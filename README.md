@@ -151,6 +151,44 @@ Build around interfaces first, then benchmark concrete backends.
 
 Decision rule: choose defaults by measured latency/accuracy on target hardware, not by benchmark claims.
 
+## ASR Backend Setup (Bench)
+
+Install optional ASR backends for non-Whisper model families:
+
+```bash
+# Qwen models only
+uv sync --extra qwen-asr
+
+# NVIDIA NeMo models only
+uv sync --extra nemo-asr
+
+# Both families
+uv sync --extra asr-backends
+```
+
+Notes:
+
+- `nemo-asr` builds native dependencies (for example `kaldialign`) and requires local build tools (`cmake`, `make`, C/C++ compiler).
+- If you only need `qwen/*` models, prefer `--extra qwen-asr` to avoid NeMo native build requirements.
+
+Model routing used by `bench` and `init-bench`:
+
+- `whisper-*` and `faster-whisper-*` -> `faster-whisper`
+- `nvidia/*` -> `nemo_asr` (`nemo_toolkit[asr]`)
+- `qwen/*` -> `qwen-asr`
+
+Examples:
+
+```bash
+# Cache model + dataset assets
+uv run init-bench --model nvidia/parakeet-tdt-0.6b-v3
+uv run init-bench --model Qwen/Qwen3-ASR-1.7B
+
+# Run diarized transcription benchmark
+uv run bench --model nvidia/parakeet-tdt-0.6b-v3
+uv run bench --model Qwen/Qwen3-ASR-1.7B
+```
+
 ## Delivery Plan
 
 ## Phase 0 - Foundation and Compliance-Ready Architecture (Week 1)

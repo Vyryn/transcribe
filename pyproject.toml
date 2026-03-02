@@ -12,6 +12,14 @@ dependencies = [
   "torchcodec>=0.10.0",
 ]
 
+[project.optional-dependencies]
+nemo-asr = ["nemo_toolkit[asr]"]
+qwen-asr = ["qwen-asr"]
+asr-backends = [
+  "nemo_toolkit[asr]",
+  "qwen-asr",
+]
+
 [project.scripts]
 transcribe = "transcribe.cli:main"
 bench = "transcribe.bench.cli:main"

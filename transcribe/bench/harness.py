@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import os
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from transcribe.bench.report import build_benchmark_report, write_benchmark_report
 from transcribe.models import CaptureConfig
@@ -33,8 +35,14 @@ class BenchmarkResult:
 
 HfDatasetRowsLoader = Callable[[str, str | None, str, int | None], Iterable[Mapping[str, object]]]
 HfSegmentTranscriber = Callable[[Mapping[str, object], str], tuple[str, float]]
+TranscriptionBackend = Literal["faster_whisper", "nemo_asr", "qwen_asr"]
 
 _FASTER_WHISPER_MODEL_CACHE: dict[str, Any] = {}
+_NEMO_ASR_MODEL_CACHE: dict[str, Any] = {}
+_QWEN_ASR_MODEL_CACHE: dict[str, Any] = {}
+_HF_REPO_SNAPSHOT_CACHE: dict[str, str] = {}
+_QWEN_AUDIO_BYTES_PATH_CACHE: dict[str, str] = {}
+_NEMO_AUDIO_BYTES_PATH_CACHE: dict[str, str] = {}
 _MODEL_RAM_GB_ESTIMATES = {
     "tiny": 0.7,
     "base": 1.0,
@@ -98,19 +106,47 @@ def _allow_hf_network_access() -> None:
     os.environ["HF_DATASETS_OFFLINE"] = "0"
 
 
-def _normalize_transcription_model_id(transcription_model: str) -> str:
-    """Normalize user-facing model identifiers to faster-whisper ids."""
+def _canonical_transcription_model_id(transcription_model: str) -> str:
+    """Map known transcription model aliases to canonical ids."""
     normalized = transcription_model.strip()
+    if not normalized:
+        return normalized
+    aliases = {
+        "parakeet-tdt-0.6b-v3": "nvidia/parakeet-tdt-0.6b-v3",
+        "nvidia/parakeet-tdt-0.6b-v3": "nvidia/parakeet-tdt-0.6b-v3",
+        "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B",
+        "qwen/qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B",
+    }
+    return aliases.get(normalized.lower(), normalized)
+
+
+def _resolve_transcription_backend(transcription_model: str) -> tuple[TranscriptionBackend, str]:
+    """Resolve backend type and normalized model id."""
+    canonical = _canonical_transcription_model_id(transcription_model)
+    canonical_lower = canonical.lower()
+    if canonical_lower.startswith("nvidia/"):
+        return "nemo_asr", canonical
+    if canonical_lower.startswith("qwen/"):
+        return "qwen_asr", canonical
+
+    normalized = canonical
     for prefix in ("faster-whisper-", "whisper-"):
-        if normalized.startswith(prefix):
-            normalized = normalized[len(prefix) :]
+        if canonical_lower.startswith(prefix):
+            normalized = canonical[len(prefix) :]
             break
+    return "faster_whisper", normalized
+
+
+def _normalize_transcription_model_id(transcription_model: str) -> str:
+    """Normalize user-facing model identifiers for cache/report metadata."""
+    _, normalized = _resolve_transcription_backend(transcription_model)
     return normalized
 
 
 def _estimate_model_ram_gb(transcription_model: str) -> float | None:
     """Return estimated runtime RAM/VRAM requirement for known model ids."""
-    return _MODEL_RAM_GB_ESTIMATES.get(_normalize_transcription_model_id(transcription_model))
+    normalized = _normalize_transcription_model_id(transcription_model).lower()
+    return _MODEL_RAM_GB_ESTIMATES.get(normalized)
 
 
 def _enforce_model_ram_limit(transcription_model: str, max_model_ram_gb: float) -> None:
@@ -171,6 +207,36 @@ def _offline_model_error(model_id: str) -> RuntimeError:
     )
 
 
+def _get_hf_repo_snapshot(repo_id: str, *, local_files_only: bool) -> str:
+    """Resolve local snapshot path for a Hugging Face repo id."""
+    cache_key = f"{repo_id}|local_files_only={local_files_only}"
+    if cache_key in _HF_REPO_SNAPSHOT_CACHE:
+        return _HF_REPO_SNAPSHOT_CACHE[cache_key]
+    if local_files_only and repo_id in _HF_REPO_SNAPSHOT_CACHE:
+        return _HF_REPO_SNAPSHOT_CACHE[repo_id]
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "Transcription benchmarking model caching requires `huggingface_hub`."
+        ) from exc
+
+    if local_files_only:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    try:
+        snapshot_dir = snapshot_download(repo_id=repo_id, local_files_only=local_files_only)
+    except Exception as exc:  # noqa: BLE001
+        if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
+            raise _offline_model_error(repo_id) from exc
+        raise
+
+    _HF_REPO_SNAPSHOT_CACHE[cache_key] = snapshot_dir
+    if local_files_only:
+        _HF_REPO_SNAPSHOT_CACHE[repo_id] = snapshot_dir
+    return snapshot_dir
+
+
 def _get_faster_whisper_model(model_id: str, *, local_files_only: bool = True) -> Any:
     """Return cached faster-whisper model instance for local benchmarking."""
     normalized = _normalize_transcription_model_id(model_id)
@@ -184,8 +250,7 @@ def _get_faster_whisper_model(model_id: str, *, local_files_only: bool = True) -
         from faster_whisper import WhisperModel
     except ImportError as exc:
         raise RuntimeError(
-            "Transcription benchmarking requires `faster-whisper`. "
-            "Install it before running this scenario."
+            "Transcription benchmarking requires `faster-whisper`. Install it before running this scenario."
         ) from exc
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -207,6 +272,171 @@ def _get_faster_whisper_model(model_id: str, *, local_files_only: bool = True) -
     return model
 
 
+def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
+    """Return cached NeMo ASR model instance for local benchmarking."""
+    _, resolved_model_id = _resolve_transcription_backend(model_id)
+    cache_key = f"{resolved_model_id}|local_files_only={local_files_only}"
+    if cache_key in _NEMO_ASR_MODEL_CACHE:
+        return _NEMO_ASR_MODEL_CACHE[cache_key]
+    if local_files_only and resolved_model_id in _NEMO_ASR_MODEL_CACHE:
+        return _NEMO_ASR_MODEL_CACHE[resolved_model_id]
+
+    _get_hf_repo_snapshot(resolved_model_id, local_files_only=local_files_only)
+    try:
+        import nemo.collections.asr as nemo_asr
+    except ImportError as exc:
+        raise RuntimeError(
+            "Transcription benchmarking for NVIDIA ASR models requires `nemo_toolkit[asr]`."
+        ) from exc
+
+    try:
+        model = nemo_asr.models.ASRModel.from_pretrained(model_name=resolved_model_id)
+    except Exception as exc:  # noqa: BLE001
+        if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
+            raise _offline_model_error(resolved_model_id) from exc
+        raise
+
+    _NEMO_ASR_MODEL_CACHE[cache_key] = model
+    if local_files_only:
+        _NEMO_ASR_MODEL_CACHE[resolved_model_id] = model
+    return model
+
+
+def _get_qwen_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
+    """Return cached Qwen ASR model instance for local benchmarking."""
+    _, resolved_model_id = _resolve_transcription_backend(model_id)
+    cache_key = f"{resolved_model_id}|local_files_only={local_files_only}"
+    if cache_key in _QWEN_ASR_MODEL_CACHE:
+        return _QWEN_ASR_MODEL_CACHE[cache_key]
+    if local_files_only and resolved_model_id in _QWEN_ASR_MODEL_CACHE:
+        return _QWEN_ASR_MODEL_CACHE[resolved_model_id]
+
+    snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=local_files_only)
+    try:
+        from qwen_asr import Qwen3ASRModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "Transcription benchmarking for Qwen ASR models requires `qwen-asr`."
+        ) from exc
+
+    load_errors: list[BaseException] = []
+    for load_source in (snapshot_dir, resolved_model_id):
+        try:
+            model = Qwen3ASRModel.from_pretrained(load_source)
+            _QWEN_ASR_MODEL_CACHE[cache_key] = model
+            if local_files_only:
+                _QWEN_ASR_MODEL_CACHE[resolved_model_id] = model
+            return model
+        except Exception as exc:  # noqa: BLE001
+            load_errors.append(exc)
+            continue
+
+    for exc in load_errors:
+        if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
+            raise _offline_model_error(resolved_model_id) from exc
+    raise RuntimeError(
+        f"Failed to initialize qwen-asr model for {resolved_model_id!r}: {load_errors[-1]}"
+    ) from load_errors[-1]
+
+
+def _extract_audio_path(row: Mapping[str, object]) -> str:
+    """Extract local audio path from a dataset row."""
+    audio = row.get("audio")
+    if isinstance(audio, str) and audio:
+        return audio
+    if isinstance(audio, Mapping):
+        path = audio.get("path")
+        if isinstance(path, str) and path:
+            path_obj = Path(path)
+            if path_obj.exists():
+                return path
+        payload = audio.get("bytes")
+        if isinstance(payload, (bytes, bytearray)):
+            payload_bytes = bytes(payload)
+            cache_key = hashlib.sha1(payload_bytes).hexdigest()
+            cached_path = _NEMO_AUDIO_BYTES_PATH_CACHE.get(cache_key)
+            if cached_path and Path(cached_path).exists():
+                return cached_path
+
+            suffix = ".wav"
+            if isinstance(path, str) and path:
+                path_suffix = Path(path).suffix
+                if path_suffix:
+                    suffix = path_suffix
+            temp_dir = Path(tempfile.gettempdir()) / "transcribe-nemo-audio"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = temp_dir / f"{cache_key}{suffix}"
+            if not temp_path.exists():
+                temp_path.write_bytes(payload_bytes)
+            materialized_path = str(temp_path)
+            _NEMO_AUDIO_BYTES_PATH_CACHE[cache_key] = materialized_path
+            return materialized_path
+        if isinstance(path, str) and path:
+            return path
+    raise ValueError("Dataset row does not include an audio file path")
+
+
+def _extract_qwen_audio_input(row: Mapping[str, object]) -> object:
+    """Extract qwen-asr compatible audio input payload from a dataset row."""
+    audio = row.get("audio")
+    if isinstance(audio, str) and audio:
+        return audio
+    if isinstance(audio, Mapping):
+        path = audio.get("path")
+        if isinstance(path, str) and path and Path(path).exists():
+            return path
+        payload = audio.get("bytes")
+        if isinstance(payload, (bytes, bytearray)):
+            payload_bytes = bytes(payload)
+            cache_key = hashlib.sha1(payload_bytes).hexdigest()
+            cached_path = _QWEN_AUDIO_BYTES_PATH_CACHE.get(cache_key)
+            if cached_path and Path(cached_path).exists():
+                return cached_path
+
+            suffix = ".wav"
+            if isinstance(path, str) and path:
+                path_suffix = Path(path).suffix
+                if path_suffix:
+                    suffix = path_suffix
+            temp_dir = Path(tempfile.gettempdir()) / "transcribe-qwen-audio"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = temp_dir / f"{cache_key}{suffix}"
+            if not temp_path.exists():
+                temp_path.write_bytes(payload_bytes)
+            materialized_path = str(temp_path)
+            _QWEN_AUDIO_BYTES_PATH_CACHE[cache_key] = materialized_path
+            return materialized_path
+        if isinstance(path, str) and path:
+            return path
+        array = audio.get("array")
+        if array is not None:
+            sampling_rate = int(_to_float(audio.get("sampling_rate"), default=16_000))
+            sampling_rate = sampling_rate if sampling_rate > 0 else 16_000
+            return (array, sampling_rate)
+    return _extract_audio_input(row)
+
+
+def _transcription_item_to_text(item: object) -> str:
+    """Extract transcript text from one backend response item."""
+    text_attr = getattr(item, "text", None)
+    if isinstance(text_attr, str):
+        return text_attr.strip()
+    if isinstance(item, Mapping):
+        text = item.get("text")
+        if isinstance(text, str):
+            return text.strip()
+    if isinstance(item, str):
+        return item.strip()
+    return ""
+
+
+def _transcription_output_to_text(output: object) -> str:
+    """Normalize backend-specific transcription outputs into plain text."""
+    if isinstance(output, (list, tuple)):
+        return " ".join(piece for piece in (_transcription_item_to_text(item) for item in output) if piece).strip()
+    return _transcription_item_to_text(output)
+
+
 def transcribe_row_with_faster_whisper(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
     """Transcribe one diarized row and return text plus inference latency."""
     model = _get_faster_whisper_model(transcription_model, local_files_only=True)
@@ -223,6 +453,40 @@ def transcribe_row_with_faster_whisper(row: Mapping[str, object], transcription_
     predicted_text = " ".join(segment.text.strip() for segment in segments if segment.text).strip()
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
     return predicted_text, elapsed_ms
+
+
+def transcribe_row_with_nemo_asr(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
+    """Transcribe one diarized row with NeMo ASR and return text plus latency."""
+    model = _get_nemo_asr_model(transcription_model, local_files_only=True)
+    audio_path = _extract_audio_path(row)
+
+    started_at = time.perf_counter()
+    output = model.transcribe([audio_path])
+    predicted_text = _transcription_output_to_text(output)
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    return predicted_text, elapsed_ms
+
+
+def transcribe_row_with_qwen_asr(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
+    """Transcribe one diarized row with qwen-asr and return text plus latency."""
+    model = _get_qwen_asr_model(transcription_model, local_files_only=True)
+    audio_input = _extract_qwen_audio_input(row)
+
+    started_at = time.perf_counter()
+    output = model.transcribe(audio=audio_input)
+    predicted_text = _transcription_output_to_text(output)
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    return predicted_text, elapsed_ms
+
+
+def _default_hf_segment_transcriber(transcription_model: str) -> HfSegmentTranscriber:
+    """Resolve the default segment transcriber for a model identifier."""
+    backend, _ = _resolve_transcription_backend(transcription_model)
+    if backend == "nemo_asr":
+        return transcribe_row_with_nemo_asr
+    if backend == "qwen_asr":
+        return transcribe_row_with_qwen_asr
+    return transcribe_row_with_faster_whisper
 
 
 def _word_error_rate(reference_text: str, hypothesis_text: str) -> float:
@@ -373,8 +637,7 @@ def load_hf_diarized_rows(
     if dataset is None:
         split_list = ", ".join(split_candidates)
         raise ValueError(
-            f"Unable to load split for dataset {dataset_id!r}. Tried: {split_list}. "
-            "Verify dataset id/config/split."
+            f"Unable to load split for dataset {dataset_id!r}. Tried: {split_list}. Verify dataset id/config/split."
         )
 
     if hasattr(dataset, "features") and "audio" in dataset.features:
@@ -405,8 +668,7 @@ def cache_hf_diarized_dataset(
         from datasets import Audio, DownloadConfig, load_dataset
     except ImportError as exc:
         raise RuntimeError(
-            "Dataset cache initialization requires the `datasets` package. "
-            "Install it before running init-bench."
+            "Dataset cache initialization requires the `datasets` package. Install it before running init-bench."
         ) from exc
 
     split_expr = f"{split}[:{sample_limit}]" if sample_limit is not None else split
@@ -450,34 +712,46 @@ def cache_transcription_model(
 ) -> dict[str, object]:
     """Download and cache a transcription model for local benchmarking."""
     _enforce_model_ram_limit(transcription_model, max_model_ram_gb)
-    normalized_model_id = _normalize_transcription_model_id(transcription_model)
+    backend, normalized_model_id = _resolve_transcription_backend(transcription_model)
     _allow_hf_network_access()
 
-    try:
-        model = _get_faster_whisper_model(transcription_model, local_files_only=False)
-        cache_source = "faster_whisper"
-        cache_dir = ""
-        if hasattr(model, "model_path"):
-            path_value = getattr(model, "model_path")
-            if isinstance(path_value, str):
-                cache_dir = path_value
-        if not cache_dir and hasattr(model, "model_dir"):
-            path_value = getattr(model, "model_dir")
-            if isinstance(path_value, str):
-                cache_dir = path_value
-    except RuntimeError as exc:
-        if "faster-whisper" not in str(exc).lower():
-            raise
+    cache_dir = ""
+    if backend == "nemo_asr":
+        cache_dir = _get_hf_repo_snapshot(normalized_model_id, local_files_only=False)
         try:
-            from huggingface_hub import snapshot_download
-        except ImportError as import_exc:
-            raise RuntimeError(
-                "Model cache initialization requires either `faster-whisper` or `huggingface_hub`."
-            ) from import_exc
-
-        repo_id = f"Systran/faster-whisper-{normalized_model_id}"
-        cache_dir = snapshot_download(repo_id=repo_id, local_files_only=False)
-        cache_source = "huggingface_hub"
+            _get_nemo_asr_model(transcription_model, local_files_only=False)
+            cache_source = "nemo_toolkit_asr"
+        except RuntimeError as exc:
+            if "nemo_toolkit[asr]" not in str(exc).lower():
+                raise
+            cache_source = "huggingface_hub"
+    elif backend == "qwen_asr":
+        cache_dir = _get_hf_repo_snapshot(normalized_model_id, local_files_only=False)
+        try:
+            _get_qwen_asr_model(transcription_model, local_files_only=False)
+            cache_source = "qwen_asr"
+        except RuntimeError as exc:
+            if "qwen-asr" not in str(exc).lower():
+                raise
+            cache_source = "huggingface_hub"
+    else:
+        try:
+            model = _get_faster_whisper_model(transcription_model, local_files_only=False)
+            cache_source = "faster_whisper"
+            if hasattr(model, "model_path"):
+                path_value = getattr(model, "model_path")
+                if isinstance(path_value, str):
+                    cache_dir = path_value
+            if not cache_dir and hasattr(model, "model_dir"):
+                path_value = getattr(model, "model_dir")
+                if isinstance(path_value, str):
+                    cache_dir = path_value
+        except RuntimeError as exc:
+            if "faster-whisper" not in str(exc).lower():
+                raise
+            repo_id = f"Systran/faster-whisper-{normalized_model_id}"
+            cache_dir = _get_hf_repo_snapshot(repo_id, local_files_only=False)
+            cache_source = "huggingface_hub"
 
     return {
         "transcription_model": transcription_model,
@@ -611,7 +885,7 @@ def run_hf_diarized_transcription_benchmark(
 
     benchmark_started = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_results: list[dict[str, object]] = []
-    segment_transcriber = transcriber or transcribe_row_with_faster_whisper
+    segment_transcriber = transcriber or _default_hf_segment_transcriber(transcription_model)
 
     total_reference_words = 0
     total_reference_chars = 0

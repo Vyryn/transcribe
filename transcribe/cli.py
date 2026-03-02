@@ -116,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--transcription-model",
         dest="transcription_model",
         default="faster-whisper-medium",
-        help="Transcription runtime/model identifier under test",
+        help="Model id under test (whisper*=>faster-whisper, nvidia/*=>nemo_asr, qwen/*=>qwen-asr)",
     )
     bench_run.add_argument(
         "--max-model-ram-gb",

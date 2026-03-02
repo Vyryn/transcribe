@@ -18,11 +18,19 @@ from transcribe.bench.harness import (
 
 def test_bench_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, argparse.Namespace] = {}
+    observed: dict[str, str] = {}
+
+    expected_out = Path("data/benchmarks/hf_diarized/faster-whisper-medium_20260302_010203")
+
+    def fake_default_out(model_id: str) -> Path:
+        observed["model_id"] = model_id
+        return expected_out
 
     def fake_run_benchmark(args: argparse.Namespace) -> int:
         captured["args"] = args
         return 0
 
+    monkeypatch.setattr(bench_cli, "_default_output_dir", fake_default_out)
     monkeypatch.setattr(bench_cli, "run_benchmark", fake_run_benchmark)
 
     rc = bench_cli.main([])
@@ -35,7 +43,8 @@ def test_bench_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.hf_split == DEFAULT_HF_DIARIZED_SPLIT
     assert args.hf_limit == DEFAULT_HF_SAMPLE_LIMIT
     assert args.transcription_model == DEFAULT_TRANSCRIPTION_MODEL
-    assert args.out == Path("data/benchmarks/hf_diarized")
+    assert observed["model_id"] == DEFAULT_TRANSCRIPTION_MODEL
+    assert args.out == expected_out
 
 
 def test_bench_cli_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -45,6 +54,10 @@ def test_bench_cli_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         captured["args"] = args
         return 0
 
+    def fail_default_out(model_id: str) -> Path:
+        raise AssertionError(f"_default_output_dir should not be called when --out is set: {model_id}")
+
+    monkeypatch.setattr(bench_cli, "_default_output_dir", fail_default_out)
     monkeypatch.setattr(bench_cli, "run_benchmark", fake_run_benchmark)
 
     rc = bench_cli.main(

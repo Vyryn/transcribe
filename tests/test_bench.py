@@ -5,13 +5,21 @@ from pathlib import Path
 
 import pytest
 
+import transcribe.bench.harness as bench_harness
 from transcribe.bench.harness import (
     DEFAULT_HF_SAMPLE_LIMIT,
     DEFAULT_TRANSCRIPTION_MODEL,
     HF_DIARIZED_SCENARIO,
+    _default_hf_segment_transcriber,
     _extract_audio_input,
+    _extract_audio_path,
+    _extract_qwen_audio_input,
+    _normalize_transcription_model_id,
     run_capture_sync_benchmark,
     run_hf_diarized_transcription_benchmark,
+    transcribe_row_with_faster_whisper,
+    transcribe_row_with_nemo_asr,
+    transcribe_row_with_qwen_asr,
 )
 from transcribe.models import AudioSourceMode, CaptureConfig
 
@@ -166,7 +174,95 @@ def test_run_hf_diarized_transcription_benchmark_rejects_large_model() -> None:
         )
 
 
+def test_normalize_transcription_model_id_supports_backend_aliases() -> None:
+    assert _normalize_transcription_model_id("whisper-small") == "small"
+    assert _normalize_transcription_model_id("faster-whisper-medium") == "medium"
+    assert _normalize_transcription_model_id("parakeet-tdt-0.6b-v3") == "nvidia/parakeet-tdt-0.6b-v3"
+    assert _normalize_transcription_model_id("nvidia/canary-1b") == "nvidia/canary-1b"
+    assert _normalize_transcription_model_id("qwen/qwen3-asr-1.7b") == "Qwen/Qwen3-ASR-1.7B"
+    assert _normalize_transcription_model_id("qwen/custom-asr") == "qwen/custom-asr"
+
+
+def test_default_hf_segment_transcriber_routes_by_model_slug_prefix() -> None:
+    assert _default_hf_segment_transcriber("whisper-small") is transcribe_row_with_faster_whisper
+    assert _default_hf_segment_transcriber("nvidia/parakeet-tdt-0.6b-v3") is transcribe_row_with_nemo_asr
+    assert _default_hf_segment_transcriber("nvidia/canary-1b") is transcribe_row_with_nemo_asr
+    assert _default_hf_segment_transcriber("Qwen/Qwen3-ASR-1.7B") is transcribe_row_with_qwen_asr
+    assert _default_hf_segment_transcriber("qwen/custom-asr") is transcribe_row_with_qwen_asr
+
+
+def test_cache_transcription_model_uses_nvidia_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_snapshot(repo_id: str, *, local_files_only: bool) -> str:
+        observed["repo_id"] = repo_id
+        observed["local_files_only"] = local_files_only
+        return "/tmp/fake-nvidia-model"
+
+    def fake_get_nemo_model(model_id: str, *, local_files_only: bool) -> object:
+        observed["model_id"] = model_id
+        observed["loader_local_files_only"] = local_files_only
+        return object()
+
+    monkeypatch.setattr(bench_harness, "_get_hf_repo_snapshot", fake_snapshot)
+    monkeypatch.setattr(bench_harness, "_get_nemo_asr_model", fake_get_nemo_model)
+    result = bench_harness.cache_transcription_model(
+        transcription_model="nvidia/parakeet-tdt-0.6b-v3",
+        max_model_ram_gb=16.0,
+    )
+
+    assert observed["repo_id"] == "nvidia/parakeet-tdt-0.6b-v3"
+    assert observed["local_files_only"] is False
+    assert observed["model_id"] == "nvidia/parakeet-tdt-0.6b-v3"
+    assert observed["loader_local_files_only"] is False
+    assert result["model_cache_source"] == "nemo_toolkit_asr"
+    assert result["model_cache_dir"] == "/tmp/fake-nvidia-model"
+
+
+def test_cache_transcription_model_uses_qwen_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_snapshot(repo_id: str, *, local_files_only: bool) -> str:
+        observed["repo_id"] = repo_id
+        observed["local_files_only"] = local_files_only
+        return "/tmp/fake-qwen-model"
+
+    def fake_get_qwen_model(model_id: str, *, local_files_only: bool) -> object:
+        observed["model_id"] = model_id
+        observed["loader_local_files_only"] = local_files_only
+        return object()
+
+    monkeypatch.setattr(bench_harness, "_get_hf_repo_snapshot", fake_snapshot)
+    monkeypatch.setattr(bench_harness, "_get_qwen_asr_model", fake_get_qwen_model)
+    result = bench_harness.cache_transcription_model(
+        transcription_model="qwen/qwen3-asr-0.6b",
+        max_model_ram_gb=16.0,
+    )
+
+    assert observed["repo_id"] == "qwen/qwen3-asr-0.6b"
+    assert observed["local_files_only"] is False
+    assert observed["model_id"] == "qwen/qwen3-asr-0.6b"
+    assert observed["loader_local_files_only"] is False
+    assert result["model_cache_source"] == "qwen_asr"
+    assert result["model_cache_dir"] == "/tmp/fake-qwen-model"
+
+
 def test_extract_audio_input_prefers_bytes_over_path() -> None:
     input_audio = _extract_audio_input({"audio": {"bytes": b"abc", "path": "missing.wav"}})
     assert hasattr(input_audio, "read")
     assert input_audio.read() == b"abc"
+
+
+def test_extract_qwen_audio_input_prefers_bytes_over_path() -> None:
+    input_audio = _extract_qwen_audio_input({"audio": {"bytes": b"abc", "path": "missing.wav"}})
+    assert isinstance(input_audio, str)
+    materialized = Path(input_audio)
+    assert materialized.exists()
+    assert materialized.read_bytes() == b"abc"
+
+
+def test_extract_audio_path_prefers_materialized_bytes_when_path_missing() -> None:
+    input_audio = _extract_audio_path({"audio": {"bytes": b"abc", "path": "missing.wav"}})
+    materialized = Path(input_audio)
+    assert materialized.exists()
+    assert materialized.read_bytes() == b"abc"

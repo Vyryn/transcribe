@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--transcription-model",
         dest="transcription_model",
         default=DEFAULT_TRANSCRIPTION_MODEL,
-        help="Transcription runtime/model identifier to cache",
+        help="Model id to cache (whisper*=>faster-whisper, nvidia/*=>nemo_asr, qwen/*=>qwen-asr)",
     )
     parser.add_argument(
         "--max-model-ram-gb",
@@ -78,4 +78,3 @@ def main(argv: list[str] | None = None) -> int:
     if result.get("model_cache_dir"):
         print(f"Model cache directory: {result['model_cache_dir']}")
     return 0
-
