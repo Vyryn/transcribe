@@ -1,0 +1,7 @@
+[project]
+name = "transcribe"
+version = "0.1.0"
+description = "HIPAA aware transcription and client note utility for psychotherapists"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
