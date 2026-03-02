@@ -1,1 +1,1 @@
-"""Benchmark harness for Phase 0 capture metrics."""
+"""Benchmark harness for capture-sync and diarized transcription datasets."""

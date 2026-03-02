@@ -98,6 +98,32 @@ def build_parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--duration-sec", type=float, default=10.0)
     bench_run.add_argument("--out", type=Path, default=Path("data/benchmarks"))
     bench_run.add_argument("--real-devices", action="store_true", help="Use live devices instead of fixture")
+    bench_run.add_argument(
+        "--hf-dataset",
+        default="edinburghcstr/ami",
+        help="Hugging Face dataset id for diarized-transcription benchmarking",
+    )
+    bench_run.add_argument("--hf-config", default="ihm", help="Hugging Face dataset config/subset")
+    bench_run.add_argument("--hf-split", default="test", help="Hugging Face split name")
+    bench_run.add_argument(
+        "--hf-limit",
+        type=int,
+        default=100,
+        help="Row limit for Hugging Face benchmark runs",
+    )
+    bench_run.add_argument(
+        "--model",
+        "--transcription-model",
+        dest="transcription_model",
+        default="faster-whisper-medium",
+        help="Transcription runtime/model identifier under test",
+    )
+    bench_run.add_argument(
+        "--max-model-ram-gb",
+        type=float,
+        default=8.0,
+        help="Reject models with estimated runtime RAM above this threshold",
+    )
 
     compliance_parser = subparsers.add_parser("compliance", help="Compliance checks")
     compliance_subparsers = compliance_parser.add_subparsers(dest="compliance_command", required=True)
@@ -212,20 +238,36 @@ def run_benchmark(args: argparse.Namespace) -> int:
     int
         Exit code.
     """
-    from transcribe.bench.harness import run_capture_sync_benchmark
+    from transcribe.bench.harness import (
+        HF_DIARIZED_SCENARIO,
+        run_capture_sync_benchmark,
+        run_hf_diarized_transcription_benchmark,
+    )
 
     load_and_configure_logging(args)
-    if args.scenario != "capture_sync":
-        raise ValueError("Only --scenario capture_sync is supported in Phase 0")
-
-    base_config = CaptureConfig(source_mode=AudioSourceMode.BOTH, session_id="bench", output_dir=args.out)
-    bench = run_capture_sync_benchmark(
-        base_config=base_config,
-        runs=args.runs,
-        duration_sec=args.duration_sec,
-        output_dir=args.out,
-        use_fixture=not args.real_devices,
-    )
+    if args.scenario == "capture_sync":
+        base_config = CaptureConfig(source_mode=AudioSourceMode.BOTH, session_id="bench", output_dir=args.out)
+        bench = run_capture_sync_benchmark(
+            base_config=base_config,
+            runs=args.runs,
+            duration_sec=args.duration_sec,
+            output_dir=args.out,
+            use_fixture=not args.real_devices,
+        )
+    elif args.scenario == HF_DIARIZED_SCENARIO:
+        bench = run_hf_diarized_transcription_benchmark(
+            output_dir=args.out,
+            dataset_id=args.hf_dataset,
+            dataset_config=args.hf_config,
+            split=args.hf_split,
+            sample_limit=args.hf_limit,
+            transcription_model=args.transcription_model,
+            max_model_ram_gb=args.max_model_ram_gb,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported --scenario {args.scenario!r}. Use 'capture_sync' or '{HF_DIARIZED_SCENARIO}'."
+        )
 
     print(f"Benchmark JSON: {bench.json_path}")
     print(f"Benchmark Markdown: {bench.markdown_path}")
