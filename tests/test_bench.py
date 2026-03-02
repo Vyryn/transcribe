@@ -14,6 +14,7 @@ from transcribe.bench.harness import (
     _extract_audio_input,
     _extract_audio_path,
     _extract_qwen_audio_input,
+    _is_nemo_speechlm_snapshot,
     _normalize_transcription_model_id,
     run_capture_sync_benchmark,
     run_hf_diarized_transcription_benchmark,
@@ -266,3 +267,13 @@ def test_extract_audio_path_prefers_materialized_bytes_when_path_missing() -> No
     materialized = Path(input_audio)
     assert materialized.exists()
     assert materialized.read_bytes() == b"abc"
+
+
+def test_is_nemo_speechlm_snapshot_detects_expected_config(tmp_path: Path) -> None:
+    snapshot_dir = tmp_path / "snapshot"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "config.json").write_text(
+        json.dumps({"pretrained_llm": "Qwen/Qwen3-1.7B", "perception": {"encoder": {}}}),
+        encoding="utf-8",
+    )
+    assert _is_nemo_speechlm_snapshot(str(snapshot_dir)) is True

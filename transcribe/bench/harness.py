@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import tempfile
 import time
@@ -272,6 +273,100 @@ def _get_faster_whisper_model(model_id: str, *, local_files_only: bool = True) -
     return model
 
 
+def _load_nemo_model_from_snapshot(nemo_asr: Any, resolved_model_id: str, snapshot_dir: str) -> Any:
+    """Load a NeMo model from a locally cached HF snapshot directory."""
+    snapshot_path = Path(snapshot_dir)
+    preferred_nemo_filename = f"{Path(resolved_model_id).name}.nemo"
+    nemo_files = sorted(snapshot_path.glob("*.nemo"))
+
+    restore_errors: list[BaseException] = []
+    if nemo_files:
+        ordered_files = sorted(nemo_files, key=lambda item: (item.name != preferred_nemo_filename, item.name))
+        for nemo_file in ordered_files:
+            try:
+                return nemo_asr.models.ASRModel.restore_from(restore_path=str(nemo_file))
+            except Exception as exc:  # noqa: BLE001
+                restore_errors.append(exc)
+                continue
+    else:
+        try:
+            from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
+        except ImportError as exc:
+            raise RuntimeError(
+                "Failed to import NeMo SaveRestoreConnector required for local snapshot loading."
+            ) from exc
+
+        for class_name in ("ASRModel", "EncDecMultiTaskModel"):
+            model_class = getattr(nemo_asr.models, class_name, None)
+            if model_class is None:
+                continue
+            connector = SaveRestoreConnector()
+            connector.model_extracted_dir = snapshot_dir
+            try:
+                return model_class.restore_from(restore_path=snapshot_dir, save_restore_connector=connector)
+            except Exception as exc:  # noqa: BLE001
+                restore_errors.append(exc)
+                continue
+
+    if restore_errors:
+        raise RuntimeError(
+            f"Failed to restore NeMo model {resolved_model_id!r} from local snapshot {snapshot_dir}: "
+            f"{restore_errors[-1]}"
+        ) from restore_errors[-1]
+    raise RuntimeError(
+        f"NeMo model snapshot {snapshot_dir!r} for {resolved_model_id!r} did not contain loadable artifacts."
+    )
+
+
+def _is_nemo_speechlm_snapshot(snapshot_dir: str) -> bool:
+    """Check whether a snapshot directory looks like a NeMo SpeechLM checkpoint."""
+    config_path = Path(snapshot_dir) / "config.json"
+    if not config_path.exists():
+        return False
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and "pretrained_llm" in data and "perception" in data
+
+
+def _load_nemo_speechlm_model_from_snapshot(
+    resolved_model_id: str,
+    snapshot_dir: str,
+    *,
+    local_files_only: bool,
+) -> Any:
+    """Load a NeMo SpeechLM (for example Canary-Qwen) model from snapshot or repo id."""
+    if not _is_nemo_speechlm_snapshot(snapshot_dir):
+        raise RuntimeError(
+            f"Snapshot {snapshot_dir!r} for {resolved_model_id!r} does not look like a NeMo SpeechLM checkpoint."
+        )
+
+    try:
+        from nemo.collections.speechlm2.models import SALM
+    except ImportError as exc:
+        raise RuntimeError(
+            "Loading NVIDIA SpeechLM models requires `nemo_toolkit` with speechlm2 support."
+        ) from exc
+
+    load_errors: list[BaseException] = []
+    load_sources = [snapshot_dir]
+    if not local_files_only:
+        load_sources.append(resolved_model_id)
+
+    for load_source in load_sources:
+        try:
+            return SALM.from_pretrained(load_source, local_files_only=local_files_only)
+        except Exception as exc:  # noqa: BLE001
+            load_errors.append(exc)
+            continue
+
+    raise RuntimeError(
+        f"Failed to restore NeMo SpeechLM model {resolved_model_id!r} from snapshot {snapshot_dir!r}: "
+        f"{load_errors[-1]}"
+    ) from load_errors[-1]
+
+
 def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
     """Return cached NeMo ASR model instance for local benchmarking."""
     _, resolved_model_id = _resolve_transcription_backend(model_id)
@@ -281,7 +376,7 @@ def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
     if local_files_only and resolved_model_id in _NEMO_ASR_MODEL_CACHE:
         return _NEMO_ASR_MODEL_CACHE[resolved_model_id]
 
-    _get_hf_repo_snapshot(resolved_model_id, local_files_only=local_files_only)
+    snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=local_files_only)
     try:
         import nemo.collections.asr as nemo_asr
     except ImportError as exc:
@@ -289,12 +384,34 @@ def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
             "Transcription benchmarking for NVIDIA ASR models requires `nemo_toolkit[asr]`."
         ) from exc
 
+    load_errors: list[BaseException] = []
+    model = None
     try:
-        model = nemo_asr.models.ASRModel.from_pretrained(model_name=resolved_model_id)
+        model = _load_nemo_model_from_snapshot(nemo_asr, resolved_model_id, snapshot_dir)
     except Exception as exc:  # noqa: BLE001
-        if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
-            raise _offline_model_error(resolved_model_id) from exc
-        raise
+        load_errors.append(exc)
+    if model is None:
+        try:
+            model = _load_nemo_speechlm_model_from_snapshot(
+                resolved_model_id,
+                snapshot_dir,
+                local_files_only=local_files_only,
+            )
+        except Exception as exc:  # noqa: BLE001
+            load_errors.append(exc)
+
+    if model is None and not local_files_only:
+        try:
+            model = nemo_asr.models.ASRModel.from_pretrained(model_name=resolved_model_id)
+        except Exception as exc:  # noqa: BLE001
+            load_errors.append(exc)
+            model = None
+
+    if model is None:
+        raise RuntimeError(
+            f"Failed to initialize NeMo ASR model for {resolved_model_id!r} from snapshot "
+            f"{snapshot_dir!r}: {load_errors[-1]}"
+        ) from load_errors[-1]
 
     _NEMO_ASR_MODEL_CACHE[cache_key] = model
     if local_files_only:
@@ -461,8 +578,26 @@ def transcribe_row_with_nemo_asr(row: Mapping[str, object], transcription_model:
     audio_path = _extract_audio_path(row)
 
     started_at = time.perf_counter()
-    output = model.transcribe([audio_path])
-    predicted_text = _transcription_output_to_text(output)
+    if hasattr(model, "transcribe"):
+        output = model.transcribe([audio_path])
+        predicted_text = _transcription_output_to_text(output)
+    elif hasattr(model, "generate"):
+        audio_locator_tag = getattr(model, "audio_locator_tag", "<|audioplaceholder|>")
+        prompt = f"Transcribe the following: {audio_locator_tag}"
+        output_ids = model.generate(
+            prompts=[[{"role": "user", "content": prompt, "audio": [audio_path]}]],
+            max_new_tokens=256,
+            do_sample=False,
+        )
+        tokenizer = getattr(model, "tokenizer", None)
+        if tokenizer is not None and hasattr(tokenizer, "ids_to_text"):
+            predicted_text = str(tokenizer.ids_to_text(output_ids[0].cpu())).strip()
+        else:
+            raise RuntimeError("Loaded NeMo model does not expose tokenizer.ids_to_text for transcription decoding.")
+    else:
+        raise RuntimeError(
+            f"Loaded NeMo model for {transcription_model!r} has no supported inference API (expected transcribe or generate)."
+        )
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
     return predicted_text, elapsed_ms
 
