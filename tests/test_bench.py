@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -10,10 +11,12 @@ from transcribe.bench.harness import (
     DEFAULT_HF_SAMPLE_LIMIT,
     DEFAULT_TRANSCRIPTION_MODEL,
     HF_DIARIZED_SCENARIO,
+    _apply_parakeet_runtime_compatibility,
     _default_hf_segment_transcriber,
     _extract_audio_input,
     _extract_audio_path,
     _extract_qwen_audio_input,
+    _prepare_nemo_model_for_inference,
     _is_nemo_speechlm_snapshot,
     _normalize_transcription_model_id,
     run_capture_sync_benchmark,
@@ -248,6 +251,30 @@ def test_cache_transcription_model_uses_qwen_backend(monkeypatch: pytest.MonkeyP
     assert result["model_cache_dir"] == "/tmp/fake-qwen-model"
 
 
+def test_enforce_hf_offline_mode_sets_all_flags() -> None:
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    os.environ["HF_DATASETS_OFFLINE"] = "0"
+    os.environ["TRANSFORMERS_OFFLINE"] = "0"
+
+    bench_harness._enforce_hf_offline_mode()
+
+    assert os.environ["HF_HUB_OFFLINE"] == "1"
+    assert os.environ["HF_DATASETS_OFFLINE"] == "1"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_allow_hf_network_access_clears_all_offline_flags() -> None:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    bench_harness._allow_hf_network_access()
+
+    assert os.environ["HF_HUB_OFFLINE"] == "0"
+    assert os.environ["HF_DATASETS_OFFLINE"] == "0"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "0"
+
+
 def test_extract_audio_input_prefers_bytes_over_path() -> None:
     input_audio = _extract_audio_input({"audio": {"bytes": b"abc", "path": "missing.wav"}})
     assert hasattr(input_audio, "read")
@@ -277,3 +304,101 @@ def test_is_nemo_speechlm_snapshot_detects_expected_config(tmp_path: Path) -> No
         encoding="utf-8",
     )
     assert _is_nemo_speechlm_snapshot(str(snapshot_dir)) is True
+
+
+def test_apply_parakeet_runtime_compatibility_disables_cuda_graph_decoder() -> None:
+    class FakeGreedyCfg:
+        def __init__(self) -> None:
+            self.use_cuda_graph_decoder = True
+
+    class FakeDecodingCfg:
+        def __init__(self) -> None:
+            self.greedy = FakeGreedyCfg()
+
+    class FakeCfg:
+        def __init__(self) -> None:
+            self.decoding = FakeDecodingCfg()
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.cfg = FakeCfg()
+            self.change_calls: list[tuple[object, bool]] = []
+
+        def change_decoding_strategy(self, decoding_cfg: object, verbose: bool = True) -> None:
+            self.change_calls.append((decoding_cfg, verbose))
+
+    model = FakeModel()
+    _apply_parakeet_runtime_compatibility(model, "nvidia/parakeet-tdt-0.6b-v3")
+
+    assert model.cfg.decoding.greedy.use_cuda_graph_decoder is False
+    assert len(model.change_calls) == 1
+    assert model.change_calls[0][0] is model.cfg.decoding
+    assert model.change_calls[0][1] is False
+
+
+def test_apply_parakeet_runtime_compatibility_skips_non_parakeet_models() -> None:
+    class FakeGreedyCfg:
+        def __init__(self) -> None:
+            self.use_cuda_graph_decoder = True
+
+    class FakeDecodingCfg:
+        def __init__(self) -> None:
+            self.greedy = FakeGreedyCfg()
+
+    class FakeCfg:
+        def __init__(self) -> None:
+            self.decoding = FakeDecodingCfg()
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.cfg = FakeCfg()
+            self.change_calls: list[tuple[object, bool]] = []
+
+        def change_decoding_strategy(self, decoding_cfg: object, verbose: bool = True) -> None:
+            self.change_calls.append((decoding_cfg, verbose))
+
+    model = FakeModel()
+    _apply_parakeet_runtime_compatibility(model, "nvidia/canary-qwen-2.5b")
+
+    assert model.cfg.decoding.greedy.use_cuda_graph_decoder is True
+    assert model.change_calls == []
+
+
+def test_apply_parakeet_runtime_compatibility_supports_structured_omegaconf() -> None:
+    from omegaconf import OmegaConf
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.cfg = OmegaConf.create({"decoding": {"greedy": {"max_symbols": 10}}})
+            OmegaConf.set_struct(self.cfg, True)
+            self.change_calls: list[tuple[object, bool]] = []
+
+        def change_decoding_strategy(self, decoding_cfg: object, verbose: bool = True) -> None:
+            self.change_calls.append((decoding_cfg, verbose))
+
+    model = FakeModel()
+    _apply_parakeet_runtime_compatibility(model, "nvidia/parakeet-tdt-0.6b-v3")
+
+    assert model.cfg.decoding.greedy.use_cuda_graph_decoder is False
+    assert len(model.change_calls) == 1
+
+
+def test_prepare_nemo_model_for_inference_sets_eval_and_disables_grad() -> None:
+    class FakeModel:
+        def __init__(self) -> None:
+            self.eval_called = False
+            self.grad_flag = True
+
+        def eval(self) -> "FakeModel":
+            self.eval_called = True
+            return self
+
+        def requires_grad_(self, flag: bool) -> "FakeModel":
+            self.grad_flag = flag
+            return self
+
+    model = FakeModel()
+    _prepare_nemo_model_for_inference(model, "nvidia/canary-qwen-2.5b")
+
+    assert model.eval_called is True
+    assert model.grad_flag is False

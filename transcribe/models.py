@@ -44,6 +44,9 @@ class CaptureConfig:
     source_mode: AudioSourceMode = AudioSourceMode.BOTH
     mic_device: str | int | None = None
     speaker_device: str | int | None = None
+    capture_all_mic_devices: bool = False
+    capture_all_speaker_devices: bool = False
+    allow_missing_sources: bool = False
     session_id: str = "session"
     output_dir: Path = Path("data")
 

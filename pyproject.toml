@@ -24,6 +24,7 @@ asr-backends = [
 transcribe = "transcribe.cli:main"
 bench = "transcribe.bench.cli:main"
 init-bench = "transcribe.bench.init_cli:main"
+test-cov = "transcribe.test_cov:main"
 
 [dependency-groups]
 dev = [

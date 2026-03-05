@@ -151,6 +151,11 @@ Build around interfaces first, then benchmark concrete backends.
 
 Decision rule: choose defaults by measured latency/accuracy on target hardware, not by benchmark claims.
 
+Current production model options (selected from `data/benchmarks/hf_diarized`):
+
+- Quality profile: `nvidia/canary-qwen-2.5b`
+- Fast/low-capability profile: `nvidia/parakeet-tdt-0.6b-v3`
+
 ## ASR Backend Setup (Bench)
 
 Install optional ASR backends for non-Whisper model families:
@@ -181,13 +186,92 @@ Examples:
 
 ```bash
 # Cache model + dataset assets
+uv run init-bench --model nvidia/canary-qwen-2.5b
 uv run init-bench --model nvidia/parakeet-tdt-0.6b-v3
-uv run init-bench --model Qwen/Qwen3-ASR-1.7B
 
 # Run diarized transcription benchmark
+uv run bench --model nvidia/canary-qwen-2.5b
 uv run bench --model nvidia/parakeet-tdt-0.6b-v3
-uv run bench --model Qwen/Qwen3-ASR-1.7B
 ```
+
+## Live Session Test Rig (Stage 1)
+
+Use the Stage 1 live session runner for open-mic streaming transcription on Linux.
+
+`session run` now captures all available input devices in the selected mode and
+automatically routes each frame from the clearest source (for example, best mic
+or best speaker loopback at that moment).
+
+```bash
+# Fixture dry-run (no audio hardware needed)
+.venv/bin/python3 -m transcribe.cli session run --fixture --duration-sec 15 --chunk-sec 3
+
+# Real microphone run (Ctrl+C to stop)
+.venv/bin/python3 -m transcribe.cli session run \
+  --model nvidia/canary-qwen-2.5b \
+  --duration-sec 0 \
+  --mode both \
+  --chunk-sec 4 \
+  --partial-interval-sec 0
+
+# Pin a specific mic by index (from `capture devices`)
+.venv/bin/python3 -m transcribe.cli session run \
+  --model nvidia/canary-qwen-2.5b \
+  --duration-sec 0 \
+  --mode both \
+  --mic-device 2
+
+# Or pass exact device names shown in `capture devices`
+.venv/bin/python3 -m transcribe.cli session run \
+  --model nvidia/canary-qwen-2.5b \
+  --duration-sec 0 \
+  --mic-device "USB Audio Device: - (hw:2,0)"
+
+# Restrict to one device per source type and fail if any source is missing
+.venv/bin/python3 -m transcribe.cli session run \
+  --model nvidia/canary-qwen-2.5b \
+  --duration-sec 0 \
+  --mode both \
+  --single-device-per-source \
+  --strict-sources
+```
+
+For larger models (for example `nvidia/canary-qwen-2.5b`), keep partials off
+(`--partial-interval-sec 0`) unless your machine can sustain real-time inference.
+Silent chunks are automatically detected and skipped (no ASR call) so the session
+can catch up during quiet periods.
+Chunks are trimmed for leading/trailing silence and resampled to the requested
+ASR rate (default `16 kHz`) before inference, even when capture hardware runs
+at `44.1/48 kHz`.
+
+Quality tuning tips:
+
+- If logs show `No speaker monitor/loopback device found`, you are effectively
+  transcribing microphone audio only. Use `--mode mic` for that workflow.
+- Use `--chunk-sec 3` or `--chunk-sec 4` for better phrase boundaries with
+  conversational speech.
+- Keep `--partial-interval-sec 0` on larger models to preserve final accuracy.
+
+Outputs are written under `data/live_sessions/<session-id>/`:
+
+- `events.jsonl` (partial/final event stream)
+- `transcript.json` (session metadata + finalized segments)
+- `transcript.txt` (plain finalized transcript)
+
+The Linux capture backend now auto-negotiates a supported input sample rate and reports
+requested/effective values at session end.
+
+If the larger default model is too heavy on your machine, use:
+`uv run transcribe session run --model nvidia/parakeet-tdt-0.6b-v3 --duration-sec 0`.
+
+If the model is not already cached locally, pre-populate it first (offline policy):
+
+```bash
+uv run init-bench --model nvidia/canary-qwen-2.5b
+```
+
+`nvidia/canary-qwen-2.5b` depends on additional local tokenizer/model assets
+(for example `Qwen/Qwen3-1.7B`); `init-bench` pre-populates those dependencies.
 
 ## Delivery Plan
 
@@ -385,5 +469,5 @@ Exit criteria:
 1. Implement audio capture interface and one production-grade OS backend.
 2. Add streaming ASR path with partial/final events and transcript state manager.
 3. Add audit event schema, data classification fields, and PHI-safe logging guardrails.
-4. Build benchmark harness and choose default ASR backend from measured results.
+4. Continue benchmark regressions and validate `nvidia/canary-qwen-2.5b` + `nvidia/parakeet-tdt-0.6b-v3` on target hardware tiers.
 5. Implement local auth/session lock and encrypted persistence before any clinical pilot.
