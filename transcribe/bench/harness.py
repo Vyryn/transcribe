@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import tempfile
 import time
@@ -14,6 +15,8 @@ from typing import Any, Literal
 from transcribe.bench.report import build_benchmark_report, write_benchmark_report
 from transcribe.models import CaptureConfig
 from transcribe.utils.stats import percentile
+
+LOGGER = logging.getLogger("transcribe.bench.harness")
 
 DEFAULT_HF_DIARIZED_DATASET = "edinburghcstr/ami"
 DEFAULT_HF_DIARIZED_CONFIG = "ihm"
@@ -105,6 +108,14 @@ def _allow_hf_network_access() -> None:
     """Ensure Hugging Face clients can use network for cache initialization flows."""
     os.environ["HF_HUB_OFFLINE"] = "0"
     os.environ["HF_DATASETS_OFFLINE"] = "0"
+    os.environ["TRANSFORMERS_OFFLINE"] = "0"
+
+
+def _enforce_hf_offline_mode() -> None:
+    """Force offline mode for Hugging Face and Transformers clients."""
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 
 def _canonical_transcription_model_id(transcription_model: str) -> str:
@@ -119,6 +130,104 @@ def _canonical_transcription_model_id(transcription_model: str) -> str:
         "qwen/qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B",
     }
     return aliases.get(normalized.lower(), normalized)
+
+
+def _is_parakeet_model_id(transcription_model: str) -> bool:
+    """Return True when model id refers to NVIDIA Parakeet family."""
+    return _canonical_transcription_model_id(transcription_model).lower().startswith("nvidia/parakeet-")
+
+
+def _apply_parakeet_runtime_compatibility(model: Any, resolved_model_id: str) -> None:
+    """Disable NeMo CUDA-graph decoder for Parakeet models in this runtime.
+
+    Some NeMo runtime combinations can fail in TDT decoder paths when CUDA-graph
+    decoding is enabled. For Parakeet models, force the safer non-CUDA-graph path.
+    """
+    if not _is_parakeet_model_id(resolved_model_id):
+        return
+
+    cfg = getattr(model, "cfg", None)
+    if cfg is None:
+        return
+    decoding_cfg = getattr(cfg, "decoding", None)
+    if decoding_cfg is None:
+        return
+    greedy_cfg = getattr(decoding_cfg, "greedy", None)
+    if greedy_cfg is None:
+        return
+
+    current_value = None
+    if hasattr(greedy_cfg, "get"):
+        try:
+            current_value = greedy_cfg.get("use_cuda_graph_decoder", None)
+        except Exception:  # noqa: BLE001
+            current_value = None
+    if current_value is None:
+        current_value = getattr(greedy_cfg, "use_cuda_graph_decoder", None)
+    if current_value is False:
+        return
+
+    updated = False
+    try:
+        setattr(greedy_cfg, "use_cuda_graph_decoder", False)
+        updated = True
+    except Exception:  # noqa: BLE001
+        updated = False
+    if not updated:
+        try:
+            greedy_cfg["use_cuda_graph_decoder"] = False
+            updated = True
+        except Exception:  # noqa: BLE001
+            updated = False
+    if not updated:
+        try:
+            from omegaconf import open_dict
+
+            with open_dict(greedy_cfg):
+                greedy_cfg["use_cuda_graph_decoder"] = False
+            updated = True
+        except Exception:  # noqa: BLE001
+            updated = False
+    if not updated:
+        LOGGER.warning(
+            "Unable to disable CUDA graph decoder for Parakeet model %s; "
+            "continuing with default decoding configuration.",
+            resolved_model_id,
+        )
+        return
+
+    if hasattr(model, "change_decoding_strategy"):
+        try:
+            model.change_decoding_strategy(decoding_cfg, verbose=False)
+        except TypeError:
+            model.change_decoding_strategy(decoding_cfg)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "Disabled CUDA graph decoder for %s, but failed to refresh decoding strategy: %s",
+                resolved_model_id,
+                exc,
+            )
+            return
+
+    LOGGER.info(
+        "Disabled NeMo CUDA graph decoder for Parakeet model %s for runtime stability.",
+        resolved_model_id,
+    )
+
+
+def _prepare_nemo_model_for_inference(model: Any, resolved_model_id: str) -> None:
+    """Ensure loaded NeMo model is configured for inference-time execution."""
+    if hasattr(model, "eval"):
+        try:
+            model.eval()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to set NeMo model %s to eval mode: %s", resolved_model_id, exc)
+    if hasattr(model, "requires_grad_"):
+        try:
+            model.requires_grad_(False)
+        except Exception:  # noqa: BLE001
+            # Best effort only; not all wrappers expose requires_grad_ safely.
+            pass
 
 
 def _resolve_transcription_backend(transcription_model: str) -> tuple[TranscriptionBackend, str]:
@@ -224,7 +333,7 @@ def _get_hf_repo_snapshot(repo_id: str, *, local_files_only: bool) -> str:
         ) from exc
 
     if local_files_only:
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        _enforce_hf_offline_mode()
     try:
         snapshot_dir = snapshot_download(repo_id=repo_id, local_files_only=local_files_only)
     except Exception as exc:  # noqa: BLE001
@@ -254,7 +363,8 @@ def _get_faster_whisper_model(model_id: str, *, local_files_only: bool = True) -
             "Transcription benchmarking requires `faster-whisper`. Install it before running this scenario."
         ) from exc
 
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    if local_files_only:
+        _enforce_hf_offline_mode()
     try:
         model = WhisperModel(
             normalized,
@@ -372,9 +482,16 @@ def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
     _, resolved_model_id = _resolve_transcription_backend(model_id)
     cache_key = f"{resolved_model_id}|local_files_only={local_files_only}"
     if cache_key in _NEMO_ASR_MODEL_CACHE:
-        return _NEMO_ASR_MODEL_CACHE[cache_key]
+        model = _NEMO_ASR_MODEL_CACHE[cache_key]
+        _prepare_nemo_model_for_inference(model, resolved_model_id)
+        return model
     if local_files_only and resolved_model_id in _NEMO_ASR_MODEL_CACHE:
-        return _NEMO_ASR_MODEL_CACHE[resolved_model_id]
+        model = _NEMO_ASR_MODEL_CACHE[resolved_model_id]
+        _prepare_nemo_model_for_inference(model, resolved_model_id)
+        return model
+
+    if local_files_only:
+        _enforce_hf_offline_mode()
 
     snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=local_files_only)
     try:
@@ -408,10 +525,16 @@ def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
             model = None
 
     if model is None:
+        for exc in load_errors:
+            if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
+                raise _offline_model_error(resolved_model_id) from exc
         raise RuntimeError(
             f"Failed to initialize NeMo ASR model for {resolved_model_id!r} from snapshot "
             f"{snapshot_dir!r}: {load_errors[-1]}"
         ) from load_errors[-1]
+
+    _apply_parakeet_runtime_compatibility(model, resolved_model_id)
+    _prepare_nemo_model_for_inference(model, resolved_model_id)
 
     _NEMO_ASR_MODEL_CACHE[cache_key] = model
     if local_files_only:
@@ -427,6 +550,9 @@ def _get_qwen_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
         return _QWEN_ASR_MODEL_CACHE[cache_key]
     if local_files_only and resolved_model_id in _QWEN_ASR_MODEL_CACHE:
         return _QWEN_ASR_MODEL_CACHE[resolved_model_id]
+
+    if local_files_only:
+        _enforce_hf_offline_mode()
 
     snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=local_files_only)
     try:
@@ -732,8 +858,7 @@ def load_hf_diarized_rows(
     sample_limit: int | None,
 ) -> list[dict[str, object]]:
     """Load diarized transcription rows from Hugging Face datasets."""
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    _enforce_hf_offline_mode()
 
     try:
         from datasets import Audio, DownloadConfig, load_dataset

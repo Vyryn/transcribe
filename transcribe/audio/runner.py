@@ -60,6 +60,7 @@ def run_capture_session(
 
     backend = LinuxAudioCaptureBackend(use_fixture=use_fixture)
     backend.open(config)
+    capture_sample_rate_hz = backend.sample_rate_hz or config.sample_rate_hz
 
     frame_index = 0
     stats = SyncAccumulator()
@@ -68,8 +69,8 @@ def run_capture_session(
 
     try:
         with (
-            Pcm16MonoWavWriter(mic_path, sample_rate_hz=config.sample_rate_hz) as mic_writer,
-            Pcm16MonoWavWriter(speakers_path, sample_rate_hz=config.sample_rate_hz) as speakers_writer,
+            Pcm16MonoWavWriter(mic_path, sample_rate_hz=capture_sample_rate_hz) as mic_writer,
+            Pcm16MonoWavWriter(speakers_path, sample_rate_hz=capture_sample_rate_hz) as speakers_writer,
         ):
             while time.monotonic() - started_monotonic < duration_sec:
                 try:
@@ -115,7 +116,7 @@ def run_capture_session(
         session_id=config.session_id,
         created_at_utc=datetime.now(timezone.utc),
         source_mode=config.source_mode,
-        sample_rate_hz=config.sample_rate_hz,
+        sample_rate_hz=capture_sample_rate_hz,
         frame_ms=config.frame_ms,
         channels=config.channels,
         artifacts={
