@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+import queue
+import struct
+import time
+
+import pytest
+
+from transcribe.audio.interfaces import RawFrame
+from transcribe.audio.linux_capture import LinuxAudioCaptureBackend
+from transcribe.models import AudioSourceMode, CaptureConfig
+
+
+class _FakeSoundDevice:
+    def __init__(self, *, default_rates: dict[int, int], supported_rates: dict[int, set[int]]) -> None:
+        self._default_rates = default_rates
+        self._supported_rates = supported_rates
+
+    def query_devices(self, device: int | None = None):
+        if device is None:
+            devices = []
+            for index in sorted(self._default_rates):
+                devices.append(
+                    {
+                        "name": f"mic-{index}",
+                        "max_input_channels": 1,
+                        "default_samplerate": float(self._default_rates[index]),
+                    }
+                )
+            return devices
+        return {
+            "name": f"mic-{device}",
+            "max_input_channels": 1,
+            "default_samplerate": float(self._default_rates[int(device)]),
+        }
+
+    def check_input_settings(self, *, device: int, channels: int, dtype: str, samplerate: float) -> None:
+        _ = (channels, dtype)
+        if int(round(samplerate)) not in self._supported_rates[int(device)]:
+            raise ValueError("unsupported sample rate")
+
+
+def test_negotiate_sample_rate_prefers_requested_rate() -> None:
+    backend = LinuxAudioCaptureBackend(use_fixture=True)
+    sd = _FakeSoundDevice(default_rates={0: 48_000}, supported_rates={0: {16_000, 48_000}})
+
+    resolved = backend.negotiate_sample_rate(
+        sd,
+        devices=(0,),
+        channels=1,
+        requested_sample_rate_hz=16_000,
+    )
+
+    assert resolved == 16_000
+
+
+def test_negotiate_sample_rate_falls_back_to_device_default() -> None:
+    backend = LinuxAudioCaptureBackend(use_fixture=True)
+    sd = _FakeSoundDevice(default_rates={0: 48_000}, supported_rates={0: {48_000}})
+
+    resolved = backend.negotiate_sample_rate(
+        sd,
+        devices=(0,),
+        channels=1,
+        requested_sample_rate_hz=16_000,
+    )
+
+    assert resolved == 48_000
+
+
+def test_negotiate_sample_rate_raises_when_no_candidate_supported() -> None:
+    backend = LinuxAudioCaptureBackend(use_fixture=True)
+    sd = _FakeSoundDevice(default_rates={0: 12_345}, supported_rates={0: set()})
+
+    with pytest.raises(RuntimeError, match="No supported sample rate found"):
+        backend.negotiate_sample_rate(
+            sd,
+            devices=(0,),
+            channels=1,
+            requested_sample_rate_hz=16_000,
+        )
+
+
+def test_resolve_devices_returns_all_candidates_when_include_all() -> None:
+    class _Catalog:
+        @staticmethod
+        def query_devices():
+            return [
+                {"name": "USB Mic 1", "max_input_channels": 1, "default_samplerate": 48_000.0},
+                {"name": "USB Mic 2", "max_input_channels": 1, "default_samplerate": 48_000.0},
+                {"name": "Monitor of Built-in Output", "max_input_channels": 2, "default_samplerate": 48_000.0},
+                {"name": "Loopback Source", "max_input_channels": 2, "default_samplerate": 48_000.0},
+            ]
+
+    backend = LinuxAudioCaptureBackend(use_fixture=True)
+    mic_devices = backend.resolve_devices(
+        _Catalog(),
+        configured=None,
+        require_monitor=False,
+        include_all=True,
+        allow_missing=False,
+    )
+    speaker_devices = backend.resolve_devices(
+        _Catalog(),
+        configured=None,
+        require_monitor=True,
+        include_all=True,
+        allow_missing=False,
+    )
+
+    assert mic_devices == [0, 1]
+    assert speaker_devices == [2, 3]
+
+
+def test_read_frames_selects_clearest_frame_per_group() -> None:
+    backend = LinuxAudioCaptureBackend(use_fixture=False)
+    backend.config = CaptureConfig(source_mode=AudioSourceMode.BOTH)
+    backend._active_stream_names = ("mic",)
+    backend._group_stream_keys = {"mic": ("mic:0", "mic:1")}
+    backend._queues = {
+        "mic:0": queue.Queue(maxsize=10),
+        "mic:1": queue.Queue(maxsize=10),
+    }
+
+    quiet = struct.pack("<h", 500) * 320
+    loud = struct.pack("<h", 5_000) * 320
+    backend._queues["mic:0"].put(
+        RawFrame(stream="mic", mono_pcm16=quiet, captured_at_monotonic_ns=time.monotonic_ns())
+    )
+    backend._queues["mic:1"].put(
+        RawFrame(stream="mic", mono_pcm16=loud, captured_at_monotonic_ns=time.monotonic_ns())
+    )
+
+    frames = backend.read_frames(timeout_ms=20)
+
+    assert frames["mic"].mono_pcm16 == loud

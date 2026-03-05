@@ -1,0 +1,508 @@
+from __future__ import annotations
+
+import argparse
+import json
+import struct
+import time
+import wave
+from io import BytesIO
+from pathlib import Path
+
+import pytest
+
+from transcribe.live.session import LiveSessionConfig, run_live_transcription_session
+from transcribe.models import AudioSourceMode
+
+
+def test_run_live_transcription_session_fixture_writes_artifacts(tmp_path) -> None:
+    calls = {"count": 0}
+
+    def fake_transcriber(wav_bytes: bytes, model_id: str) -> tuple[str, float]:
+        assert wav_bytes.startswith(b"RIFF")
+        assert model_id == "unit-test-model"
+        calls["count"] += 1
+        return f"chunk-{calls['count']}", 7.5
+
+    session_dir = tmp_path / "live-session"
+    config = LiveSessionConfig(
+        transcription_model="unit-test-model",
+        duration_sec=0.30,
+        chunk_sec=0.12,
+        partial_interval_sec=0.05,
+        output_dir=session_dir,
+        session_id="live-test-session",
+    )
+    result = run_live_transcription_session(
+        config,
+        use_fixture=True,
+        transcriber=fake_transcriber,
+    )
+
+    assert result.session_dir == session_dir
+    assert result.events_path.exists()
+    assert result.transcript_json_path.exists()
+    assert result.transcript_txt_path.exists()
+    assert result.final_segment_count >= 1
+    assert calls["count"] >= result.final_segment_count
+
+    payload = json.loads(result.transcript_json_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "phase1-live-session-v1"
+    assert payload["session_id"] == "live-test-session"
+    assert payload["transcription_model"] == "unit-test-model"
+    assert payload["metrics"]["final_segment_count"] == result.final_segment_count
+
+    events = [
+        json.loads(line)
+        for line in result.events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(event["event"] == "final" for event in events)
+
+
+def test_cli_parser_accepts_session_run_command() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "session",
+            "run",
+            "--model",
+            "nvidia/parakeet-tdt-0.6b-v3",
+            "--duration-sec",
+            "0",
+            "--fixture",
+        ]
+    )
+    assert args.command == "session"
+    assert args.session_command == "run"
+    assert args.transcription_model == "nvidia/parakeet-tdt-0.6b-v3"
+    assert args.duration_sec == 0.0
+    assert args.mode == AudioSourceMode.BOTH
+    assert args.fixture is True
+
+
+def test_cli_parser_uses_larger_default_session_model() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "session",
+            "run",
+            "--fixture",
+        ]
+    )
+    assert args.transcription_model == "nvidia/canary-qwen-2.5b"
+    assert args.partial_interval_sec == 0.0
+
+
+def test_cli_parser_accepts_session_run_mic_device_index() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "session",
+            "run",
+            "--mic-device",
+            "2",
+            "--fixture",
+        ]
+    )
+    assert args.mic_device == 2
+
+
+def test_cli_parser_accepts_session_run_mic_device_bracketed_index() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "session",
+            "run",
+            "--mic-device",
+            "[2]",
+            "--fixture",
+        ]
+    )
+    assert args.mic_device == 2
+
+
+def test_cli_parser_accepts_session_run_mic_device_name() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "session",
+            "run",
+            "--mic-device",
+            "USB Audio Mic",
+            "--fixture",
+        ]
+    )
+    assert args.mic_device == "USB Audio Mic"
+
+
+def test_cli_parser_accepts_session_run_speaker_device_index() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "session",
+            "run",
+            "--speaker-device",
+            "4",
+            "--fixture",
+        ]
+    )
+    assert args.speaker_device == 4
+
+
+def test_cli_parser_accepts_capture_run_mic_device_index() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "capture",
+            "run",
+            "--mode",
+            "both",
+            "--mic-device",
+            "3",
+            "--fixture",
+        ]
+    )
+    assert args.mic_device == 3
+
+
+def test_cli_parser_accepts_capture_run_speaker_device_index() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "capture",
+            "run",
+            "--mode",
+            "both",
+            "--speaker-device",
+            "[5]",
+            "--fixture",
+        ]
+    )
+    assert args.speaker_device == 5
+
+
+def test_live_session_uses_requested_sample_rate_for_asr_payload(monkeypatch, tmp_path) -> None:
+    from transcribe.audio.interfaces import RawFrame
+    import transcribe.live.session as live_session_module
+
+    observed_rates: list[int] = []
+
+    class FakeBackend:
+        def __init__(self, *, use_fixture: bool = False) -> None:
+            _ = use_fixture
+            self.sample_rate_hz = 48_000
+            self._closed = False
+
+        def open(self, config) -> None:
+            _ = config
+
+        def read_frames(self, timeout_ms: int = 500) -> dict[str, RawFrame]:
+            _ = timeout_ms
+            time.sleep(0.02)
+            frame_samples = int((self.sample_rate_hz * 20) / 1000)
+            voiced_frame = struct.pack("<h", 1_200) * frame_samples
+            return {
+                "mic": RawFrame(
+                    stream="mic",
+                    mono_pcm16=voiced_frame,
+                    captured_at_monotonic_ns=time.monotonic_ns(),
+                )
+            }
+
+        def close(self) -> None:
+            self._closed = True
+
+    def fake_transcriber(wav_bytes: bytes, model_id: str) -> tuple[str, float]:
+        _ = model_id
+        with wave.open(BytesIO(wav_bytes), "rb") as wav:
+            observed_rates.append(wav.getframerate())
+        return "ok", 5.0
+
+    monkeypatch.setattr(live_session_module, "LinuxAudioCaptureBackend", FakeBackend)
+    config = LiveSessionConfig(
+        transcription_model="unit-test-model",
+        sample_rate_hz=16_000,
+        duration_sec=0.08,
+        chunk_sec=0.04,
+        partial_interval_sec=0.0,
+        output_dir=tmp_path / "live-rate-test",
+        session_id="live-rate-test",
+    )
+    result = run_live_transcription_session(config, use_fixture=False, transcriber=fake_transcriber)
+    payload = json.loads(result.transcript_json_path.read_text(encoding="utf-8"))
+
+    assert result.sample_rate_hz_requested == 16_000
+    assert result.sample_rate_hz == 48_000
+    assert payload["transcription_sample_rate_hz"] == 16_000
+    assert observed_rates
+    assert all(rate == 16_000 for rate in observed_rates)
+
+
+def test_live_session_selects_best_source_and_tracks_source_usage(monkeypatch, tmp_path) -> None:
+    from transcribe.audio.interfaces import RawFrame
+    import transcribe.live.session as live_session_module
+
+    class FakeBackend:
+        captured_config = None
+
+        def __init__(self, *, use_fixture: bool = False) -> None:
+            _ = use_fixture
+            self.sample_rate_hz = 16_000
+            self._calls = 0
+
+        def open(self, config) -> None:
+            FakeBackend.captured_config = config
+
+        def read_frames(self, timeout_ms: int = 500) -> dict[str, RawFrame]:
+            _ = timeout_ms
+            self._calls += 1
+            frame_samples = int((self.sample_rate_hz * 20) / 1000)
+            quiet_frame = struct.pack("<h", 700) * frame_samples
+            loud_frame = struct.pack("<h", 7_000) * frame_samples
+            return {
+                "mic": RawFrame(
+                    stream="mic",
+                    mono_pcm16=quiet_frame,
+                    captured_at_monotonic_ns=time.monotonic_ns(),
+                ),
+                "speakers": RawFrame(
+                    stream="speakers",
+                    mono_pcm16=loud_frame,
+                    captured_at_monotonic_ns=time.monotonic_ns(),
+                ),
+            }
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(live_session_module, "LinuxAudioCaptureBackend", FakeBackend)
+    config = LiveSessionConfig(
+        transcription_model="unit-test-model",
+        sample_rate_hz=16_000,
+        duration_sec=0.12,
+        chunk_sec=0.06,
+        partial_interval_sec=0.0,
+        output_dir=tmp_path / "live-best-source",
+        session_id="live-best-source",
+    )
+    result = run_live_transcription_session(
+        config,
+        use_fixture=False,
+        transcriber=lambda wav_bytes, model_id: ("ok", 1.0),
+    )
+
+    assert result.final_segment_count >= 1
+    assert FakeBackend.captured_config is not None
+    assert FakeBackend.captured_config.source_mode == AudioSourceMode.BOTH
+    assert FakeBackend.captured_config.capture_all_mic_devices is True
+    assert FakeBackend.captured_config.capture_all_speaker_devices is True
+    assert FakeBackend.captured_config.allow_missing_sources is True
+
+    payload = json.loads(result.transcript_json_path.read_text(encoding="utf-8"))
+    selection_counts = payload["metrics"]["source_selection_counts"]
+    assert selection_counts["speakers"] > 0
+    assert selection_counts.get("mic", 0) == 0
+
+
+def test_live_session_capture_coverage_ratio_stays_reasonable(monkeypatch, tmp_path) -> None:
+    from transcribe.audio.interfaces import RawFrame
+    import transcribe.live.session as live_session_module
+
+    class FakeBackend:
+        def __init__(self, *, use_fixture: bool = False) -> None:
+            _ = use_fixture
+            self.sample_rate_hz = 16_000
+
+        def open(self, config) -> None:
+            _ = config
+
+        def read_frames(self, timeout_ms: int = 500) -> dict[str, RawFrame]:
+            _ = timeout_ms
+            time.sleep(0.02)
+            frame_samples = int((self.sample_rate_hz * 20) / 1000)
+            frame_pcm = struct.pack("<h", 2_000) * frame_samples
+            now_ns = time.monotonic_ns()
+            return {
+                "mic": RawFrame(
+                    stream="mic",
+                    mono_pcm16=frame_pcm,
+                    captured_at_monotonic_ns=now_ns,
+                ),
+                "speakers": RawFrame(
+                    stream="speakers",
+                    mono_pcm16=frame_pcm,
+                    captured_at_monotonic_ns=now_ns,
+                ),
+            }
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(live_session_module, "LinuxAudioCaptureBackend", FakeBackend)
+    config = LiveSessionConfig(
+        transcription_model="unit-test-model",
+        sample_rate_hz=16_000,
+        duration_sec=0.5,
+        chunk_sec=0.25,
+        partial_interval_sec=0.0,
+        output_dir=tmp_path / "live-coverage",
+        session_id="live-coverage",
+    )
+    result = run_live_transcription_session(
+        config,
+        use_fixture=False,
+        transcriber=lambda wav_bytes, model_id: ("ok", 1.0),
+    )
+
+    payload = json.loads(result.transcript_json_path.read_text(encoding="utf-8"))
+    coverage_ratio = payload["metrics"]["capture_coverage_ratio"]
+    assert coverage_ratio >= 0.45
+
+
+def test_live_session_filters_placeholder_transcript_outputs(tmp_path) -> None:
+    calls = {"count": 0}
+
+    def fake_transcriber(wav_bytes: bytes, model_id: str) -> tuple[str, float]:
+        _ = (wav_bytes, model_id)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return "Transcribe the following", 5.0
+        return "Transcript: actual words", 5.0
+
+    config = LiveSessionConfig(
+        transcription_model="unit-test-model",
+        duration_sec=0.12,
+        chunk_sec=0.06,
+        partial_interval_sec=0.0,
+        output_dir=tmp_path / "live-filter",
+        session_id="live-filter",
+    )
+    result = run_live_transcription_session(config, use_fixture=True, transcriber=fake_transcriber)
+    payload = json.loads(result.transcript_json_path.read_text(encoding="utf-8"))
+
+    final_texts = [segment["text"] for segment in payload["final_segments"]]
+    assert all(text != "" for text in final_texts)
+    assert "Transcribe the following" not in final_texts
+    assert "actual words" in final_texts
+    assert payload["metrics"]["dropped_empty_chunk_count"] >= 1
+
+
+def test_live_session_skips_asr_for_silent_chunks(monkeypatch, tmp_path) -> None:
+    from transcribe.audio.interfaces import RawFrame
+    import transcribe.live.session as live_session_module
+
+    calls = {"count": 0}
+
+    class FakeBackend:
+        def __init__(self, *, use_fixture: bool = False) -> None:
+            _ = use_fixture
+            self.sample_rate_hz = 16_000
+
+        def open(self, config) -> None:
+            _ = config
+
+        def read_frames(self, timeout_ms: int = 500) -> dict[str, RawFrame]:
+            _ = timeout_ms
+            time.sleep(0.02)
+            frame_samples = int((self.sample_rate_hz * 20) / 1000)
+            silent_pcm = b"\x00\x00" * frame_samples
+            return {
+                "mic": RawFrame(
+                    stream="mic",
+                    mono_pcm16=silent_pcm,
+                    captured_at_monotonic_ns=time.monotonic_ns(),
+                )
+            }
+
+        def close(self) -> None:
+            return None
+
+    def fake_transcriber(wav_bytes: bytes, model_id: str) -> tuple[str, float]:
+        _ = (wav_bytes, model_id)
+        calls["count"] += 1
+        return "unexpected", 1.0
+
+    monkeypatch.setattr(live_session_module, "LinuxAudioCaptureBackend", FakeBackend)
+    config = LiveSessionConfig(
+        transcription_model="unit-test-model",
+        sample_rate_hz=16_000,
+        duration_sec=0.5,
+        chunk_sec=0.25,
+        partial_interval_sec=0.0,
+        output_dir=tmp_path / "live-silence-skip",
+        session_id="live-silence-skip",
+    )
+    result = run_live_transcription_session(config, use_fixture=False, transcriber=fake_transcriber)
+    payload = json.loads(result.transcript_json_path.read_text(encoding="utf-8"))
+
+    assert calls["count"] == 0
+    assert payload["metrics"]["silence_skipped_chunk_count"] >= 1
+    assert payload["final_segments"] == []
+
+
+def test_live_session_parakeet_failure_surfaces_fallback_hint(tmp_path) -> None:
+    def failing_transcriber(wav_bytes: bytes, model_id: str) -> tuple[str, float]:
+        _ = (wav_bytes, model_id)
+        raise ValueError("decoder exploded")
+
+    config = LiveSessionConfig(
+        transcription_model="nvidia/parakeet-tdt-0.6b-v3",
+        duration_sec=0.08,
+        chunk_sec=0.04,
+        partial_interval_sec=0.0,
+        output_dir=tmp_path / "live-failure",
+        session_id="live-failure",
+    )
+    with pytest.raises(RuntimeError, match="Parakeet decoder failed") as excinfo:
+        run_live_transcription_session(
+            config,
+            use_fixture=True,
+            transcriber=failing_transcriber,
+        )
+
+    message = str(excinfo.value)
+    assert "Qwen/Qwen3-ASR-0.6B" in message
+
+
+def test_run_session_returns_code_2_on_runtime_error(monkeypatch, tmp_path, capsys) -> None:
+    import transcribe.cli as cli_module
+    import transcribe.live.session as live_session_module
+
+    monkeypatch.setattr(cli_module, "load_and_configure_logging", lambda args: None)
+
+    def failing_runner(config, *, use_fixture: bool = False):
+        _ = (config, use_fixture)
+        raise RuntimeError("Parakeet decoder failed in this runtime")
+
+    monkeypatch.setattr(live_session_module, "run_live_transcription_session", failing_runner)
+
+    args = argparse.Namespace(
+        config=None,
+        log_level=None,
+        transcription_model="nvidia/parakeet-tdt-0.6b-v3",
+        duration_sec=0.0,
+        chunk_sec=4.0,
+        partial_interval_sec=1.0,
+        mode=AudioSourceMode.BOTH,
+        mic_device=None,
+        speaker_device=None,
+        single_device_per_source=False,
+        strict_sources=False,
+        out=Path(tmp_path),
+        session_id="live-test",
+        max_model_ram_gb=8.0,
+        fixture=False,
+    )
+    rc = cli_module.run_session(args)
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert "Session failed:" in captured.out
