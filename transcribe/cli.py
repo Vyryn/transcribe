@@ -49,6 +49,34 @@ def parse_mode(value: str) -> AudioSourceMode:
         raise argparse.ArgumentTypeError(f"Unsupported mode: {value!r}") from exc
 
 
+def parse_device_ref(value: str) -> str | int:
+    """Parse CLI device reference as index or name.
+
+    Parameters
+    ----------
+    value : str
+        Device argument passed on CLI.
+
+    Returns
+    -------
+    str | int
+        Integer index when value is numeric (or bracketed numeric), otherwise name string.
+    """
+    stripped = value.strip()
+    if not stripped:
+        raise argparse.ArgumentTypeError("Device reference cannot be empty")
+
+    if stripped.isdigit():
+        return int(stripped)
+
+    if stripped.startswith("[") and stripped.endswith("]"):
+        inner = stripped[1:-1].strip()
+        if inner.isdigit():
+            return int(inner)
+
+    return stripped
+
+
 def add_common_config_flags(parser: argparse.ArgumentParser) -> None:
     """Attach common config/log flags to a parser.
 
@@ -69,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     argparse.ArgumentParser
         Configured parser.
     """
-    parser = argparse.ArgumentParser(prog="transcribe", description="Offline transcription phase 0 CLI")
+    parser = argparse.ArgumentParser(prog="transcribe", description="Offline transcription CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     capture_parser = subparsers.add_parser("capture", help="Audio capture commands")
@@ -81,8 +109,18 @@ def build_parser() -> argparse.ArgumentParser:
     capture_run.add_argument("--duration-sec", type=float, default=30.0)
     capture_run.add_argument("--out", type=Path, default=Path("data/captures"))
     capture_run.add_argument("--session-id", default=None)
-    capture_run.add_argument("--mic-device", default=None)
-    capture_run.add_argument("--speaker-device", default=None)
+    capture_run.add_argument(
+        "--mic-device",
+        type=parse_device_ref,
+        default=None,
+        help="Mic device name or index from `capture devices`",
+    )
+    capture_run.add_argument(
+        "--speaker-device",
+        type=parse_device_ref,
+        default=None,
+        help="Speaker monitor device name or index from `capture devices`",
+    )
     capture_run.add_argument("--fixture", action="store_true", help="Use synthetic audio fixture")
 
     capture_devices = capture_subparsers.add_parser("devices", help="List Linux capture devices")
@@ -119,6 +157,69 @@ def build_parser() -> argparse.ArgumentParser:
         help="Model id under test (whisper*=>faster-whisper, nvidia/*=>nemo_asr, qwen/*=>qwen-asr)",
     )
     bench_run.add_argument(
+        "--max-model-ram-gb",
+        type=float,
+        default=8.0,
+        help="Reject models with estimated runtime RAM above this threshold",
+    )
+
+    session_parser = subparsers.add_parser("session", help="Live transcription session commands")
+    session_subparsers = session_parser.add_subparsers(dest="session_command", required=True)
+
+    session_run = session_subparsers.add_parser("run", help="Run live multi-source transcription test rig")
+    add_common_config_flags(session_run)
+    session_run.add_argument(
+        "--model",
+        "--transcription-model",
+        dest="transcription_model",
+        default="nvidia/canary-qwen-2.5b",
+        help="Model id for streaming ASR (for example nvidia/canary-qwen-2.5b)",
+    )
+    session_run.add_argument(
+        "--duration-sec",
+        type=float,
+        default=0.0,
+        help="Session runtime in seconds; 0 runs until interrupted (Ctrl+C)",
+    )
+    session_run.add_argument(
+        "--mode",
+        type=parse_mode,
+        default=AudioSourceMode.BOTH,
+        help="Source mode: mic, speakers, or both (default: both)",
+    )
+    session_run.add_argument("--chunk-sec", type=float, default=4.0, help="Finalization chunk size in seconds")
+    session_run.add_argument(
+        "--partial-interval-sec",
+        type=float,
+        default=0.0,
+        help="Partial transcript refresh interval in seconds (0 disables partials)",
+    )
+    session_run.add_argument("--out", type=Path, default=Path("data/live_sessions"))
+    session_run.add_argument("--session-id", default=None)
+    session_run.add_argument(
+        "--mic-device",
+        type=parse_device_ref,
+        default=None,
+        help="Mic device name or index from `capture devices`",
+    )
+    session_run.add_argument(
+        "--speaker-device",
+        type=parse_device_ref,
+        default=None,
+        help="Speaker monitor device name or index from `capture devices`",
+    )
+    session_run.add_argument(
+        "--single-device-per-source",
+        action="store_true",
+        help="Use only one device per source type (disable all-device auto-selection)",
+    )
+    session_run.add_argument(
+        "--strict-sources",
+        action="store_true",
+        help="Fail when any requested source type has no usable device",
+    )
+    session_run.add_argument("--fixture", action="store_true", help="Use synthetic audio fixture")
+    session_run.add_argument(
         "--max-model-ram-gb",
         type=float,
         default=8.0,
@@ -274,6 +375,61 @@ def run_benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_session(args: argparse.Namespace) -> int:
+    """Execute the ``session run`` command.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments.
+
+    Returns
+    -------
+    int
+        Exit code.
+    """
+    from transcribe.live.session import LiveSessionConfig, run_live_transcription_session
+
+    load_and_configure_logging(args)
+    session_id = args.session_id or default_session_id("live")
+    output_dir = args.out / session_id
+    config = LiveSessionConfig(
+        transcription_model=args.transcription_model,
+        duration_sec=args.duration_sec,
+        chunk_sec=args.chunk_sec,
+        partial_interval_sec=args.partial_interval_sec,
+        source_mode=args.mode,
+        mic_device=args.mic_device,
+        speaker_device=args.speaker_device,
+        capture_all_mic_devices=not args.single_device_per_source,
+        capture_all_speaker_devices=not args.single_device_per_source,
+        allow_missing_sources=not args.strict_sources,
+        output_dir=output_dir,
+        session_id=session_id,
+        max_model_ram_gb=args.max_model_ram_gb,
+    )
+    try:
+        result = run_live_transcription_session(config, use_fixture=args.fixture)
+    except RuntimeError as exc:
+        print(f"Session failed: {exc}")
+        return 2
+
+    print(f"Session complete: {result.session_dir}")
+    print(f"Events JSONL: {result.events_path}")
+    print(f"Transcript JSON: {result.transcript_json_path}")
+    print(f"Transcript TXT: {result.transcript_txt_path}")
+    print(f"Final segments: {result.final_segment_count}")
+    print(f"Partial events: {result.partial_event_count}")
+    print(
+        "Sample rate (requested/effective Hz): "
+        f"{result.sample_rate_hz_requested}/{result.sample_rate_hz}"
+    )
+    print(f"Source selections: {result.source_selection_counts}")
+    print(f"Audio sec: {result.total_audio_sec:.3f}")
+    print(f"Inference sec: {result.total_inference_sec:.3f}")
+    return 0
+
+
 def run_check_no_network(args: argparse.Namespace) -> int:
     """Execute the ``compliance check-no-network`` command.
 
@@ -330,6 +486,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_devices(args)
     if args.command == "bench" and args.bench_command == "run":
         return run_benchmark(args)
+    if args.command == "session" and args.session_command == "run":
+        return run_session(args)
     if args.command == "compliance" and args.compliance_command == "check-no-network":
         return run_check_no_network(args)
     if args.command == "compliance" and args.compliance_command == "check-no-urls":
