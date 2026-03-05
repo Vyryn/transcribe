@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import importlib
 import logging
 import math
@@ -15,6 +16,84 @@ _SOUNDDEVICE: Any | None = None
 _SOUNDDEVICE_ATTEMPTED = False
 _SOUNDDEVICE_IMPORT_ERROR: Exception | None = None
 LOGGER = logging.getLogger("transcribe.audio.linux_capture")
+
+_GENERIC_BACKEND_DEVICE_NAMES = {
+    "pipewire",
+    "pulse",
+    "default",
+    "sysdefault",
+    "front",
+    "surround40",
+    "surround41",
+    "surround50",
+    "surround51",
+    "surround71",
+}
+
+_SPEAKER_STRONG_MARKERS = (
+    "monitor",
+    "loopback",
+    "playback stream",
+    "internal playback stream",
+    "stereo mix",
+    "what u hear",
+)
+_SPEAKER_WEAK_MARKERS = (
+    "playback",
+    "output",
+    "sink",
+    "speaker",
+    "speakers",
+    "hdmi",
+    "iec958",
+    "digital stereo",
+)
+_SPEAKER_APP_MARKERS = (
+    "spotify",
+    "chrome",
+    "chromium",
+    "firefox",
+    "browser",
+    "youtube",
+    "vlc",
+    "mpv",
+    "discord",
+    "zoom",
+    "teams",
+    "obs",
+)
+
+_MIC_STRONG_MARKERS = (
+    "noisetorch",
+    "rnnoise",
+    "krisp",
+    "microphone",
+    " usb mic",
+    "usb mic ",
+)
+_MIC_WEAK_MARKERS = (
+    "mic",
+    "capture stream",
+    "capture",
+    "source",
+    "input",
+    "headset",
+)
+_MIC_NEGATIVE_APP_MARKERS = (
+    "spotify",
+    "chrome",
+    "chromium",
+    "firefox",
+    "browser",
+    "youtube",
+    "vlc",
+    "mpv",
+    "discord",
+    "zoom",
+    "teams",
+    "obs",
+    "settings",
+)
 
 
 def load_sounddevice() -> Any | None:
@@ -270,20 +349,105 @@ class LinuxAudioCaptureBackend:
         *,
         require_monitor: bool,
     ) -> list[int]:
-        """Return candidate device indices for microphone or loopback capture."""
-        monitor_markers = ("monitor", "loopback")
-        candidates: list[int] = []
-        for index, device in enumerate(sd.query_devices()):
-            name = str(device.get("name", ""))
-            input_channels = int(device.get("max_input_channels", 0))
+        """Return ranked candidate device indices for mic or speaker/loopback capture."""
+        scored_candidates: list[tuple[float, int]] = []
+        generic_fallbacks: list[int] = []
+        for index, raw_device in enumerate(sd.query_devices()):
+            if not isinstance(raw_device, Mapping):
+                continue
+            name = self._normalize_device_name(raw_device)
+            input_channels = int(raw_device.get("max_input_channels", 0))
             if input_channels < 1:
                 continue
-            is_monitor = any(marker in name.lower() for marker in monitor_markers)
-            if require_monitor and is_monitor:
-                candidates.append(index)
-            if not require_monitor and not is_monitor:
-                candidates.append(index)
-        return candidates
+
+            if self._is_generic_backend_device(name):
+                generic_fallbacks.append(index)
+
+            score = self._score_device_for_role(name=name, require_monitor=require_monitor)
+            minimum_score = 0.01 if require_monitor else 0.0
+            if score >= minimum_score:
+                # Slightly prefer devices with more input channels as tiebreaker.
+                scored_candidates.append((score + min(float(input_channels), 4.0) * 0.01, index))
+
+        if scored_candidates:
+            scored_candidates.sort(key=lambda item: (-item[0], item[1]))
+            return [index for _, index in scored_candidates]
+
+        # Fallback: if no confident speaker candidate exists, try generic backend nodes.
+        if require_monitor and generic_fallbacks:
+            return generic_fallbacks
+
+        # Fallback: for mic mode, use all non-speaker-like devices.
+        if not require_monitor:
+            fallback_mic: list[int] = []
+            for index, raw_device in enumerate(sd.query_devices()):
+                if not isinstance(raw_device, Mapping):
+                    continue
+                input_channels = int(raw_device.get("max_input_channels", 0))
+                if input_channels < 1:
+                    continue
+                name = self._normalize_device_name(raw_device)
+                speaker_score = self._score_device_for_role(name=name, require_monitor=True)
+                if speaker_score <= 0:
+                    fallback_mic.append(index)
+            return fallback_mic
+
+        return []
+
+    @staticmethod
+    def _normalize_device_name(device: Mapping[str, object]) -> str:
+        """Normalize a queried device name for role classification."""
+        return str(device.get("name", "")).strip().lower()
+
+    @staticmethod
+    def _is_generic_backend_device(device_name_lower: str) -> bool:
+        """Return True when name matches a generic routing backend."""
+        return device_name_lower in _GENERIC_BACKEND_DEVICE_NAMES
+
+    @staticmethod
+    def _score_device_for_role(*, name: str, require_monitor: bool) -> float:
+        """Score a device name for microphone or speaker/loopback suitability."""
+        score = 0.0
+        is_generic = LinuxAudioCaptureBackend._is_generic_backend_device(name)
+
+        has_speaker_strong = any(marker in name for marker in _SPEAKER_STRONG_MARKERS)
+        has_speaker_weak = any(marker in name for marker in _SPEAKER_WEAK_MARKERS)
+        has_speaker_app = any(marker in name for marker in _SPEAKER_APP_MARKERS)
+        has_mic_strong = any(marker in name for marker in _MIC_STRONG_MARKERS)
+        has_mic_weak = any(marker in name for marker in _MIC_WEAK_MARKERS)
+        has_capture_stream = "capture stream" in name
+        has_playback_stream = "playback stream" in name
+
+        if require_monitor:
+            if has_speaker_strong:
+                score += 9.0
+            if has_speaker_weak:
+                score += 4.0
+            if has_speaker_app:
+                score += 5.0
+            if has_mic_strong or (" mic" in f" {name} "):
+                score -= 8.0
+            if has_capture_stream and not has_playback_stream:
+                score -= 7.0
+            if is_generic:
+                score += 1.0
+            return score
+
+        if has_mic_strong:
+            score += 9.0
+        if has_mic_weak:
+            score += 4.0
+        if "bluetooth internal capture stream" in name:
+            score += 2.0
+        if any(marker in name for marker in _MIC_NEGATIVE_APP_MARKERS):
+            score -= 6.0
+        if has_speaker_strong or has_playback_stream:
+            score -= 8.0
+        elif has_speaker_weak or has_speaker_app:
+            score -= 5.0
+        if is_generic:
+            score -= 2.0
+        return score
 
     def resolve_devices(
         self,
@@ -306,13 +470,17 @@ class LinuxAudioCaptureBackend:
 
         if allow_missing:
             if require_monitor:
-                LOGGER.warning("No speaker monitor/loopback device found; continuing without speaker capture.")
+                LOGGER.warning(
+                    "No speaker playback/loopback device found; continuing without speaker capture."
+                )
             else:
                 LOGGER.warning("No microphone input device found; continuing without mic capture.")
             return []
 
         if require_monitor:
-            raise RuntimeError("No speaker monitor/loopback input device found. Provide --speaker-device explicitly.")
+            raise RuntimeError(
+                "No speaker playback/loopback input device found. Provide --speaker-device explicitly."
+            )
         raise RuntimeError("No microphone input device found. Provide --mic-device explicitly.")
 
     def build_stream(self, sd: Any, *, stream_key: str, stream_group: str, device: str | int) -> Any:

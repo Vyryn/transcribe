@@ -119,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--speaker-device",
         type=parse_device_ref,
         default=None,
-        help="Speaker monitor device name or index from `capture devices`",
+        help="Speaker playback/loopback device name or index from `capture devices`",
     )
     capture_run.add_argument("--fixture", action="store_true", help="Use synthetic audio fixture")
 
@@ -206,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--speaker-device",
         type=parse_device_ref,
         default=None,
-        help="Speaker monitor device name or index from `capture devices`",
+        help="Speaker playback/loopback device name or index from `capture devices`",
     )
     session_run.add_argument(
         "--single-device-per-source",

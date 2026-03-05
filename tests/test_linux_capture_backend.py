@@ -112,6 +112,88 @@ def test_resolve_devices_returns_all_candidates_when_include_all() -> None:
     assert speaker_devices == [2, 3]
 
 
+def test_resolve_devices_realistic_pipewire_catalog_prefers_expected_roles() -> None:
+    class _Catalog:
+        @staticmethod
+        def query_devices():
+            return [
+                {"name": "Realtek USB MIC: Audio (hw:1,0)", "max_input_channels": 1, "default_samplerate": 44_100.0},
+                {"name": "HDA Intel PCH: ALC897 Analog (hw:2,0)", "max_input_channels": 2, "default_samplerate": 44_100.0},
+                {"name": "HDA NVidia: HDMI 2 (hw:3,8)", "max_input_channels": 0, "default_samplerate": 44_100.0},
+                {"name": "pipewire", "max_input_channels": 64, "default_samplerate": 44_100.0},
+                {"name": "pulse", "max_input_channels": 32, "default_samplerate": 44_100.0},
+                {"name": "default", "max_input_channels": 32, "default_samplerate": 44_100.0},
+                {"name": "USB PnP Audio Device Mono", "max_input_channels": 1, "default_samplerate": 48_000.0},
+                {"name": "NoiseTorch Microphone for USB PnP Audio Device Source", "max_input_channels": 2, "default_samplerate": 48_000.0},
+                {"name": "Bluetooth internal playback stream for WH-1000XM5", "max_input_channels": 2, "default_samplerate": 48_000.0},
+                {"name": "spotify", "max_input_channels": 2, "default_samplerate": 48_000.0},
+                {"name": "Bluetooth internal capture stream for WH-1000XM5", "max_input_channels": 1, "default_samplerate": 48_000.0},
+                {"name": "GNOME Settings", "max_input_channels": 3, "default_samplerate": 48_000.0},
+            ]
+
+    backend = LinuxAudioCaptureBackend(use_fixture=True)
+    mic_devices = backend.resolve_devices(
+        _Catalog(),
+        configured=None,
+        require_monitor=False,
+        include_all=True,
+        allow_missing=False,
+    )
+    speaker_devices = backend.resolve_devices(
+        _Catalog(),
+        configured=None,
+        require_monitor=True,
+        include_all=True,
+        allow_missing=False,
+    )
+
+    # Prefer filtered/real mic-like sources.
+    assert 7 in mic_devices  # NoiseTorch microphone
+    assert 0 in mic_devices  # Explicit USB mic
+    assert 10 in mic_devices  # Bluetooth capture stream
+    assert 8 not in mic_devices  # Playback stream should not be treated as mic
+    assert 9 not in mic_devices  # App playback stream should not be treated as mic
+    assert 11 not in mic_devices  # Non-capture app stream should not be treated as mic
+
+    # Prefer playback/app streams for speakers.
+    assert 8 in speaker_devices  # Bluetooth playback stream
+    assert 9 in speaker_devices  # App stream
+    assert 10 not in speaker_devices  # Capture stream should not be treated as speaker output
+    assert 7 not in speaker_devices  # NoiseTorch mic should not be treated as speaker output
+
+
+def test_resolve_devices_single_device_prefers_filtered_mic_and_playback_stream() -> None:
+    class _Catalog:
+        @staticmethod
+        def query_devices():
+            return [
+                {"name": "USB PnP Audio Device Mono", "max_input_channels": 1, "default_samplerate": 48_000.0},
+                {"name": "NoiseTorch Microphone for USB PnP Audio Device Source", "max_input_channels": 2, "default_samplerate": 48_000.0},
+                {"name": "Bluetooth internal playback stream for WH-1000XM5", "max_input_channels": 2, "default_samplerate": 48_000.0},
+                {"name": "spotify", "max_input_channels": 2, "default_samplerate": 48_000.0},
+                {"name": "Bluetooth internal capture stream for WH-1000XM5", "max_input_channels": 1, "default_samplerate": 48_000.0},
+            ]
+
+    backend = LinuxAudioCaptureBackend(use_fixture=True)
+    mic_device = backend.resolve_devices(
+        _Catalog(),
+        configured=None,
+        require_monitor=False,
+        include_all=False,
+        allow_missing=False,
+    )
+    speaker_device = backend.resolve_devices(
+        _Catalog(),
+        configured=None,
+        require_monitor=True,
+        include_all=False,
+        allow_missing=False,
+    )
+
+    assert mic_device == [1]
+    assert speaker_device == [2]
+
+
 def test_read_frames_selects_clearest_frame_per_group() -> None:
     backend = LinuxAudioCaptureBackend(use_fixture=False)
     backend.config = CaptureConfig(source_mode=AudioSourceMode.BOTH)
