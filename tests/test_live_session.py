@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from transcribe.live.session import LiveSessionConfig, run_live_transcription_session
+from transcribe.live.session import LiveSessionConfig, _stitch_text_overlap, run_live_transcription_session
 from transcribe.models import AudioSourceMode
 
 
@@ -91,7 +91,8 @@ def test_cli_parser_uses_larger_default_session_model() -> None:
             "--fixture",
         ]
     )
-    assert args.transcription_model == "nvidia/canary-qwen-2.5b"
+    assert args.transcription_model == "nvidia/parakeet-tdt-0.6b-v3"
+    assert args.chunk_overlap_sec == 0.75
     assert args.partial_interval_sec == 0.0
 
 
@@ -472,14 +473,188 @@ def test_live_session_parakeet_failure_surfaces_fallback_hint(tmp_path) -> None:
     assert "Qwen/Qwen3-ASR-0.6B" in message
 
 
+def test_stitch_text_overlap_removes_repeated_boundary_words() -> None:
+    assert (
+        _stitch_text_overlap(
+            "Stand ho, who's there? Friends to this ground.",
+            "ground, and liegemen to the Dane.",
+        )
+        == "and liegemen to the Dane."
+    )
+
+
+def test_stitch_text_overlap_preserves_new_text_without_overlap() -> None:
+    assert _stitch_text_overlap("Who's there?", "Long live the king.") == "Long live the king."
+
+
+def test_run_live_transcription_session_reports_progress_events(tmp_path) -> None:
+    progress_events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_transcriber(wav_bytes: bytes, model_id: str) -> tuple[str, float]:
+        _ = (wav_bytes, model_id)
+        return "progress line", 4.0
+
+    config = LiveSessionConfig(
+        transcription_model="unit-test-model",
+        duration_sec=0.12,
+        chunk_sec=0.06,
+        partial_interval_sec=0.0,
+        output_dir=tmp_path / "live-progress",
+        session_id="live-progress",
+    )
+    run_live_transcription_session(
+        config,
+        use_fixture=True,
+        transcriber=fake_transcriber,
+        progress_callback=lambda event, fields: progress_events.append((event, fields)),
+    )
+
+    event_names = [event for event, _ in progress_events]
+    assert "capture_ready" in event_names
+    assert "transcribing_started" in event_names
+    assert "final" in event_names
+
+
+def test_run_session_prints_crisp_feedback_by_default(monkeypatch, tmp_path, capsys) -> None:
+    import transcribe.cli as cli_module
+    import transcribe.live.session as live_session_module
+
+    monkeypatch.setattr(cli_module, "load_and_configure_logging", lambda args: None)
+
+    def fake_runner(config, *, use_fixture: bool = False, debug: bool = False, progress_callback=None):
+        _ = (use_fixture, debug)
+        assert progress_callback is not None
+        progress_callback("loading_model", {"transcription_model": config.transcription_model})
+        progress_callback("model_ready", {"transcription_model": config.transcription_model})
+        progress_callback(
+            "capture_ready",
+            {
+                "requested_sample_rate_hz": 16_000,
+                "capture_sample_rate_hz": 48_000,
+                "transcription_sample_rate_hz": 16_000,
+                "resolved_capture_devices": {"mic": ["2"], "speakers": ["5"]},
+            },
+        )
+        progress_callback("transcribing_started", {"duration_sec": 0.0})
+        progress_callback("final", {"chunk_index": 1, "text": "clean transcript line"})
+        return live_session_module.LiveSessionResult(
+            session_dir=Path(tmp_path) / "live-test",
+            events_path=Path(tmp_path) / "live-test" / "events.jsonl",
+            transcript_json_path=Path(tmp_path) / "live-test" / "transcript.json",
+            transcript_txt_path=Path(tmp_path) / "live-test" / "transcript.txt",
+            final_segment_count=1,
+            partial_event_count=0,
+            sample_rate_hz=48_000,
+            sample_rate_hz_requested=16_000,
+            total_audio_sec=4.0,
+            total_inference_sec=0.2,
+            source_selection_counts={"mic": 1},
+            interrupted=False,
+        )
+
+    monkeypatch.setattr(live_session_module, "run_live_transcription_session", fake_runner)
+
+    args = argparse.Namespace(
+        config=None,
+        log_level=None,
+        debug=False,
+        transcription_model="nvidia/parakeet-tdt-0.6b-v3",
+        duration_sec=0.0,
+        chunk_overlap_sec=0.75,
+        chunk_sec=4.0,
+        partial_interval_sec=0.0,
+        mode=AudioSourceMode.BOTH,
+        mic_device=None,
+        speaker_device=None,
+        single_device_per_source=False,
+        strict_sources=False,
+        out=Path(tmp_path),
+        session_id="live-test",
+        max_model_ram_gb=8.0,
+        fixture=False,
+    )
+    rc = cli_module.run_session(args)
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "Loading model: nvidia/parakeet-tdt-0.6b-v3" in captured.out
+    assert "Model ready." in captured.out
+    assert "Capture ready: mic, speakers" in captured.out
+    assert "Sample rate: 48000 Hz capture (requested 16000 Hz), 16000 Hz ASR" in captured.out
+    assert "Transcribing. Press Ctrl+C to stop." in captured.out
+    assert "clean transcript line" in captured.out
+    assert "Session saved:" in captured.out
+    assert "Events JSONL:" not in captured.out
+    assert "Source selections:" not in captured.out
+
+
+def test_run_session_prints_debug_feedback_when_enabled(monkeypatch, tmp_path, capsys) -> None:
+    import transcribe.cli as cli_module
+    import transcribe.live.session as live_session_module
+
+    monkeypatch.setattr(cli_module, "load_and_configure_logging", lambda args: None)
+
+    def fake_runner(config, *, use_fixture: bool = False, debug: bool = False, progress_callback=None):
+        _ = use_fixture
+        assert debug is True
+        assert progress_callback is not None
+        progress_callback("loading_model", {"transcription_model": config.transcription_model})
+        progress_callback("partial", {"chunk_index": 1, "text": "partial line"})
+        progress_callback("final", {"chunk_index": 1, "text": "final line"})
+        return live_session_module.LiveSessionResult(
+            session_dir=Path(tmp_path) / "live-test",
+            events_path=Path(tmp_path) / "live-test" / "events.jsonl",
+            transcript_json_path=Path(tmp_path) / "live-test" / "transcript.json",
+            transcript_txt_path=Path(tmp_path) / "live-test" / "transcript.txt",
+            final_segment_count=1,
+            partial_event_count=1,
+            sample_rate_hz=16_000,
+            sample_rate_hz_requested=16_000,
+            total_audio_sec=4.0,
+            total_inference_sec=0.2,
+            source_selection_counts={"speakers": 1},
+            interrupted=False,
+        )
+
+    monkeypatch.setattr(live_session_module, "run_live_transcription_session", fake_runner)
+
+    args = argparse.Namespace(
+        config=None,
+        log_level=None,
+        debug=True,
+        transcription_model="nvidia/parakeet-tdt-0.6b-v3",
+        duration_sec=0.0,
+        chunk_overlap_sec=0.75,
+        chunk_sec=4.0,
+        partial_interval_sec=0.0,
+        mode=AudioSourceMode.BOTH,
+        mic_device=None,
+        speaker_device=None,
+        single_device_per_source=False,
+        strict_sources=False,
+        out=Path(tmp_path),
+        session_id="live-test",
+        max_model_ram_gb=8.0,
+        fixture=False,
+    )
+    rc = cli_module.run_session(args)
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "[partial 1] partial line" in captured.out
+    assert "[final 1] final line" in captured.out
+    assert "Events JSONL:" in captured.out
+    assert "Source selections:" in captured.out
+
+
 def test_run_session_returns_code_2_on_runtime_error(monkeypatch, tmp_path, capsys) -> None:
     import transcribe.cli as cli_module
     import transcribe.live.session as live_session_module
 
     monkeypatch.setattr(cli_module, "load_and_configure_logging", lambda args: None)
 
-    def failing_runner(config, *, use_fixture: bool = False):
-        _ = (config, use_fixture)
+    def failing_runner(config, *, use_fixture: bool = False, debug: bool = False, progress_callback=None):
+        _ = (config, use_fixture, debug, progress_callback)
         raise RuntimeError("Parakeet decoder failed in this runtime")
 
     monkeypatch.setattr(live_session_module, "run_live_transcription_session", failing_runner)
@@ -487,8 +662,10 @@ def test_run_session_returns_code_2_on_runtime_error(monkeypatch, tmp_path, caps
     args = argparse.Namespace(
         config=None,
         log_level=None,
+        debug=False,
         transcription_model="nvidia/parakeet-tdt-0.6b-v3",
         duration_sec=0.0,
+        chunk_overlap_sec=0.75,
         chunk_sec=4.0,
         partial_interval_sec=1.0,
         mode=AudioSourceMode.BOTH,

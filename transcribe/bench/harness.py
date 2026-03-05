@@ -750,6 +750,24 @@ def _default_hf_segment_transcriber(transcription_model: str) -> HfSegmentTransc
     return transcribe_row_with_faster_whisper
 
 
+def preload_transcription_model(
+    transcription_model: str,
+    *,
+    max_model_ram_gb: float = DEFAULT_MAX_MODEL_RAM_GB,
+) -> None:
+    """Load the requested transcription backend into cache without running inference."""
+    _enforce_model_ram_limit(transcription_model, max_model_ram_gb)
+    backend, resolved_model_id = _resolve_transcription_backend(transcription_model)
+
+    if backend == "nemo_asr":
+        _get_nemo_asr_model(resolved_model_id, local_files_only=True)
+        return
+    if backend == "qwen_asr":
+        _get_qwen_asr_model(resolved_model_id, local_files_only=True)
+        return
+    _get_faster_whisper_model(resolved_model_id, local_files_only=True)
+
+
 def _word_error_rate(reference_text: str, hypothesis_text: str) -> float:
     """Compute word error rate between reference and hypothesis text."""
     reference = [token for token in reference_text.lower().split() if token]

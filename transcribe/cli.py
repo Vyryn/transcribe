@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from transcribe.config import load_app_config
 from transcribe.logging import configure_logging, security_log
 from transcribe.models import AudioSourceMode, CaptureConfig
 from transcribe.network_guard import install_outbound_network_guard
+from transcribe.runtime_defaults import DEFAULT_LIVE_TRANSCRIPTION_MODEL
 
 LOGGER = logging.getLogger("transcribe")
 
@@ -87,6 +89,65 @@ def add_common_config_flags(parser: argparse.ArgumentParser) -> None:
     """
     parser.add_argument("--config", type=Path, default=None, help="Optional config file path")
     parser.add_argument("--log-level", default=None, help="Override logging level")
+    parser.add_argument("--debug", action="store_true", help="Show backend logs and verbose session events")
+
+
+def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str, object]], None]:
+    """Create CLI printer for structured live-session progress events."""
+
+    def _format_sources(raw_devices: object) -> str:
+        if not isinstance(raw_devices, dict):
+            return "none"
+        parts: list[str] = []
+        for source_name in ("mic", "speakers"):
+            devices = raw_devices.get(source_name)
+            if not isinstance(devices, list) or not devices:
+                continue
+            label = source_name if len(devices) == 1 else f"{source_name} x{len(devices)}"
+            parts.append(label)
+        return ", ".join(parts) if parts else "none"
+
+    def _report(event: str, fields: dict[str, object]) -> None:
+        if event == "loading_model":
+            print(f"Loading model: {fields['transcription_model']}")
+            return
+        if event == "model_ready":
+            print("Model ready.")
+            return
+        if event == "capture_ready":
+            requested_rate_hz = int(fields.get("requested_sample_rate_hz", 0))
+            capture_rate_hz = int(fields.get("capture_sample_rate_hz", 0))
+            asr_rate_hz = int(fields.get("transcription_sample_rate_hz", 0))
+            print(f"Capture ready: {_format_sources(fields.get('resolved_capture_devices'))}")
+            if capture_rate_hz == requested_rate_hz:
+                print(f"Sample rate: {capture_rate_hz} Hz capture, {asr_rate_hz} Hz ASR")
+            else:
+                print(
+                    "Sample rate: "
+                    f"{capture_rate_hz} Hz capture (requested {requested_rate_hz} Hz), "
+                    f"{asr_rate_hz} Hz ASR"
+                )
+            return
+        if event == "transcribing_started":
+            if float(fields.get("duration_sec", 0.0)) > 0:
+                print("Transcribing.")
+            else:
+                print("Transcribing. Press Ctrl+C to stop.")
+            return
+        if event == "partial":
+            if debug:
+                print(f"[partial {fields['chunk_index']}] {fields['text']}")
+            return
+        if event == "final":
+            text = str(fields.get("text", "")).strip()
+            if not text:
+                return
+            if debug:
+                print(f"[final {fields['chunk_index']}] {text}")
+            else:
+                print(text)
+
+    return _report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -172,14 +233,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         "--transcription-model",
         dest="transcription_model",
-        default="nvidia/canary-qwen-2.5b",
-        help="Model id for streaming ASR (for example nvidia/canary-qwen-2.5b)",
+        default=DEFAULT_LIVE_TRANSCRIPTION_MODEL,
+        help=f"Model id for streaming ASR (default: {DEFAULT_LIVE_TRANSCRIPTION_MODEL})",
     )
     session_run.add_argument(
         "--duration-sec",
         type=float,
         default=0.0,
         help="Session runtime in seconds; 0 runs until interrupted (Ctrl+C)",
+    )
+    session_run.add_argument(
+        "--chunk-overlap-sec",
+        type=float,
+        default=0.75,
+        help="Audio overlap carried into the next finalized chunk to reduce clipped boundaries",
     )
     session_run.add_argument(
         "--mode",
@@ -248,11 +315,14 @@ def load_and_configure_logging(args: argparse.Namespace) -> None:
     """
     app_config = load_app_config(
         config_path=args.config,
-        overrides={"log_level": args.log_level} if args.log_level else None,
+        overrides={
+            "log_level": args.log_level or ("DEBUG" if getattr(args, "debug", False) else "ERROR")
+        },
     )
     configure_logging(app_config.log_level, redact_logs=app_config.redact_logs)
     install_outbound_network_guard()
-    security_log(LOGGER, logging.INFO, "startup", offline_only=app_config.offline_only)
+    if getattr(args, "debug", False):
+        security_log(LOGGER, logging.INFO, "startup", offline_only=app_config.offline_only)
 
 
 def run_capture(args: argparse.Namespace) -> int:
@@ -397,6 +467,7 @@ def run_session(args: argparse.Namespace) -> int:
         transcription_model=args.transcription_model,
         duration_sec=args.duration_sec,
         chunk_sec=args.chunk_sec,
+        chunk_overlap_sec=args.chunk_overlap_sec,
         partial_interval_sec=args.partial_interval_sec,
         source_mode=args.mode,
         mic_device=args.mic_device,
@@ -408,25 +479,35 @@ def run_session(args: argparse.Namespace) -> int:
         session_id=session_id,
         max_model_ram_gb=args.max_model_ram_gb,
     )
+    progress_reporter = _build_session_progress_reporter(debug=getattr(args, "debug", False))
     try:
-        result = run_live_transcription_session(config, use_fixture=args.fixture)
+        result = run_live_transcription_session(
+            config,
+            use_fixture=args.fixture,
+            debug=getattr(args, "debug", False),
+            progress_callback=progress_reporter,
+        )
     except RuntimeError as exc:
         print(f"Session failed: {exc}")
         return 2
 
-    print(f"Session complete: {result.session_dir}")
-    print(f"Events JSONL: {result.events_path}")
-    print(f"Transcript JSON: {result.transcript_json_path}")
-    print(f"Transcript TXT: {result.transcript_txt_path}")
-    print(f"Final segments: {result.final_segment_count}")
-    print(f"Partial events: {result.partial_event_count}")
+    print(f"Session saved: {result.session_dir}")
+    print(f"Transcript: {result.transcript_txt_path}")
     print(
-        "Sample rate (requested/effective Hz): "
-        f"{result.sample_rate_hz_requested}/{result.sample_rate_hz}"
+        "Summary: "
+        f"{result.final_segment_count} final segments, "
+        f"{result.total_audio_sec:.3f}s audio, "
+        f"{result.total_inference_sec:.3f}s inference"
     )
-    print(f"Source selections: {result.source_selection_counts}")
-    print(f"Audio sec: {result.total_audio_sec:.3f}")
-    print(f"Inference sec: {result.total_inference_sec:.3f}")
+    if getattr(args, "debug", False):
+        print(f"Events JSONL: {result.events_path}")
+        print(f"Transcript JSON: {result.transcript_json_path}")
+        print(f"Partial events: {result.partial_event_count}")
+        print(
+            "Sample rate (requested/effective Hz): "
+            f"{result.sample_rate_hz_requested}/{result.sample_rate_hz}"
+        )
+        print(f"Source selections: {result.source_selection_counts}")
     return 0
 
 

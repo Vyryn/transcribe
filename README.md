@@ -206,7 +206,14 @@ or best speaker loopback at that moment).
 # Fixture dry-run (no audio hardware needed)
 .venv/bin/python3 -m transcribe.cli session run --fixture --duration-sec 15 --chunk-sec 3
 
-# Real microphone run (Ctrl+C to stop)
+# Real microphone run (Ctrl+C to stop, default model is NVIDIA Parakeet)
+.venv/bin/python3 -m transcribe.cli session run \
+  --duration-sec 0 \
+  --mode both \
+  --chunk-sec 4 \
+  --partial-interval-sec 0
+
+# Use a larger quality-focused model explicitly
 .venv/bin/python3 -m transcribe.cli session run \
   --model nvidia/canary-qwen-2.5b \
   --duration-sec 0 \
@@ -216,20 +223,17 @@ or best speaker loopback at that moment).
 
 # Pin a specific mic by index (from `capture devices`)
 .venv/bin/python3 -m transcribe.cli session run \
-  --model nvidia/canary-qwen-2.5b \
   --duration-sec 0 \
   --mode both \
   --mic-device 2
 
 # Or pass exact device names shown in `capture devices`
 .venv/bin/python3 -m transcribe.cli session run \
-  --model nvidia/canary-qwen-2.5b \
   --duration-sec 0 \
   --mic-device "USB Audio Device: - (hw:2,0)"
 
 # Restrict to one device per source type and fail if any source is missing
 .venv/bin/python3 -m transcribe.cli session run \
-  --model nvidia/canary-qwen-2.5b \
   --duration-sec 0 \
   --mode both \
   --single-device-per-source \
@@ -243,6 +247,8 @@ can catch up during quiet periods.
 Chunks are trimmed for leading/trailing silence and resampled to the requested
 ASR rate (default `16 kHz`) before inference, even when capture hardware runs
 at `44.1/48 kHz`.
+Final chunks now carry a short audio overlap into the next chunk by default
+(`--chunk-overlap-sec 0.75`) to reduce clipped words at phrase boundaries.
 
 Quality tuning tips:
 
@@ -261,8 +267,10 @@ Outputs are written under `data/live_sessions/<session-id>/`:
 The Linux capture backend now auto-negotiates a supported input sample rate and reports
 requested/effective values at session end.
 
-If the larger default model is too heavy on your machine, use:
-`uv run transcribe session run --model nvidia/parakeet-tdt-0.6b-v3 --duration-sec 0`.
+If you want the larger quality-focused model instead, use:
+`uv run transcribe session run --model nvidia/canary-qwen-2.5b --duration-sec 0`.
+
+Add `--debug` to surface backend logs, partial events, and detailed session diagnostics.
 
 If the model is not already cached locally, pre-populate it first (offline policy):
 
