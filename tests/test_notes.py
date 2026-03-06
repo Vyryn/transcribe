@@ -1,0 +1,485 @@
+from __future__ import annotations
+
+import argparse
+import contextlib
+from pathlib import Path
+
+import pytest
+
+from transcribe.notes import (
+    NotesGpuRuntimeError,
+    SessionNotesConfig,
+    SessionNotesResult,
+    build_cleanup_chunks,
+    build_clean_transcript_prompt,
+    build_client_notes_prompt,
+    load_transcript_units,
+    run_post_transcription_notes,
+)
+from transcribe.models import AudioSourceMode
+from transcribe.runtime_defaults import DEFAULT_SESSION_NOTES_MODEL
+
+
+class FakePromptRuntime:
+    """Simple fake runtime for deterministic notes-generation tests."""
+
+    def __init__(self, responses: list[object]) -> None:
+        self._responses = list(responses)
+        self.checked_models: list[str] = []
+        self.prompts: list[str] = []
+
+    def ensure_model_available(self, model: str) -> None:
+        self.checked_models.append(model)
+
+    def run_prompt(self, *, model: str, prompt: str) -> str:
+        self.checked_models.append(model)
+        self.prompts.append(prompt)
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return str(response)
+
+
+class FakeRuntimeFactory:
+    """Record whether the pipeline retried on CPU."""
+
+    def __init__(self, runtimes_by_cpu: dict[bool, list[FakePromptRuntime]]) -> None:
+        self._runtimes_by_cpu = runtimes_by_cpu
+        self.calls: list[bool] = []
+
+    @contextlib.contextmanager
+    def __call__(self, *, cpu_only: bool = False):
+        self.calls.append(cpu_only)
+        runtime = self._runtimes_by_cpu[cpu_only].pop(0)
+        yield runtime
+
+
+def test_build_clean_transcript_prompt_embeds_rough_transcript() -> None:
+    prompt = build_clean_transcript_prompt("rough transcript")
+    assert "rough transcript" in prompt
+    assert "Return only the cleaned transcript text" in prompt
+
+
+def test_build_client_notes_prompt_embeds_template_and_transcript() -> None:
+    prompt = build_client_notes_prompt("SYSTEM PROMPT", "clean transcript")
+    assert "SYSTEM PROMPT" in prompt
+    assert "clean transcript" in prompt
+    assert "Output only the finished client note" in prompt
+
+
+def test_load_transcript_units_uses_structured_session_json_when_available(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "transcript.txt"
+    transcript_path.write_text("flat transcript\n", encoding="utf-8")
+    (tmp_path / "transcript.json").write_text(
+        """
+        {
+          "final_segments": [
+            {"selected_source": "mic", "text": "hello there"},
+            {"selected_source": "mic", "text": "how are you"},
+            {"selected_source": "speakers", "text": "i am okay"},
+            {"selected_source": "speakers", "text": "thank you"}
+          ]
+        }
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    units = load_transcript_units(transcript_path)
+
+    assert units == [
+        "Speaker A: hello there how are you",
+        "Speaker B: i am okay thank you",
+    ]
+
+
+def test_build_cleanup_chunks_splits_long_transcripts_by_word_budget() -> None:
+    chunks = build_cleanup_chunks(
+        [
+            "Speaker A: " + " ".join(f"word{i}" for i in range(12)),
+            "Speaker B: short reply",
+        ],
+        max_words=5,
+    )
+
+    assert len(chunks) >= 3
+    assert chunks[0].startswith("Speaker A:")
+    assert any("Speaker B: short reply" in chunk for chunk in chunks)
+
+
+def test_run_post_transcription_notes_writes_clean_transcript_and_notes(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "rough_transcript.txt"
+    transcript_path.write_text("um client says things\n", encoding="utf-8")
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("WRITE THE NOTE", encoding="utf-8")
+
+    runtime = FakePromptRuntime(["Clean transcript", "Client note"])
+    runtime_factory = FakeRuntimeFactory({False: [runtime], True: []})
+
+    result = run_post_transcription_notes(
+        SessionNotesConfig(
+            transcript_path=transcript_path,
+            output_dir=tmp_path / "notes_out",
+            model="qwen3.5:4b-q4_K_M",
+            prompt_path=prompt_path,
+        ),
+        runtime_factory=runtime_factory,
+    )
+
+    assert result.clean_transcript_path.read_text(encoding="utf-8") == "Clean transcript\n"
+    assert result.client_notes_path.read_text(encoding="utf-8") == "Client note\n"
+    assert runtime.checked_models[0] == "qwen3.5:4b-q4_K_M"
+    assert "um client says things" in runtime.prompts[0]
+    assert "WRITE THE NOTE" in runtime.prompts[1]
+    assert "Clean transcript" in runtime.prompts[1]
+    assert runtime_factory.calls == [False]
+
+
+def test_run_post_transcription_notes_uses_multiple_cleanup_prompts_for_long_transcript(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "rough_transcript.txt"
+    transcript_path.write_text(
+        "\n".join(" ".join(f"word{index}_{i}" for i in range(450)) for index in range(3)),
+        encoding="utf-8",
+    )
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("WRITE THE NOTE", encoding="utf-8")
+
+    runtime = FakePromptRuntime(
+        [
+            "Cleaned chunk one",
+            "Cleaned chunk two",
+            "Cleaned chunk three",
+            "Client note",
+        ]
+    )
+    runtime_factory = FakeRuntimeFactory({False: [runtime], True: []})
+
+    result = run_post_transcription_notes(
+        SessionNotesConfig(
+            transcript_path=transcript_path,
+            output_dir=tmp_path / "notes_out",
+            prompt_path=prompt_path,
+        ),
+        runtime_factory=runtime_factory,
+    )
+
+    assert result.clean_transcript_path.read_text(encoding="utf-8") == (
+        "Cleaned chunk one\n\nCleaned chunk two\n\nCleaned chunk three\n"
+    )
+    assert len(runtime.prompts) == 4
+    assert "Cleaned chunk three" in runtime.prompts[-1]
+
+
+def test_run_post_transcription_notes_reports_progress_events(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "rough_transcript.txt"
+    transcript_path.write_text(
+        "\n".join(" ".join(f"word{index}_{i}" for i in range(450)) for index in range(3)),
+        encoding="utf-8",
+    )
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("WRITE THE NOTE", encoding="utf-8")
+
+    runtime = FakePromptRuntime(
+        [
+            "Cleaned chunk one",
+            "Cleaned chunk two",
+            "Cleaned chunk three",
+            "Client note",
+        ]
+    )
+    runtime_factory = FakeRuntimeFactory({False: [runtime], True: []})
+    progress_events: list[tuple[str, dict[str, object]]] = []
+
+    run_post_transcription_notes(
+        SessionNotesConfig(
+            transcript_path=transcript_path,
+            output_dir=tmp_path / "notes_out",
+            prompt_path=prompt_path,
+        ),
+        runtime_factory=runtime_factory,
+        progress_callback=lambda event, fields: progress_events.append((event, fields)),
+    )
+
+    event_names = [event for event, _ in progress_events]
+    assert event_names[0] == "notes_started"
+    assert event_names.count("clean_transcript_chunk_started") == 3
+    assert "clean_transcript_ready" in event_names
+    assert "client_notes_started" in event_names
+    assert "client_notes_ready" in event_names
+
+
+def test_run_post_transcription_notes_retries_on_cpu_after_gpu_error(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "rough_transcript.txt"
+    transcript_path.write_text("rough text", encoding="utf-8")
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("WRITE THE NOTE", encoding="utf-8")
+
+    gpu_runtime = FakePromptRuntime([NotesGpuRuntimeError("cuda out of memory")])
+    cpu_runtime = FakePromptRuntime(["Clean transcript", "Client note"])
+    runtime_factory = FakeRuntimeFactory({False: [gpu_runtime], True: [cpu_runtime]})
+
+    result = run_post_transcription_notes(
+        SessionNotesConfig(
+            transcript_path=transcript_path,
+            output_dir=tmp_path / "notes_out",
+            prompt_path=prompt_path,
+        ),
+        runtime_factory=runtime_factory,
+    )
+
+    assert result.cpu_fallback_used is True
+    assert result.clean_transcript_path.read_text(encoding="utf-8") == "Clean transcript\n"
+    assert result.client_notes_path.read_text(encoding="utf-8") == "Client note\n"
+    assert runtime_factory.calls == [False, True]
+
+
+def test_run_post_transcription_notes_rejects_empty_transcript(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "rough_transcript.txt"
+    transcript_path.write_text(" \n", encoding="utf-8")
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("WRITE THE NOTE", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Transcript is empty"):
+        run_post_transcription_notes(
+            SessionNotesConfig(
+                transcript_path=transcript_path,
+                output_dir=tmp_path / "notes_out",
+                prompt_path=prompt_path,
+            ),
+            runtime_factory=FakeRuntimeFactory({False: [], True: []}),
+        )
+
+
+def test_cli_parser_accepts_notes_run_command() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "notes",
+            "run",
+            "--transcript",
+            "rough.txt",
+        ]
+    )
+    assert args.command == "notes"
+    assert args.notes_command == "run"
+    assert args.transcript == Path("rough.txt")
+    assert args.notes_model == DEFAULT_SESSION_NOTES_MODEL
+
+
+def test_cli_parser_allows_disabling_session_notes() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "session",
+            "run",
+            "--fixture",
+            "--no-notes",
+        ]
+    )
+    assert args.notes is False
+
+
+def test_run_session_runs_notes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
+    import transcribe.cli as cli_module
+    import transcribe.live.session as live_session_module
+    import transcribe.notes as notes_module
+
+    monkeypatch.setattr(cli_module, "load_and_configure_logging", lambda args: None)
+
+    observed: dict[str, SessionNotesConfig] = {}
+
+    def fake_runner(config, *, use_fixture: bool = False, debug: bool = False, progress_callback=None):
+        _ = (config, use_fixture, debug, progress_callback)
+        return live_session_module.LiveSessionResult(
+            session_dir=tmp_path / "live-test",
+            events_path=tmp_path / "live-test" / "events.jsonl",
+            transcript_json_path=tmp_path / "live-test" / "transcript.json",
+            transcript_txt_path=tmp_path / "live-test" / "transcript.txt",
+            final_segment_count=1,
+            partial_event_count=0,
+            sample_rate_hz=16_000,
+            sample_rate_hz_requested=16_000,
+            total_audio_sec=4.0,
+            total_inference_sec=0.2,
+            source_selection_counts={"mic": 1},
+            interrupted=True,
+        )
+
+    def fake_run_post_transcription_notes(
+        config: SessionNotesConfig,
+        *,
+        progress_callback=None,
+    ) -> SessionNotesResult:
+        observed["config"] = config
+        if progress_callback is not None:
+            progress_callback(
+                "notes_started",
+                {"model": config.model, "cleanup_chunk_count": 2},
+            )
+            progress_callback("clean_transcript_chunk_started", {"chunk_index": 1, "chunk_count": 2})
+            progress_callback("clean_transcript_ready", {})
+            progress_callback("client_notes_started", {})
+        return SessionNotesResult(
+            transcript_path=config.transcript_path,
+            clean_transcript_path=config.output_dir / "clean_transcript.txt",
+            client_notes_path=config.output_dir / "client_notes.txt",
+            model=config.model,
+            cpu_fallback_used=False,
+            clean_duration_sec=0.1,
+            notes_duration_sec=0.2,
+        )
+
+    monkeypatch.setattr(live_session_module, "run_live_transcription_session", fake_runner)
+    monkeypatch.setattr(notes_module, "run_post_transcription_notes", fake_run_post_transcription_notes)
+
+    args = argparse.Namespace(
+        config=None,
+        log_level=None,
+        debug=False,
+        transcription_model="nvidia/parakeet-tdt-0.6b-v3",
+        duration_sec=0.0,
+        chunk_overlap_sec=0.75,
+        stitch_overlap_text=True,
+        chunk_sec=4.0,
+        partial_interval_sec=0.0,
+        mode=AudioSourceMode.BOTH,
+        mic_device=None,
+        speaker_device=None,
+        single_device_per_source=False,
+        strict_sources=False,
+        out=tmp_path,
+        session_id="live-test",
+        max_model_ram_gb=8.0,
+        fixture=False,
+        notes=True,
+        notes_model=DEFAULT_SESSION_NOTES_MODEL,
+    )
+    rc = cli_module.run_session(args)
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert observed["config"].transcript_path == tmp_path / "live-test" / "transcript.txt"
+    assert observed["config"].output_dir == tmp_path / "live-test"
+    assert observed["config"].model == DEFAULT_SESSION_NOTES_MODEL
+    assert "Post-session notes: cleaning transcript" in captured.out
+    assert "Cleanup pass 1/2..." in captured.out
+    assert "Clean transcript ready." in captured.out
+    assert "Writing client notes..." in captured.out
+    assert "Clean transcript:" in captured.out
+    assert "Client notes:" in captured.out
+
+
+def test_run_session_skips_notes_when_disabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import transcribe.cli as cli_module
+    import transcribe.live.session as live_session_module
+    import transcribe.notes as notes_module
+
+    monkeypatch.setattr(cli_module, "load_and_configure_logging", lambda args: None)
+
+    def fake_runner(config, *, use_fixture: bool = False, debug: bool = False, progress_callback=None):
+        _ = (config, use_fixture, debug, progress_callback)
+        return live_session_module.LiveSessionResult(
+            session_dir=tmp_path / "live-test",
+            events_path=tmp_path / "live-test" / "events.jsonl",
+            transcript_json_path=tmp_path / "live-test" / "transcript.json",
+            transcript_txt_path=tmp_path / "live-test" / "transcript.txt",
+            final_segment_count=1,
+            partial_event_count=0,
+            sample_rate_hz=16_000,
+            sample_rate_hz_requested=16_000,
+            total_audio_sec=4.0,
+            total_inference_sec=0.2,
+            source_selection_counts={"mic": 1},
+            interrupted=True,
+        )
+
+    def fail_run_post_transcription_notes(
+        config: SessionNotesConfig,
+        *,
+        progress_callback=None,
+    ) -> SessionNotesResult:
+        _ = progress_callback
+        raise AssertionError(f"notes should not run when disabled: {config}")
+
+    monkeypatch.setattr(live_session_module, "run_live_transcription_session", fake_runner)
+    monkeypatch.setattr(notes_module, "run_post_transcription_notes", fail_run_post_transcription_notes)
+
+    args = argparse.Namespace(
+        config=None,
+        log_level=None,
+        debug=False,
+        transcription_model="nvidia/parakeet-tdt-0.6b-v3",
+        duration_sec=0.0,
+        chunk_overlap_sec=0.75,
+        stitch_overlap_text=True,
+        chunk_sec=4.0,
+        partial_interval_sec=0.0,
+        mode=AudioSourceMode.BOTH,
+        mic_device=None,
+        speaker_device=None,
+        single_device_per_source=False,
+        strict_sources=False,
+        out=tmp_path,
+        session_id="live-test",
+        max_model_ram_gb=8.0,
+        fixture=False,
+        notes=False,
+        notes_model=DEFAULT_SESSION_NOTES_MODEL,
+    )
+
+    assert cli_module.run_session(args) == 0
+
+
+def test_run_notes_command_uses_requested_transcript(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
+    import transcribe.cli as cli_module
+    import transcribe.notes as notes_module
+
+    monkeypatch.setattr(cli_module, "load_and_configure_logging", lambda args: None)
+
+    rough_transcript = tmp_path / "rough.txt"
+    rough_transcript.write_text("rough", encoding="utf-8")
+    observed: dict[str, SessionNotesConfig] = {}
+
+    def fake_run_post_transcription_notes(
+        config: SessionNotesConfig,
+        *,
+        progress_callback=None,
+    ) -> SessionNotesResult:
+        observed["config"] = config
+        if progress_callback is not None:
+            progress_callback(
+                "notes_started",
+                {"model": config.model, "cleanup_chunk_count": 1},
+            )
+            progress_callback("notes_cpu_fallback", {})
+            progress_callback("client_notes_started", {})
+        return SessionNotesResult(
+            transcript_path=config.transcript_path,
+            clean_transcript_path=config.output_dir / "clean_transcript.txt",
+            client_notes_path=config.output_dir / "client_notes.txt",
+            model=config.model,
+            cpu_fallback_used=True,
+            clean_duration_sec=0.1,
+            notes_duration_sec=0.2,
+        )
+
+    monkeypatch.setattr(notes_module, "run_post_transcription_notes", fake_run_post_transcription_notes)
+
+    rc = cli_module.run_notes(
+        argparse.Namespace(
+            config=None,
+            log_level=None,
+            debug=False,
+            transcript=rough_transcript,
+            out_dir=None,
+            notes_model=DEFAULT_SESSION_NOTES_MODEL,
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert observed["config"].transcript_path == rough_transcript
+    assert observed["config"].output_dir == tmp_path
+    assert "Post-session notes: cleaning transcript" in captured.out
+    assert "retrying on CPU" in captured.out

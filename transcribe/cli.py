@@ -11,7 +11,11 @@ from transcribe.config import load_app_config
 from transcribe.logging import configure_logging, security_log
 from transcribe.models import AudioSourceMode, CaptureConfig
 from transcribe.network_guard import install_outbound_network_guard
-from transcribe.runtime_defaults import DEFAULT_LIVE_TRANSCRIPTION_MODEL
+from transcribe.runtime_defaults import (
+    ALTERNATE_SESSION_NOTES_MODEL,
+    DEFAULT_LIVE_TRANSCRIPTION_MODEL,
+    DEFAULT_SESSION_NOTES_MODEL,
+)
 
 LOGGER = logging.getLogger("transcribe")
 
@@ -146,6 +150,36 @@ def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str,
                 print(f"[final {fields['chunk_index']}] {text}")
             else:
                 print(text)
+
+    return _report
+
+
+def _build_notes_progress_reporter() -> Callable[[str, dict[str, object]], None]:
+    """Create CLI printer for structured post-session notes progress events."""
+
+    def _report(event: str, fields: dict[str, object]) -> None:
+        if event == "notes_started":
+            model = str(fields.get("model", ""))
+            chunk_count = int(fields.get("cleanup_chunk_count", 0))
+            if chunk_count > 1:
+                print(f"Post-session notes: cleaning transcript with {model} ({chunk_count} passes)...")
+            else:
+                print(f"Post-session notes: cleaning transcript with {model}...")
+            return
+        if event == "clean_transcript_chunk_started":
+            chunk_count = int(fields.get("chunk_count", 0))
+            chunk_index = int(fields.get("chunk_index", 0))
+            if chunk_count > 1:
+                print(f"Cleanup pass {chunk_index}/{chunk_count}...")
+            return
+        if event == "clean_transcript_ready":
+            print("Clean transcript ready.")
+            return
+        if event == "client_notes_started":
+            print("Writing client notes...")
+            return
+        if event == "notes_cpu_fallback":
+            print("Notes runtime: retrying on CPU...")
 
     return _report
 
@@ -297,6 +331,43 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=8.0,
         help="Reject models with estimated runtime RAM above this threshold",
+    )
+    session_run.add_argument(
+        "--notes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run transcript cleanup + client notes generation after the session (default: enabled)",
+    )
+    session_run.add_argument(
+        "--notes-model",
+        default=DEFAULT_SESSION_NOTES_MODEL,
+        help=(
+            "Local Ollama model for transcript cleanup and client notes "
+            f"(default: {DEFAULT_SESSION_NOTES_MODEL}; alternative: {ALTERNATE_SESSION_NOTES_MODEL})"
+        ),
+    )
+
+    notes_parser = subparsers.add_parser("notes", help="Transcript cleanup and session notes commands")
+    notes_subparsers = notes_parser.add_subparsers(dest="notes_command", required=True)
+
+    notes_run = notes_subparsers.add_parser("run", help="Clean a rough transcript and generate client notes")
+    add_common_config_flags(notes_run)
+    notes_run.add_argument("--transcript", type=Path, required=True, help="Path to the rough transcript text file")
+    notes_run.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Output directory for clean transcript and client notes (default: transcript parent)",
+    )
+    notes_run.add_argument(
+        "--model",
+        "--notes-model",
+        dest="notes_model",
+        default=DEFAULT_SESSION_NOTES_MODEL,
+        help=(
+            "Local Ollama model for transcript cleanup and client notes "
+            f"(default: {DEFAULT_SESSION_NOTES_MODEL}; alternative: {ALTERNATE_SESSION_NOTES_MODEL})"
+        ),
     )
 
     compliance_parser = subparsers.add_parser("compliance", help="Compliance checks")
@@ -515,6 +586,66 @@ def run_session(args: argparse.Namespace) -> int:
             f"{result.sample_rate_hz_requested}/{result.sample_rate_hz}"
         )
         print(f"Source selections: {result.source_selection_counts}")
+
+    notes_enabled = getattr(args, "notes", False)
+    if not notes_enabled:
+        return 0
+
+    from transcribe.notes import SessionNotesConfig, run_post_transcription_notes
+
+    notes_progress_reporter = _build_notes_progress_reporter()
+    try:
+        notes_result = run_post_transcription_notes(
+            SessionNotesConfig(
+                transcript_path=result.transcript_txt_path,
+                output_dir=result.session_dir,
+                model=getattr(args, "notes_model", DEFAULT_SESSION_NOTES_MODEL),
+            ),
+            progress_callback=notes_progress_reporter,
+        )
+    except RuntimeError as exc:
+        print(f"Notes failed: {exc}")
+        return 3
+
+    print(f"Clean transcript: {notes_result.clean_transcript_path}")
+    print(f"Client notes: {notes_result.client_notes_path}")
+    return 0
+
+
+def run_notes(args: argparse.Namespace) -> int:
+    """Execute the ``notes run`` command.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments.
+
+    Returns
+    -------
+    int
+        Exit code.
+    """
+    from transcribe.notes import SessionNotesConfig, run_post_transcription_notes
+
+    load_and_configure_logging(args)
+
+    output_dir = args.out_dir or args.transcript.parent
+    notes_progress_reporter = _build_notes_progress_reporter()
+    try:
+        result = run_post_transcription_notes(
+            SessionNotesConfig(
+                transcript_path=args.transcript,
+                output_dir=output_dir,
+                model=args.notes_model,
+            ),
+            progress_callback=notes_progress_reporter,
+        )
+    except RuntimeError as exc:
+        print(f"Notes failed: {exc}")
+        return 2
+
+    print(f"Clean transcript: {result.clean_transcript_path}")
+    print(f"Client notes: {result.client_notes_path}")
     return 0
 
 
@@ -576,6 +707,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_benchmark(args)
     if args.command == "session" and args.session_command == "run":
         return run_session(args)
+    if args.command == "notes" and args.notes_command == "run":
+        return run_notes(args)
     if args.command == "compliance" and args.compliance_command == "check-no-network":
         return run_check_no_network(args)
     if args.command == "compliance" and args.compliance_command == "check-no-urls":
