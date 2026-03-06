@@ -142,6 +142,10 @@ class LinuxAudioCaptureBackend:
         self._sample_rate_hz = 0
         self._fixture_frame_index = 0
         self._dropped_callback_frames = 0
+        self._consecutive_timeouts = 0
+        self._timeout_recovery_threshold = 3
+        self._last_recovery_attempt_monotonic = 0.0
+        self._recovery_cooldown_sec = 1.0
 
     @property
     def dropped_callback_frames(self) -> int:
@@ -207,6 +211,7 @@ class LinuxAudioCaptureBackend:
         self._stream_quality_ema = {}
         self._preferred_stream_key = {}
         self._streams.clear()
+        self._consecutive_timeouts = 0
 
         if self.use_fixture:
             self.frame_samples = int((self._sample_rate_hz * config.frame_ms) / 1000)
@@ -557,6 +562,24 @@ class LinuxAudioCaptureBackend:
         previous = self._stream_quality_ema.get(stream_key, score)
         self._stream_quality_ema[stream_key] = ((1.0 - alpha) * previous) + (alpha * score)
 
+    @staticmethod
+    def _drain_latest_frame(queue_ref: queue.Queue[RawFrame], *, timeout_s: float = 0.0) -> RawFrame | None:
+        """Read the freshest available frame from one queue."""
+        latest: RawFrame | None = None
+        try:
+            if timeout_s > 0:
+                latest = queue_ref.get(timeout=timeout_s)
+            else:
+                latest = queue_ref.get_nowait()
+        except queue.Empty:
+            return None
+
+        while True:
+            try:
+                latest = queue_ref.get_nowait()
+            except queue.Empty:
+                return latest
+
     def _read_group_frame(self, stream_name: str, timeout_s: float) -> RawFrame:
         """Read one continuous frame for a source group with low-overhead device scouting."""
         stream_keys = self._group_stream_keys.get(stream_name, ())
@@ -571,13 +594,11 @@ class LinuxAudioCaptureBackend:
         if preferred_queue is None:
             raise TimeoutError("Preferred source stream queue is unavailable")
 
-        try:
-            preferred_frame = preferred_queue.get(timeout=timeout_s)
-        except queue.Empty as exc:
-            raise TimeoutError(f"Timed out waiting for capture frame ({stream_name})") from exc
-
-        self._update_stream_quality(preferred, preferred_frame)
-        candidate_frames: dict[str, RawFrame] = {preferred: preferred_frame}
+        candidate_frames: dict[str, RawFrame] = {}
+        preferred_frame = self._drain_latest_frame(preferred_queue, timeout_s=timeout_s)
+        if preferred_frame is not None:
+            self._update_stream_quality(preferred, preferred_frame)
+            candidate_frames[preferred] = preferred_frame
 
         # Scout non-preferred devices without blocking, then keep only the freshest frame.
         for stream_key in stream_keys:
@@ -586,29 +607,60 @@ class LinuxAudioCaptureBackend:
             queue_ref = self._queues.get(stream_key)
             if queue_ref is None:
                 continue
-            latest = None
-            while True:
-                try:
-                    latest = queue_ref.get_nowait()
-                except queue.Empty:
-                    break
+            latest = self._drain_latest_frame(queue_ref)
             if latest is not None:
                 candidate_frames[stream_key] = latest
                 self._update_stream_quality(stream_key, latest)
 
-        best_stream_key = max(stream_keys, key=lambda key: self._stream_quality_ema.get(key, float("-inf")))
-        preferred_score = self._stream_quality_ema.get(preferred, float("-inf"))
+        if not candidate_frames:
+            raise TimeoutError(f"Timed out waiting for capture frame ({stream_name})")
+
+        candidate_stream_keys = tuple(key for key in stream_keys if key in candidate_frames)
+        best_stream_key = max(candidate_stream_keys, key=lambda key: self._stream_quality_ema.get(key, float("-inf")))
+        preferred_score = self._stream_quality_ema.get(preferred, float("-inf")) if preferred in candidate_frames else float("-inf")
         best_score = self._stream_quality_ema.get(best_stream_key, float("-inf"))
         hysteresis_margin = 0.10
 
-        selected_stream_key = preferred
-        if best_stream_key != preferred and best_score > (preferred_score + hysteresis_margin):
+        selected_stream_key = preferred if preferred in candidate_frames else best_stream_key
+        if best_stream_key != selected_stream_key and best_score > (preferred_score + hysteresis_margin):
             selected_stream_key = best_stream_key
             self._preferred_stream_key[stream_name] = best_stream_key
         else:
-            self._preferred_stream_key[stream_name] = preferred
+            self._preferred_stream_key[stream_name] = selected_stream_key
 
-        return candidate_frames.get(selected_stream_key, preferred_frame)
+        return candidate_frames[selected_stream_key]
+
+    @staticmethod
+    def _stream_looks_active(stream: Any) -> bool:
+        """Best-effort health check for a PortAudio stream wrapper."""
+        active = getattr(stream, "active", None)
+        if active is False:
+            return False
+        if getattr(stream, "stopped", False):
+            return False
+        if getattr(stream, "closed", False):
+            return False
+        return True
+
+    def _recover_live_streams(self) -> None:
+        """Attempt to reopen live capture streams after a stall or device change."""
+        if self.use_fixture or self.config is None:
+            return
+
+        now = time.monotonic()
+        if (now - self._last_recovery_attempt_monotonic) < self._recovery_cooldown_sec:
+            return
+        self._last_recovery_attempt_monotonic = now
+
+        try:
+            self.close()
+            self.open(self.config)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Capture stalled; waiting for audio device recovery: %s", exc)
+            return
+
+        self._consecutive_timeouts = 0
+        LOGGER.warning("Capture stream recovered after device interruption.")
 
     def read_frames(self, timeout_ms: int = 500) -> dict[str, RawFrame]:
         """Read one frame per active source group.
@@ -638,15 +690,33 @@ class LinuxAudioCaptureBackend:
 
         timeout_s = timeout_ms / 1000
         output: dict[str, RawFrame] = {}
-        for stream_name in self._active_stream_names:
-            output[stream_name] = self._read_group_frame(stream_name, timeout_s)
+        try:
+            for stream_name in self._active_stream_names:
+                output[stream_name] = self._read_group_frame(stream_name, timeout_s)
+        except TimeoutError:
+            self._consecutive_timeouts += 1
+            if (
+                self._consecutive_timeouts >= self._timeout_recovery_threshold
+                or not self._streams
+                or any(not self._stream_looks_active(stream) for stream in self._streams.values())
+            ):
+                self._recover_live_streams()
+            raise
+
+        self._consecutive_timeouts = 0
         return output
 
     def close(self) -> None:
         """Stop and close live capture streams."""
         for stream in self._streams.values():
-            stream.stop()
-            stream.close()
+            try:
+                stream.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
         self._streams.clear()
         self._queues.clear()
         self._group_stream_keys.clear()

@@ -216,3 +216,72 @@ def test_read_frames_selects_clearest_frame_per_group() -> None:
     frames = backend.read_frames(timeout_ms=20)
 
     assert frames["mic"].mono_pcm16 == loud
+
+
+def test_read_frames_falls_back_when_preferred_stream_stalls() -> None:
+    backend = LinuxAudioCaptureBackend(use_fixture=False)
+    backend.config = CaptureConfig(source_mode=AudioSourceMode.BOTH)
+    backend._active_stream_names = ("mic",)
+    backend._group_stream_keys = {"mic": ("mic:0", "mic:1")}
+    backend._queues = {
+        "mic:0": queue.Queue(maxsize=10),
+        "mic:1": queue.Queue(maxsize=10),
+    }
+    backend._preferred_stream_key = {"mic": "mic:0"}
+
+    loud = struct.pack("<h", 5_000) * 320
+    backend._queues["mic:1"].put(
+        RawFrame(stream="mic", mono_pcm16=loud, captured_at_monotonic_ns=time.monotonic_ns())
+    )
+
+    frames = backend.read_frames(timeout_ms=20)
+
+    assert frames["mic"].mono_pcm16 == loud
+    assert backend._preferred_stream_key["mic"] == "mic:1"
+
+
+def test_read_frames_recovers_after_repeated_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = LinuxAudioCaptureBackend(use_fixture=False)
+    backend.config = CaptureConfig(source_mode=AudioSourceMode.MIC)
+    backend._active_stream_names = ("mic",)
+    backend._group_stream_keys = {"mic": ("mic:0",)}
+    backend._queues = {"mic:0": queue.Queue(maxsize=10)}
+    backend._timeout_recovery_threshold = 1
+
+    class BrokenStream:
+        active = False
+
+        def stop(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    backend._streams = {"mic:0": BrokenStream()}
+
+    recovered_frame = RawFrame(
+        stream="mic",
+        mono_pcm16=struct.pack("<h", 4_000) * 320,
+        captured_at_monotonic_ns=time.monotonic_ns(),
+    )
+    reopened = {"count": 0}
+
+    def fake_open(config: CaptureConfig) -> None:
+        _ = config
+        reopened["count"] += 1
+        backend.config = config
+        backend._active_stream_names = ("mic",)
+        backend._group_stream_keys = {"mic": ("mic:1",)}
+        backend._queues = {"mic:1": queue.Queue(maxsize=10)}
+        backend._queues["mic:1"].put(recovered_frame)
+        backend._streams = {"mic:1": BrokenStream()}
+
+    monkeypatch.setattr(backend, "open", fake_open)
+
+    with pytest.raises(TimeoutError):
+        backend.read_frames(timeout_ms=5)
+
+    frames = backend.read_frames(timeout_ms=5)
+
+    assert reopened["count"] == 1
+    assert frames["mic"] == recovered_frame

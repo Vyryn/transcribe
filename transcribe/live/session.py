@@ -33,6 +33,7 @@ class LiveSessionConfig:
     duration_sec: float = 0.0
     chunk_sec: float = 4.0
     chunk_overlap_sec: float = 0.75
+    stitch_overlap_text: bool = True
     partial_interval_sec: float = 0.0
     source_mode: AudioSourceMode = AudioSourceMode.BOTH
     mic_device: str | int | None = None
@@ -253,8 +254,10 @@ def _word_spans(text: str) -> list[tuple[str, int, int]]:
 
 
 def _stitch_text_overlap(previous_text: str, current_text: str, *, max_overlap_words: int = 12) -> str:
-    """Remove repeated leading words caused by chunk overlap."""
+    """Remove clearly repeated leading words caused by chunk overlap."""
     if not previous_text or not current_text:
+        return current_text
+    if previous_text.rstrip().endswith("-"):
         return current_text
 
     previous_words = _word_spans(previous_text)
@@ -263,15 +266,45 @@ def _stitch_text_overlap(previous_text: str, current_text: str, *, max_overlap_w
         return current_text
 
     overlap_limit = min(max_overlap_words, len(previous_words), len(current_words))
-    for overlap_size in range(overlap_limit, 0, -1):
-        previous_suffix = [word for word, _, _ in previous_words[-overlap_size:]]
-        current_prefix = [word for word, _, _ in current_words[:overlap_size]]
+
+    for overlap_words in range(overlap_limit, 1, -1):
+        previous_suffix = [word for word, _, _ in previous_words[-overlap_words:]]
+        current_prefix = [word for word, _, _ in current_words[:overlap_words]]
         if previous_suffix != current_prefix:
             continue
-        if overlap_size >= len(current_words):
+        overlap_text_len = len(" ".join(current_prefix))
+        if overlap_words == 2 and overlap_text_len < 12:
+            continue
+        if overlap_words < len(current_words) and len(current_words[overlap_words][0]) <= 1:
+            continue
+        if overlap_words >= len(current_words):
             return ""
-        trim_start = current_words[overlap_size][1]
+        trim_start = current_words[overlap_words][1]
         return current_text[trim_start:].lstrip()
+
+    shifted_overlap_limit = min(max_overlap_words, len(previous_words) - 1, len(current_words))
+    for overlap_words in range(shifted_overlap_limit, 2, -1):
+        previous_shifted_suffix = [word for word, _, _ in previous_words[-(overlap_words + 1) : -1]]
+        current_prefix = [word for word, _, _ in current_words[:overlap_words]]
+        if previous_shifted_suffix != current_prefix:
+            continue
+        if overlap_words < len(current_words) and len(current_words[overlap_words][0]) <= 1:
+            continue
+        if overlap_words >= len(current_words):
+            return ""
+        trim_start = current_words[overlap_words][1]
+        return current_text[trim_start:].lstrip()
+
+    previous_last_word = previous_words[-1][0]
+    current_first_word = current_words[0][0]
+    if previous_last_word == current_first_word and len(current_first_word) >= 6:
+        if len(current_words) <= 1:
+            return ""
+        if len(current_words[1][0]) <= 1:
+            return current_text
+        trim_start = current_words[1][1]
+        return current_text[trim_start:].lstrip()
+
     return current_text
 
 
@@ -319,16 +352,6 @@ def _suppress_backend_output(enabled: bool) -> Iterator[None]:
     stderr_buffer = io.StringIO()
     with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
         yield
-
-
-def _warm_default_chunk_transcriber(transcription_model: str, max_model_ram_gb: float) -> None:
-    """Eagerly load the default backend so CLI loading feedback is explicit."""
-    from transcribe.bench.harness import preload_transcription_model
-
-    preload_transcription_model(
-        transcription_model,
-        max_model_ram_gb=max_model_ram_gb,
-    )
 
 
 def _transcribe_chunk(
@@ -552,25 +575,12 @@ def run_live_transcription_session(
         raise ValueError("frame_ms must be > 0")
 
     chunk_transcriber: ChunkTranscriber
+    uses_lazy_default_transcriber = transcriber is None
+    model_ready_reported = not uses_lazy_default_transcriber
     if transcriber is None:
-        _emit_progress(
-            progress_callback,
-            "loading_model",
-            transcription_model=config.transcription_model,
-        )
-        with _suppress_backend_output(not debug):
-            _warm_default_chunk_transcriber(
-                config.transcription_model,
-                config.max_model_ram_gb,
-            )
         chunk_transcriber = _build_default_chunk_transcriber(
             config.transcription_model,
             config.max_model_ram_gb,
-        )
-        _emit_progress(
-            progress_callback,
-            "model_ready",
-            transcription_model=config.transcription_model,
         )
     else:
         chunk_transcriber = transcriber
@@ -649,6 +659,32 @@ def run_live_transcription_session(
     interrupted = False
     previous_final_text = ""
 
+    def _transcribe_chunk_with_progress(chunk_pcm16: bytes) -> tuple[str, float]:
+        nonlocal model_ready_reported
+        if not model_ready_reported and uses_lazy_default_transcriber:
+            _emit_progress(
+                progress_callback,
+                "loading_model",
+                transcription_model=config.transcription_model,
+            )
+        text, latency_ms = _transcribe_chunk_or_raise(
+            bytearray(chunk_pcm16),
+            capture_sample_rate_hz=capture_sample_rate_hz,
+            transcription_sample_rate_hz=transcription_sample_rate_hz,
+            channels=config.channels,
+            transcription_model=config.transcription_model,
+            transcriber=chunk_transcriber,
+            suppress_backend_output=not debug,
+        )
+        if not model_ready_reported and uses_lazy_default_transcriber:
+            _emit_progress(
+                progress_callback,
+                "model_ready",
+                transcription_model=config.transcription_model,
+            )
+            model_ready_reported = True
+        return text, latency_ms
+
     def _write_event(event: dict[str, object], handle: object) -> None:
         handle.write(json.dumps(event, ensure_ascii=True) + "\n")
         handle.flush()
@@ -702,15 +738,7 @@ def run_live_transcription_session(
                         last_partial_at = now
                         continue
                     last_selected_source = selected_source
-                    text, latency_ms = _transcribe_chunk_or_raise(
-                        bytearray(selected_pcm16),
-                        capture_sample_rate_hz=capture_sample_rate_hz,
-                        transcription_sample_rate_hz=transcription_sample_rate_hz,
-                        channels=config.channels,
-                        transcription_model=config.transcription_model,
-                        transcriber=chunk_transcriber,
-                        suppress_backend_output=not debug,
-                    )
+                    text, latency_ms = _transcribe_chunk_with_progress(selected_pcm16)
                     total_inference_ms += latency_ms
                     if text and text != last_partial_text:
                         partial_event = {
@@ -772,15 +800,7 @@ def run_live_transcription_session(
                     chunk_pcm16_by_source = {}
                     continue
                 else:
-                    text, latency_ms = _transcribe_chunk_or_raise(
-                        bytearray(selected_pcm16),
-                        capture_sample_rate_hz=capture_sample_rate_hz,
-                        transcription_sample_rate_hz=transcription_sample_rate_hz,
-                        channels=config.channels,
-                        transcription_model=config.transcription_model,
-                        transcriber=chunk_transcriber,
-                        suppress_backend_output=not debug,
-                    )
+                    text, latency_ms = _transcribe_chunk_with_progress(selected_pcm16)
                     total_inference_ms += latency_ms
 
                 if not text:
@@ -795,9 +815,10 @@ def run_live_transcription_session(
                     chunk_pcm16_by_source = {}
                     continue
 
-                stitched_text = _stitch_text_overlap(previous_final_text, text)
-                if stitched_text:
-                    text = stitched_text
+                if config.stitch_overlap_text:
+                    stitched_text = _stitch_text_overlap(previous_final_text, text)
+                    if stitched_text:
+                        text = stitched_text
 
                 empty_output_streak = 0
                 total_audio_bytes += len(selected_pcm16)
@@ -879,20 +900,13 @@ def run_live_transcription_session(
                 empty_output_streak += 1
                 selected_source = ""
             else:
-                text, latency_ms = _transcribe_chunk_or_raise(
-                    bytearray(selected_pcm16),
-                    capture_sample_rate_hz=capture_sample_rate_hz,
-                    transcription_sample_rate_hz=transcription_sample_rate_hz,
-                    channels=config.channels,
-                    transcription_model=config.transcription_model,
-                    transcriber=chunk_transcriber,
-                    suppress_backend_output=not debug,
-                )
+                text, latency_ms = _transcribe_chunk_with_progress(selected_pcm16)
                 total_inference_ms += latency_ms
                 if text:
-                    stitched_text = _stitch_text_overlap(previous_final_text, text)
-                    if stitched_text:
-                        text = stitched_text
+                    if config.stitch_overlap_text:
+                        stitched_text = _stitch_text_overlap(previous_final_text, text)
+                        if stitched_text:
+                            text = stitched_text
                     empty_output_streak = 0
                     total_audio_bytes += len(selected_pcm16)
                     source_selection_counts[selected_source] = source_selection_counts.get(selected_source, 0) + 1
@@ -950,6 +964,7 @@ def run_live_transcription_session(
         "chunk_sec": config.chunk_sec,
         "chunk_overlap_sec": config.chunk_overlap_sec,
         "chunk_overlap_sec_effective": effective_chunk_overlap_sec,
+        "stitch_overlap_text": config.stitch_overlap_text,
         "partial_interval_sec": config.partial_interval_sec,
         "source_mode": config.source_mode.value,
         "mic_device": config.mic_device,

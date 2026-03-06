@@ -93,7 +93,36 @@ def test_cli_parser_uses_larger_default_session_model() -> None:
     )
     assert args.transcription_model == "nvidia/parakeet-tdt-0.6b-v3"
     assert args.chunk_overlap_sec == 0.75
+    assert args.stitch_overlap_text is True
     assert args.partial_interval_sec == 0.0
+
+
+def test_cli_parser_accepts_session_overlap_stitch_flag() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "session",
+            "run",
+            "--stitch-overlap-text",
+            "--fixture",
+        ]
+    )
+    assert args.stitch_overlap_text is True
+
+
+def test_cli_parser_accepts_session_overlap_stitch_opt_out() -> None:
+    from transcribe.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "session",
+            "run",
+            "--no-stitch-overlap-text",
+            "--fixture",
+        ]
+    )
+    assert args.stitch_overlap_text is False
 
 
 def test_cli_parser_accepts_session_run_mic_device_index() -> None:
@@ -485,6 +514,148 @@ def test_stitch_text_overlap_removes_repeated_boundary_words() -> None:
 
 def test_stitch_text_overlap_preserves_new_text_without_overlap() -> None:
     assert _stitch_text_overlap("Who's there?", "Long live the king.") == "Long live the king."
+
+
+@pytest.mark.parametrize(
+    ("previous_text", "current_text", "expected_text"),
+    [
+        (
+            "USB C port, be it with slower charging speeds, and we get the desk view upgrade.",
+            "the desk view up like a pixel center stage camera. I would have really liked to see",
+            "up like a pixel center stage camera. I would have really liked to see",
+        ),
+        (
+            "But hey, it's 5k resolution and not everybody wants that.",
+            "Not everybody wants. I'm just gonna say I'm jazzed enough about the new XDR that I'm willing",
+            "I'm just gonna say I'm jazzed enough about the new XDR that I'm willing",
+        ),
+    ],
+)
+def test_stitch_text_overlap_handles_conservative_boundary_trim(
+    previous_text: str,
+    current_text: str,
+    expected_text: str,
+) -> None:
+    assert _stitch_text_overlap(previous_text, current_text) == expected_text
+
+
+def test_stitch_text_overlap_preserves_hyphenated_cutoff_recovery() -> None:
+    assert (
+        _stitch_text_overlap(
+            "least not as much, coming in around $1,700 less than the Pro Display XDR. Also, it's finally a mini-",
+            "It's finally a minity, and on top of the physical changes, we're also getting support for 16 reference modes.",
+        )
+        == "It's finally a minity, and on top of the physical changes, we're also getting support for 16 reference modes."
+    )
+
+
+def test_stitch_text_overlap_preserves_short_fuzzy_corrections() -> None:
+    assert (
+        _stitch_text_overlap(
+            "It's finally a minity, and on top of the physical changes, we're also getting support for 16 reference modes. So color correction is sending.",
+            "So color correctionists and common rejoice, along with access to the color again, and the same quality technical center stage plus...",
+        )
+        == "So color correctionists and common rejoice, along with access to the color again, and the same quality technical center stage plus..."
+    )
+
+
+def test_stitch_text_overlap_keeps_three_word_corrections() -> None:
+    assert (
+        _stitch_text_overlap(
+            "bit the same, sixteen hundred dollars we were paying before, but now it's similarly upgraded Thunderbolt and US P C port.",
+            "USB C port, be it with slower charging speeds, and we get the desk view upgrade.",
+        )
+        == "USB C port, be it with slower charging speeds, and we get the desk view upgrade."
+    )
+
+
+def test_stitch_text_overlap_removes_long_two_word_suffix_overlap() -> None:
+    assert (
+        _stitch_text_overlap(
+            "The pricing change is pretty disruptive.",
+            "pretty disruptive, but maybe overdue.",
+        )
+        == "but maybe overdue."
+    )
+
+
+def test_stitch_text_overlap_preserves_two_word_exact_overlap() -> None:
+    assert (
+        _stitch_text_overlap(
+            "Not everybody wants. I'm just gonna say I'm jazzed enough about the new XDR that I'm willing",
+            "XDR that I will give them on this one since they didn't raise the price. On that subject,",
+        )
+        == "XDR that I will give them on this one since they didn't raise the price. On that subject,"
+    )
+
+
+def test_stitch_text_overlap_preserves_partial_word_followups() -> None:
+    assert (
+        _stitch_text_overlap(
+            "I mean who would have just slapped an M4 chip onto it and called it?",
+            "onto it and c they've certainly done it before. But instead, it's",
+        )
+        == "onto it and c they've certainly done it before. But instead, it's"
+    )
+
+
+def test_run_live_transcription_session_can_disable_stitching(monkeypatch, tmp_path) -> None:
+    from transcribe.audio.interfaces import RawFrame
+    import transcribe.live.session as live_session_module
+
+    class FakeBackend:
+        def __init__(self, *, use_fixture: bool = False) -> None:
+            _ = use_fixture
+            self.sample_rate_hz = 16_000
+            self.active_devices = {"mic": ["fixture"]}
+
+        def open(self, config) -> None:
+            _ = config
+
+        def read_frames(self, timeout_ms: int = 500) -> dict[str, RawFrame]:
+            _ = timeout_ms
+            frame_samples = int((self.sample_rate_hz * 20) / 1000)
+            voiced_frame = struct.pack("<h", 1_200) * frame_samples
+            return {
+                "mic": RawFrame(
+                    stream="mic",
+                    mono_pcm16=voiced_frame,
+                    captured_at_monotonic_ns=time.monotonic_ns(),
+                )
+            }
+
+        def close(self) -> None:
+            return None
+
+    call_count = {"count": 0}
+
+    def fake_transcriber(wav_bytes: bytes, model_id: str) -> tuple[str, float]:
+        _ = (wav_bytes, model_id)
+        call_count["count"] += 1
+        if call_count["count"] == 1:
+            return "Not everybody wants that.", 1.0
+        return "Not everybody wants. I'm just gonna say more.", 1.0
+
+    def fail_if_called(previous_text: str, current_text: str, *, max_overlap_words: int = 12) -> str:
+        _ = (previous_text, current_text, max_overlap_words)
+        raise AssertionError("stitcher should not run by default")
+
+    monkeypatch.setattr(live_session_module, "LinuxAudioCaptureBackend", FakeBackend)
+    monkeypatch.setattr(live_session_module, "_stitch_text_overlap", fail_if_called)
+
+    config = LiveSessionConfig(
+        transcription_model="unit-test-model",
+        duration_sec=0.18,
+        chunk_sec=0.08,
+        stitch_overlap_text=False,
+        output_dir=tmp_path / "live-session",
+        session_id="live-no-stitch",
+    )
+    result = run_live_transcription_session(config, use_fixture=False, transcriber=fake_transcriber)
+
+    payload = json.loads(result.transcript_json_path.read_text(encoding="utf-8"))
+    assert payload["stitch_overlap_text"] is False
+    assert payload["final_segments"]
 
 
 def test_run_live_transcription_session_reports_progress_events(tmp_path) -> None:

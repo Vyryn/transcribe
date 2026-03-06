@@ -96,6 +96,21 @@ def _is_hf_offline_network_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    """Check whether an exception chain indicates CUDA memory exhaustion."""
+    needles = (
+        "cuda out of memory",
+        "cuda error: out of memory",
+        "cudnn_status_alloc_failed",
+        "hip out of memory",
+    )
+    for item in _iter_exception_chain(exc):
+        message = str(item).lower()
+        if any(needle in message for needle in needles):
+            return True
+    return False
+
+
 def _offline_hf_error(dataset_id: str) -> HfOfflineDatasetUnavailableError:
     """Create a user-friendly offline cache error for HF benchmark datasets."""
     return HfOfflineDatasetUnavailableError(
@@ -385,6 +400,30 @@ def _get_faster_whisper_model(model_id: str, *, local_files_only: bool = True) -
 
 def _load_nemo_model_from_snapshot(nemo_asr: Any, resolved_model_id: str, snapshot_dir: str) -> Any:
     """Load a NeMo model from a locally cached HF snapshot directory."""
+
+    def _restore_with_optional_cpu_fallback(model_loader: Callable[..., Any], **kwargs: Any) -> Any:
+        try:
+            return model_loader(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            restore_errors.append(exc)
+            if not _is_cuda_oom_error(exc):
+                raise
+
+            try:
+                import torch
+            except ImportError:
+                raise
+
+            LOGGER.warning(
+                "CUDA memory exhausted while restoring %s; retrying on CPU.",
+                resolved_model_id,
+            )
+            try:
+                return model_loader(**kwargs, map_location=torch.device("cpu"))
+            except Exception as cpu_exc:  # noqa: BLE001
+                restore_errors.append(cpu_exc)
+                raise
+
     snapshot_path = Path(snapshot_dir)
     preferred_nemo_filename = f"{Path(resolved_model_id).name}.nemo"
     nemo_files = sorted(snapshot_path.glob("*.nemo"))
@@ -394,9 +433,11 @@ def _load_nemo_model_from_snapshot(nemo_asr: Any, resolved_model_id: str, snapsh
         ordered_files = sorted(nemo_files, key=lambda item: (item.name != preferred_nemo_filename, item.name))
         for nemo_file in ordered_files:
             try:
-                return nemo_asr.models.ASRModel.restore_from(restore_path=str(nemo_file))
+                return _restore_with_optional_cpu_fallback(
+                    nemo_asr.models.ASRModel.restore_from,
+                    restore_path=str(nemo_file),
+                )
             except Exception as exc:  # noqa: BLE001
-                restore_errors.append(exc)
                 continue
     else:
         try:
@@ -413,9 +454,12 @@ def _load_nemo_model_from_snapshot(nemo_asr: Any, resolved_model_id: str, snapsh
             connector = SaveRestoreConnector()
             connector.model_extracted_dir = snapshot_dir
             try:
-                return model_class.restore_from(restore_path=snapshot_dir, save_restore_connector=connector)
+                return _restore_with_optional_cpu_fallback(
+                    model_class.restore_from,
+                    restore_path=snapshot_dir,
+                    save_restore_connector=connector,
+                )
             except Exception as exc:  # noqa: BLE001
-                restore_errors.append(exc)
                 continue
 
     if restore_errors:
@@ -426,6 +470,11 @@ def _load_nemo_model_from_snapshot(nemo_asr: Any, resolved_model_id: str, snapsh
     raise RuntimeError(
         f"NeMo model snapshot {snapshot_dir!r} for {resolved_model_id!r} did not contain loadable artifacts."
     )
+
+
+def _snapshot_contains_nemo_archive(snapshot_dir: str) -> bool:
+    """Return True when a snapshot directory contains one or more `.nemo` archives."""
+    return any(Path(snapshot_dir).glob("*.nemo"))
 
 
 def _is_nemo_speechlm_snapshot(snapshot_dir: str) -> bool:
@@ -503,11 +552,18 @@ def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
 
     load_errors: list[BaseException] = []
     model = None
-    try:
-        model = _load_nemo_model_from_snapshot(nemo_asr, resolved_model_id, snapshot_dir)
-    except Exception as exc:  # noqa: BLE001
-        load_errors.append(exc)
-    if model is None:
+    snapshot_contains_nemo_archive = _snapshot_contains_nemo_archive(snapshot_dir)
+    nemo_restore_attempts = 2 if snapshot_contains_nemo_archive else 1
+    for attempt_index in range(nemo_restore_attempts):
+        try:
+            model = _load_nemo_model_from_snapshot(nemo_asr, resolved_model_id, snapshot_dir)
+            break
+        except Exception as exc:  # noqa: BLE001
+            load_errors.append(exc)
+            if (attempt_index + 1) < nemo_restore_attempts:
+                continue
+
+    if model is None and not snapshot_contains_nemo_archive:
         try:
             model = _load_nemo_speechlm_model_from_snapshot(
                 resolved_model_id,
@@ -528,10 +584,13 @@ def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
         for exc in load_errors:
             if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
                 raise _offline_model_error(resolved_model_id) from exc
+        preferred_error = load_errors[-1]
+        if snapshot_contains_nemo_archive:
+            preferred_error = load_errors[0]
         raise RuntimeError(
             f"Failed to initialize NeMo ASR model for {resolved_model_id!r} from snapshot "
-            f"{snapshot_dir!r}: {load_errors[-1]}"
-        ) from load_errors[-1]
+            f"{snapshot_dir!r}: {preferred_error}"
+        ) from preferred_error
 
     _apply_parakeet_runtime_compatibility(model, resolved_model_id)
     _prepare_nemo_model_for_inference(model, resolved_model_id)

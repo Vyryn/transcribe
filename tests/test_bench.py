@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,8 @@ from transcribe.bench.harness import (
     _extract_audio_input,
     _extract_audio_path,
     _extract_qwen_audio_input,
+    _get_nemo_asr_model,
+    _load_nemo_model_from_snapshot,
     _prepare_nemo_model_for_inference,
     _is_nemo_speechlm_snapshot,
     _normalize_transcription_model_id,
@@ -402,3 +406,115 @@ def test_prepare_nemo_model_for_inference_sets_eval_and_disables_grad() -> None:
 
     assert model.eval_called is True
     assert model.grad_flag is False
+
+
+def test_get_nemo_asr_model_retries_nemo_archive_restore(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot_dir = tmp_path / "snapshot"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "parakeet-tdt-0.6b-v3.nemo").write_bytes(b"placeholder")
+
+    observed = {"calls": 0}
+    sentinel_model = object()
+
+    fake_nemo = types.ModuleType("nemo")
+    fake_collections = types.ModuleType("nemo.collections")
+    fake_asr = types.ModuleType("nemo.collections.asr")
+    fake_asr.models = types.SimpleNamespace(ASRModel=object())
+    fake_collections.asr = fake_asr
+    fake_nemo.collections = fake_collections
+
+    monkeypatch.setitem(sys.modules, "nemo", fake_nemo)
+    monkeypatch.setitem(sys.modules, "nemo.collections", fake_collections)
+    monkeypatch.setitem(sys.modules, "nemo.collections.asr", fake_asr)
+    monkeypatch.setattr(bench_harness, "_NEMO_ASR_MODEL_CACHE", {})
+    monkeypatch.setattr(bench_harness, "_get_hf_repo_snapshot", lambda *args, **kwargs: str(snapshot_dir))
+
+    def fake_restore(nemo_asr: object, resolved_model_id: str, snapshot_dir_arg: str) -> object:
+        _ = (nemo_asr, resolved_model_id, snapshot_dir_arg)
+        observed["calls"] += 1
+        if observed["calls"] == 1:
+            raise RuntimeError("first restore failed")
+        return sentinel_model
+
+    monkeypatch.setattr(bench_harness, "_load_nemo_model_from_snapshot", fake_restore)
+    monkeypatch.setattr(
+        bench_harness,
+        "_load_nemo_speechlm_model_from_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("speechlm fallback should not run")),
+    )
+    monkeypatch.setattr(bench_harness, "_apply_parakeet_runtime_compatibility", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bench_harness, "_prepare_nemo_model_for_inference", lambda *args, **kwargs: None)
+
+    model = _get_nemo_asr_model("nvidia/parakeet-tdt-0.6b-v3", local_files_only=True)
+
+    assert model is sentinel_model
+    assert observed["calls"] == 2
+
+
+def test_get_nemo_asr_model_surfaces_nemo_archive_restore_error_without_speechlm_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot_dir = tmp_path / "snapshot"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "parakeet-tdt-0.6b-v3.nemo").write_bytes(b"placeholder")
+
+    fake_nemo = types.ModuleType("nemo")
+    fake_collections = types.ModuleType("nemo.collections")
+    fake_asr = types.ModuleType("nemo.collections.asr")
+    fake_asr.models = types.SimpleNamespace(ASRModel=object())
+    fake_collections.asr = fake_asr
+    fake_nemo.collections = fake_collections
+
+    monkeypatch.setitem(sys.modules, "nemo", fake_nemo)
+    monkeypatch.setitem(sys.modules, "nemo.collections", fake_collections)
+    monkeypatch.setitem(sys.modules, "nemo.collections.asr", fake_asr)
+    monkeypatch.setattr(bench_harness, "_NEMO_ASR_MODEL_CACHE", {})
+    monkeypatch.setattr(bench_harness, "_get_hf_repo_snapshot", lambda *args, **kwargs: str(snapshot_dir))
+    monkeypatch.setattr(
+        bench_harness,
+        "_load_nemo_model_from_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("restore exploded")),
+    )
+    monkeypatch.setattr(
+        bench_harness,
+        "_load_nemo_speechlm_model_from_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("speechlm fallback should not run")),
+    )
+
+    with pytest.raises(RuntimeError, match="restore exploded"):
+        _get_nemo_asr_model("nvidia/parakeet-tdt-0.6b-v3", local_files_only=True)
+
+
+def test_load_nemo_model_from_snapshot_retries_on_cpu_after_cuda_oom(tmp_path: Path) -> None:
+    snapshot_dir = tmp_path / "snapshot"
+    snapshot_dir.mkdir()
+    nemo_file = snapshot_dir / "parakeet-tdt-0.6b-v3.nemo"
+    nemo_file.write_bytes(b"placeholder")
+
+    observed: list[object | None] = []
+    sentinel_model = object()
+
+    class FakeASRModel:
+        @staticmethod
+        def restore_from(*, restore_path: str, map_location=None):
+            assert restore_path == str(nemo_file)
+            observed.append(map_location)
+            if map_location is None:
+                raise RuntimeError("CUDA out of memory. Tried to allocate 20.00 MiB.")
+            return sentinel_model
+
+    fake_nemo_asr = types.SimpleNamespace(models=types.SimpleNamespace(ASRModel=FakeASRModel))
+
+    model = _load_nemo_model_from_snapshot(
+        fake_nemo_asr,
+        "nvidia/parakeet-tdt-0.6b-v3",
+        str(snapshot_dir),
+    )
+
+    assert model is sentinel_model
+    assert observed[0] is None
+    assert str(observed[1]) == "cpu"

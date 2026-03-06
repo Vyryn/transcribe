@@ -249,6 +249,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Audio overlap carried into the next finalized chunk to reduce clipped boundaries",
     )
     session_run.add_argument(
+        "--stitch-overlap-text",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Trim clearly repeated leading text between finalized chunks (default: enabled)",
+    )
+    session_run.add_argument(
         "--mode",
         type=parse_mode,
         default=AudioSourceMode.BOTH,
@@ -468,6 +474,7 @@ def run_session(args: argparse.Namespace) -> int:
         duration_sec=args.duration_sec,
         chunk_sec=args.chunk_sec,
         chunk_overlap_sec=args.chunk_overlap_sec,
+        stitch_overlap_text=getattr(args, "stitch_overlap_text", True),
         partial_interval_sec=args.partial_interval_sec,
         source_mode=args.mode,
         mic_device=args.mic_device,
