@@ -23,6 +23,7 @@ from transcribe.bench.harness import (
     _prepare_nemo_model_for_inference,
     _is_nemo_speechlm_snapshot,
     _normalize_transcription_model_id,
+    release_transcription_runtime_resources,
     run_capture_sync_benchmark,
     run_hf_diarized_transcription_benchmark,
     transcribe_row_with_faster_whisper,
@@ -197,6 +198,45 @@ def test_default_hf_segment_transcriber_routes_by_model_slug_prefix() -> None:
     assert _default_hf_segment_transcriber("nvidia/canary-1b") is transcribe_row_with_nemo_asr
     assert _default_hf_segment_transcriber("Qwen/Qwen3-ASR-1.7B") is transcribe_row_with_qwen_asr
     assert _default_hf_segment_transcriber("qwen/custom-asr") is transcribe_row_with_qwen_asr
+
+
+def test_release_transcription_runtime_resources_clears_selected_backend_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModel:
+        def __init__(self) -> None:
+            self.devices: list[str] = []
+
+        def to(self, device: str) -> None:
+            self.devices.append(device)
+
+    faster_model = FakeModel()
+    nemo_model = FakeModel()
+    qwen_model = FakeModel()
+
+    monkeypatch.setattr(bench_harness, "_FASTER_WHISPER_MODEL_CACHE", {"medium": faster_model})
+    monkeypatch.setattr(bench_harness, "_NEMO_ASR_MODEL_CACHE", {"nvidia/parakeet-tdt-0.6b-v3": nemo_model})
+    monkeypatch.setattr(bench_harness, "_QWEN_ASR_MODEL_CACHE", {"Qwen/Qwen3-ASR-1.7B": qwen_model})
+
+    observed = {"gc": 0, "cache_flush": 0}
+    monkeypatch.setattr(bench_harness.gc, "collect", lambda: observed.__setitem__("gc", observed["gc"] + 1) or 0)
+    monkeypatch.setattr(
+        bench_harness,
+        "_clear_accelerator_caches",
+        lambda: observed.__setitem__("cache_flush", observed["cache_flush"] + 1),
+    )
+
+    released = release_transcription_runtime_resources("nvidia/parakeet-tdt-0.6b-v3")
+
+    assert released == 1
+    assert faster_model.devices == []
+    assert nemo_model.devices == ["cpu"]
+    assert qwen_model.devices == []
+    assert bench_harness._FASTER_WHISPER_MODEL_CACHE == {"medium": faster_model}
+    assert bench_harness._NEMO_ASR_MODEL_CACHE == {}
+    assert bench_harness._QWEN_ASR_MODEL_CACHE == {"Qwen/Qwen3-ASR-1.7B": qwen_model}
+    assert observed["gc"] == 1
+    assert observed["cache_flush"] == 1
 
 
 def test_cache_transcription_model_uses_nvidia_backend(monkeypatch: pytest.MonkeyPatch) -> None:

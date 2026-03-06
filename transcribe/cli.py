@@ -591,8 +591,11 @@ def run_session(args: argparse.Namespace) -> int:
     if not notes_enabled:
         return 0
 
+    from transcribe.bench.harness import release_transcription_runtime_resources
     from transcribe.notes import SessionNotesConfig, run_post_transcription_notes
 
+    print("Preparing notes: releasing transcription model resources...")
+    release_transcription_runtime_resources(args.transcription_model)
     notes_progress_reporter = _build_notes_progress_reporter()
     try:
         notes_result = run_post_transcription_notes(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import io
 import json
@@ -437,7 +438,7 @@ def _load_nemo_model_from_snapshot(nemo_asr: Any, resolved_model_id: str, snapsh
                     nemo_asr.models.ASRModel.restore_from,
                     restore_path=str(nemo_file),
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 continue
     else:
         try:
@@ -459,7 +460,7 @@ def _load_nemo_model_from_snapshot(nemo_asr: Any, resolved_model_id: str, snapsh
                     restore_path=snapshot_dir,
                     save_restore_connector=connector,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 continue
 
     if restore_errors:
@@ -825,6 +826,109 @@ def preload_transcription_model(
         _get_qwen_asr_model(resolved_model_id, local_files_only=True)
         return
     _get_faster_whisper_model(resolved_model_id, local_files_only=True)
+
+
+def release_transcription_runtime_resources(transcription_model: str | None = None) -> int:
+    """Release cached ASR model instances so later stages can reclaim accelerator memory."""
+    caches = _selected_transcription_model_caches(transcription_model)
+    models_to_release = _collect_unique_cached_models(caches)
+
+    for cache in caches:
+        cache.clear()
+    for model in models_to_release:
+        _offload_model_to_cpu(model)
+
+    gc.collect()
+    _clear_accelerator_caches()
+    return len(models_to_release)
+
+
+def _selected_transcription_model_caches(transcription_model: str | None) -> list[dict[str, Any]]:
+    """Select cache dictionaries relevant to a given transcription model."""
+    if transcription_model is None:
+        return [
+            _FASTER_WHISPER_MODEL_CACHE,
+            _NEMO_ASR_MODEL_CACHE,
+            _QWEN_ASR_MODEL_CACHE,
+        ]
+
+    backend, _ = _resolve_transcription_backend(transcription_model)
+    if backend == "nemo_asr":
+        return [_NEMO_ASR_MODEL_CACHE]
+    if backend == "qwen_asr":
+        return [_QWEN_ASR_MODEL_CACHE]
+    return [_FASTER_WHISPER_MODEL_CACHE]
+
+
+def _collect_unique_cached_models(caches: Iterable[dict[str, Any]]) -> list[Any]:
+    """Collect unique cached model objects across one or more cache mappings."""
+    seen_model_ids: set[int] = set()
+    unique_models: list[Any] = []
+    for cache in caches:
+        for model in cache.values():
+            model_id = id(model)
+            if model_id in seen_model_ids:
+                continue
+            seen_model_ids.add(model_id)
+            unique_models.append(model)
+    return unique_models
+
+
+def _offload_model_to_cpu(model: Any) -> None:
+    """Best-effort move a cached model off accelerator memory before dropping references."""
+    for candidate in (model, getattr(model, "model", None)):
+        if candidate is None:
+            continue
+        to_method = getattr(candidate, "to", None)
+        if callable(to_method):
+            try:
+                to_method("cpu")
+                return
+            except TypeError:
+                try:
+                    import torch
+
+                    to_method(torch.device("cpu"))
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
+                pass
+
+        cpu_method = getattr(candidate, "cpu", None)
+        if callable(cpu_method):
+            try:
+                cpu_method()
+                return
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _clear_accelerator_caches() -> None:
+    """Best-effort flush of Torch accelerator allocators after model release."""
+    try:
+        import torch
+    except ImportError:
+        return
+
+    cuda_module = getattr(torch, "cuda", None)
+    if cuda_module is not None:
+        try:
+            if cuda_module.is_available():
+                cuda_module.empty_cache()
+                ipc_collect = getattr(cuda_module, "ipc_collect", None)
+                if callable(ipc_collect):
+                    ipc_collect()
+        except Exception:  # noqa: BLE001
+            pass
+
+    mps_module = getattr(torch, "mps", None)
+    empty_cache = getattr(mps_module, "empty_cache", None)
+    if callable(empty_cache):
+        try:
+            empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _word_error_rate(reference_text: str, hypothesis_text: str) -> float:

@@ -282,12 +282,14 @@ def test_cli_parser_allows_disabling_session_notes() -> None:
 
 def test_run_session_runs_notes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
     import transcribe.cli as cli_module
+    import transcribe.bench.harness as bench_harness
     import transcribe.live.session as live_session_module
     import transcribe.notes as notes_module
 
     monkeypatch.setattr(cli_module, "load_and_configure_logging", lambda args: None)
 
     observed: dict[str, SessionNotesConfig] = {}
+    released: dict[str, str] = {}
 
     def fake_runner(config, *, use_fixture: bool = False, debug: bool = False, progress_callback=None):
         _ = (config, use_fixture, debug, progress_callback)
@@ -332,6 +334,11 @@ def test_run_session_runs_notes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_
 
     monkeypatch.setattr(live_session_module, "run_live_transcription_session", fake_runner)
     monkeypatch.setattr(notes_module, "run_post_transcription_notes", fake_run_post_transcription_notes)
+    monkeypatch.setattr(
+        bench_harness,
+        "release_transcription_runtime_resources",
+        lambda transcription_model: released.setdefault("model", transcription_model) or 1,
+    )
 
     args = argparse.Namespace(
         config=None,
@@ -359,9 +366,11 @@ def test_run_session_runs_notes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_
     captured = capsys.readouterr()
 
     assert rc == 0
+    assert released["model"] == "nvidia/parakeet-tdt-0.6b-v3"
     assert observed["config"].transcript_path == tmp_path / "live-test" / "transcript.txt"
     assert observed["config"].output_dir == tmp_path / "live-test"
     assert observed["config"].model == DEFAULT_SESSION_NOTES_MODEL
+    assert "Preparing notes: releasing transcription model resources..." in captured.out
     assert "Post-session notes: cleaning transcript" in captured.out
     assert "Cleanup pass 1/2..." in captured.out
     assert "Clean transcript ready." in captured.out
@@ -372,10 +381,13 @@ def test_run_session_runs_notes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_
 
 def test_run_session_skips_notes_when_disabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import transcribe.cli as cli_module
+    import transcribe.bench.harness as bench_harness
     import transcribe.live.session as live_session_module
     import transcribe.notes as notes_module
 
     monkeypatch.setattr(cli_module, "load_and_configure_logging", lambda args: None)
+
+    release_calls = {"count": 0}
 
     def fake_runner(config, *, use_fixture: bool = False, debug: bool = False, progress_callback=None):
         _ = (config, use_fixture, debug, progress_callback)
@@ -404,6 +416,11 @@ def test_run_session_skips_notes_when_disabled(monkeypatch: pytest.MonkeyPatch, 
 
     monkeypatch.setattr(live_session_module, "run_live_transcription_session", fake_runner)
     monkeypatch.setattr(notes_module, "run_post_transcription_notes", fail_run_post_transcription_notes)
+    monkeypatch.setattr(
+        bench_harness,
+        "release_transcription_runtime_resources",
+        lambda transcription_model: release_calls.__setitem__("count", release_calls["count"] + 1) or 1,
+    )
 
     args = argparse.Namespace(
         config=None,
@@ -429,6 +446,7 @@ def test_run_session_skips_notes_when_disabled(monkeypatch: pytest.MonkeyPatch, 
     )
 
     assert cli_module.run_session(args) == 0
+    assert release_calls["count"] == 0
 
 
 def test_run_notes_command_uses_requested_transcript(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
