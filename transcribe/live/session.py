@@ -14,9 +14,10 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
-from transcribe.audio.linux_capture import LinuxAudioCaptureBackend
+from transcribe.audio.backend_loader import open_audio_backend
 from transcribe.models import AudioSourceMode, CaptureConfig
 from transcribe.runtime_defaults import DEFAULT_LIVE_TRANSCRIPTION_MODEL
+from transcribe.runtime_env import validate_transcription_model_for_runtime
 
 ChunkTranscriber = Callable[[bytes, str], tuple[str, float]]
 SessionProgressCallback = Callable[[str, dict[str, object]], None]
@@ -561,6 +562,7 @@ def run_live_transcription_session(
     progress_callback: SessionProgressCallback | None = None,
 ) -> LiveSessionResult:
     """Run a live multi-source transcription session with partial/final events."""
+    config.transcription_model = validate_transcription_model_for_runtime(config.transcription_model)
     if config.chunk_sec <= 0:
         raise ValueError("chunk_sec must be > 0")
     if config.chunk_overlap_sec < 0:
@@ -605,7 +607,7 @@ def run_live_transcription_session(
         output_dir=session_dir,
     )
 
-    backend = LinuxAudioCaptureBackend(use_fixture=use_fixture)
+    backend = open_audio_backend(use_fixture=use_fixture)
     backend.open(capture_config)
     capture_sample_rate_hz = backend.sample_rate_hz or config.sample_rate_hz
     transcription_sample_rate_hz = int(config.sample_rate_hz)

@@ -10,6 +10,7 @@ from transcribe.notes import (
     NotesGpuRuntimeError,
     SessionNotesConfig,
     SessionNotesResult,
+    _default_runtime_factory,
     build_cleanup_chunks,
     build_clean_transcript_prompt,
     build_client_notes_prompt,
@@ -264,6 +265,7 @@ def test_cli_parser_accepts_notes_run_command() -> None:
     assert args.notes_command == "run"
     assert args.transcript == Path("rough.txt")
     assert args.notes_model == DEFAULT_SESSION_NOTES_MODEL
+    assert args.notes_runtime == "auto"
 
 
 def test_cli_parser_allows_disabling_session_notes() -> None:
@@ -361,6 +363,7 @@ def test_run_session_runs_notes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_
         fixture=False,
         notes=True,
         notes_model=DEFAULT_SESSION_NOTES_MODEL,
+        notes_runtime="llama_cpp",
     )
     rc = cli_module.run_session(args)
     captured = capsys.readouterr()
@@ -370,6 +373,7 @@ def test_run_session_runs_notes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_
     assert observed["config"].transcript_path == tmp_path / "live-test" / "transcript.txt"
     assert observed["config"].output_dir == tmp_path / "live-test"
     assert observed["config"].model == DEFAULT_SESSION_NOTES_MODEL
+    assert observed["config"].runtime == "llama_cpp"
     assert "Preparing notes: releasing transcription model resources..." in captured.out
     assert "Post-session notes: cleaning transcript" in captured.out
     assert "Cleanup pass 1/2..." in captured.out
@@ -443,6 +447,7 @@ def test_run_session_skips_notes_when_disabled(monkeypatch: pytest.MonkeyPatch, 
         fixture=False,
         notes=False,
         notes_model=DEFAULT_SESSION_NOTES_MODEL,
+        notes_runtime="auto",
     )
 
     assert cli_module.run_session(args) == 0
@@ -492,6 +497,7 @@ def test_run_notes_command_uses_requested_transcript(monkeypatch: pytest.MonkeyP
             transcript=rough_transcript,
             out_dir=None,
             notes_model=DEFAULT_SESSION_NOTES_MODEL,
+            notes_runtime="llama_cpp",
         )
     )
     captured = capsys.readouterr()
@@ -499,5 +505,35 @@ def test_run_notes_command_uses_requested_transcript(monkeypatch: pytest.MonkeyP
     assert rc == 0
     assert observed["config"].transcript_path == rough_transcript
     assert observed["config"].output_dir == tmp_path
+    assert observed["config"].runtime == "llama_cpp"
     assert "Post-session notes: cleaning transcript" in captured.out
     assert "retrying on CPU" in captured.out
+
+
+def test_default_runtime_factory_uses_llama_cpp_when_auto_resolves_to_packaged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    observed: list[bool] = []
+
+    @contextlib.contextmanager
+    def fake_llama_runtime(*, model: str, cpu_only: bool = False):
+        assert model == DEFAULT_SESSION_NOTES_MODEL
+        observed.append(cpu_only)
+        yield FakePromptRuntime(["unused"])
+
+    monkeypatch.setattr(notes_module, "default_notes_runtime", lambda: "llama_cpp")
+    monkeypatch.setattr(notes_module, "open_llama_cpp_runtime", fake_llama_runtime)
+
+    factory = _default_runtime_factory(
+        SessionNotesConfig(
+            transcript_path=Path("rough.txt"),
+            output_dir=Path("out"),
+        )
+    )
+
+    with factory(cpu_only=True):
+        pass
+
+    assert observed == [True]

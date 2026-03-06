@@ -256,7 +256,11 @@ def test_live_session_uses_requested_sample_rate_for_asr_payload(monkeypatch, tm
             observed_rates.append(wav.getframerate())
         return "ok", 5.0
 
-    monkeypatch.setattr(live_session_module, "LinuxAudioCaptureBackend", FakeBackend)
+    monkeypatch.setattr(
+        live_session_module,
+        "open_audio_backend",
+        lambda *, use_fixture=False: FakeBackend(use_fixture=use_fixture),
+    )
     config = LiveSessionConfig(
         transcription_model="unit-test-model",
         sample_rate_hz=16_000,
@@ -313,7 +317,11 @@ def test_live_session_selects_best_source_and_tracks_source_usage(monkeypatch, t
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(live_session_module, "LinuxAudioCaptureBackend", FakeBackend)
+    monkeypatch.setattr(
+        live_session_module,
+        "open_audio_backend",
+        lambda *, use_fixture=False: FakeBackend(use_fixture=use_fixture),
+    )
     config = LiveSessionConfig(
         transcription_model="unit-test-model",
         sample_rate_hz=16_000,
@@ -376,7 +384,11 @@ def test_live_session_capture_coverage_ratio_stays_reasonable(monkeypatch, tmp_p
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(live_session_module, "LinuxAudioCaptureBackend", FakeBackend)
+    monkeypatch.setattr(
+        live_session_module,
+        "open_audio_backend",
+        lambda *, use_fixture=False: FakeBackend(use_fixture=use_fixture),
+    )
     config = LiveSessionConfig(
         transcription_model="unit-test-model",
         sample_rate_hz=16_000,
@@ -460,7 +472,11 @@ def test_live_session_skips_asr_for_silent_chunks(monkeypatch, tmp_path) -> None
         calls["count"] += 1
         return "unexpected", 1.0
 
-    monkeypatch.setattr(live_session_module, "LinuxAudioCaptureBackend", FakeBackend)
+    monkeypatch.setattr(
+        live_session_module,
+        "open_audio_backend",
+        lambda *, use_fixture=False: FakeBackend(use_fixture=use_fixture),
+    )
     config = LiveSessionConfig(
         transcription_model="unit-test-model",
         sample_rate_hz=16_000,
@@ -640,7 +656,11 @@ def test_run_live_transcription_session_can_disable_stitching(monkeypatch, tmp_p
         _ = (previous_text, current_text, max_overlap_words)
         raise AssertionError("stitcher should not run by default")
 
-    monkeypatch.setattr(live_session_module, "LinuxAudioCaptureBackend", FakeBackend)
+    monkeypatch.setattr(
+        live_session_module,
+        "open_audio_backend",
+        lambda *, use_fixture=False: FakeBackend(use_fixture=use_fixture),
+    )
     monkeypatch.setattr(live_session_module, "_stitch_text_overlap", fail_if_called)
 
     config = LiveSessionConfig(

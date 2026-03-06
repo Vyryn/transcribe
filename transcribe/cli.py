@@ -16,8 +16,15 @@ from transcribe.runtime_defaults import (
     DEFAULT_LIVE_TRANSCRIPTION_MODEL,
     DEFAULT_SESSION_NOTES_MODEL,
 )
+from transcribe.runtime_env import resolve_app_runtime_paths
 
 LOGGER = logging.getLogger("transcribe")
+
+
+def _default_data_subdir(name: str) -> Path:
+    """Resolve a default writable data subdirectory for CLI output flags."""
+    runtime_paths = resolve_app_runtime_paths()
+    return runtime_paths.data_root / name
 
 
 def default_session_id(prefix: str = "session") -> str:
@@ -202,7 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_config_flags(capture_run)
     capture_run.add_argument("--mode", type=parse_mode, default=AudioSourceMode.BOTH)
     capture_run.add_argument("--duration-sec", type=float, default=30.0)
-    capture_run.add_argument("--out", type=Path, default=Path("data/captures"))
+    capture_run.add_argument("--out", type=Path, default=_default_data_subdir("captures"))
     capture_run.add_argument("--session-id", default=None)
     capture_run.add_argument(
         "--mic-device",
@@ -218,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capture_run.add_argument("--fixture", action="store_true", help="Use synthetic audio fixture")
 
-    capture_devices = capture_subparsers.add_parser("devices", help="List Linux capture devices")
+    capture_devices = capture_subparsers.add_parser("devices", help="List available capture devices")
     add_common_config_flags(capture_devices)
 
     bench_parser = subparsers.add_parser("bench", help="Benchmark commands")
@@ -229,7 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--scenario", default="capture_sync")
     bench_run.add_argument("--runs", type=int, default=5)
     bench_run.add_argument("--duration-sec", type=float, default=10.0)
-    bench_run.add_argument("--out", type=Path, default=Path("data/benchmarks"))
+    bench_run.add_argument("--out", type=Path, default=_default_data_subdir("benchmarks"))
     bench_run.add_argument("--real-devices", action="store_true", help="Use live devices instead of fixture")
     bench_run.add_argument(
         "--hf-dataset",
@@ -301,7 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Partial transcript refresh interval in seconds (0 disables partials)",
     )
-    session_run.add_argument("--out", type=Path, default=Path("data/live_sessions"))
+    session_run.add_argument("--out", type=Path, default=_default_data_subdir("live_sessions"))
     session_run.add_argument("--session-id", default=None)
     session_run.add_argument(
         "--mic-device",
@@ -342,9 +349,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--notes-model",
         default=DEFAULT_SESSION_NOTES_MODEL,
         help=(
-            "Local Ollama model for transcript cleanup and client notes "
+            "Local notes model for transcript cleanup and client notes "
             f"(default: {DEFAULT_SESSION_NOTES_MODEL}; alternative: {ALTERNATE_SESSION_NOTES_MODEL})"
         ),
+    )
+    session_run.add_argument(
+        "--notes-runtime",
+        choices=("auto", "ollama", "llama_cpp"),
+        default="auto",
+        help="Notes runtime backend (default: auto)",
     )
 
     notes_parser = subparsers.add_parser("notes", help="Transcript cleanup and session notes commands")
@@ -365,9 +378,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="notes_model",
         default=DEFAULT_SESSION_NOTES_MODEL,
         help=(
-            "Local Ollama model for transcript cleanup and client notes "
+            "Local notes model for transcript cleanup and client notes "
             f"(default: {DEFAULT_SESSION_NOTES_MODEL}; alternative: {ALTERNATE_SESSION_NOTES_MODEL})"
         ),
+    )
+    notes_run.add_argument(
+        "--notes-runtime",
+        choices=("auto", "ollama", "llama_cpp"),
+        default="auto",
+        help="Notes runtime backend (default: auto)",
     )
 
     compliance_parser = subparsers.add_parser("compliance", help="Compliance checks")
@@ -456,13 +475,13 @@ def run_devices(args: argparse.Namespace) -> int:
     int
         Exit code.
     """
-    from transcribe.audio.linux_capture import LinuxAudioCaptureBackend
+    from transcribe.audio.backend_loader import open_audio_backend
 
     load_and_configure_logging(args)
-    backend = LinuxAudioCaptureBackend(use_fixture=False)
+    backend = open_audio_backend(use_fixture=False)
     devices = backend.list_devices()
     if not devices:
-        print("No audio devices found (or sounddevice is unavailable).")
+        print("No audio devices found (or the platform capture backend is unavailable).")
         return 0
 
     for device in devices:
@@ -536,12 +555,18 @@ def run_session(args: argparse.Namespace) -> int:
         Exit code.
     """
     from transcribe.live.session import LiveSessionConfig, run_live_transcription_session
+    from transcribe.runtime_env import validate_transcription_model_for_runtime
 
     load_and_configure_logging(args)
+    try:
+        transcription_model = validate_transcription_model_for_runtime(args.transcription_model)
+    except ValueError as exc:
+        print(f"Session failed: {exc}")
+        return 2
     session_id = args.session_id or default_session_id("live")
     output_dir = args.out / session_id
     config = LiveSessionConfig(
-        transcription_model=args.transcription_model,
+        transcription_model=transcription_model,
         duration_sec=args.duration_sec,
         chunk_sec=args.chunk_sec,
         chunk_overlap_sec=args.chunk_overlap_sec,
@@ -595,7 +620,7 @@ def run_session(args: argparse.Namespace) -> int:
     from transcribe.notes import SessionNotesConfig, run_post_transcription_notes
 
     print("Preparing notes: releasing transcription model resources...")
-    release_transcription_runtime_resources(args.transcription_model)
+    release_transcription_runtime_resources(transcription_model)
     notes_progress_reporter = _build_notes_progress_reporter()
     try:
         notes_result = run_post_transcription_notes(
@@ -603,6 +628,7 @@ def run_session(args: argparse.Namespace) -> int:
                 transcript_path=result.transcript_txt_path,
                 output_dir=result.session_dir,
                 model=getattr(args, "notes_model", DEFAULT_SESSION_NOTES_MODEL),
+                runtime=getattr(args, "notes_runtime", "auto"),
             ),
             progress_callback=notes_progress_reporter,
         )
@@ -640,6 +666,7 @@ def run_notes(args: argparse.Namespace) -> int:
                 transcript_path=args.transcript,
                 output_dir=output_dir,
                 model=args.notes_model,
+                runtime=getattr(args, "notes_runtime", "auto"),
             ),
             progress_callback=notes_progress_reporter,
         )

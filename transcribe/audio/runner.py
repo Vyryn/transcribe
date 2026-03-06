@@ -5,7 +5,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from transcribe.audio.linux_capture import LinuxAudioCaptureBackend
+from transcribe.audio.backend_loader import open_audio_backend
 from transcribe.audio.sync import SyncAccumulator, build_captured_pair, record_pair_stats, summarize_stats
 from transcribe.io.session_manifest import write_session_manifest
 from transcribe.io.wav_writer import Pcm16MonoWavWriter
@@ -58,7 +58,7 @@ def run_capture_session(
     speakers_path = output_dir / "speakers.wav"
     manifest_path = output_dir / "session_manifest.json"
 
-    backend = LinuxAudioCaptureBackend(use_fixture=use_fixture)
+    backend = open_audio_backend(use_fixture=use_fixture)
     backend.open(config)
     capture_sample_rate_hz = backend.sample_rate_hz or config.sample_rate_hz
 

@@ -12,12 +12,21 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from transcribe.runtime_defaults import DEFAULT_SESSION_NOTES_MODEL
+from transcribe.runtime_env import (
+    RuntimeMode,
+    default_notes_runtime,
+    resolve_app_runtime_paths,
+    resolve_bundled_notes_model_path,
+)
 
 DEFAULT_CLEAN_TRANSCRIPT_FILENAME = "clean_transcript.txt"
 DEFAULT_CLIENT_NOTES_FILENAME = "client_notes.txt"
 DEFAULT_OLLAMA_HOST = "127.0.0.1:11434"
+DEFAULT_LLAMA_SERVER_HOST = "127.0.0.1"
 _MAX_CLEAN_TRANSCRIPT_CHUNK_WORDS = 700
 _TEMP_SERVER_START_TIMEOUT_SEC = 20.0
 _PROMPT_TIMEOUT_SEC = 1_800.0
@@ -63,6 +72,8 @@ _SERVER_UNAVAILABLE_NEEDLES = (
     "cannot assign requested address",
     "client has been closed",
     "actively refused",
+    "connection reset by peer",
+    "timed out",
 )
 
 
@@ -87,6 +98,7 @@ class SessionNotesConfig:
     clean_transcript_filename: str = DEFAULT_CLEAN_TRANSCRIPT_FILENAME
     client_notes_filename: str = DEFAULT_CLIENT_NOTES_FILENAME
     prompt_path: Path | None = None
+    runtime: str = "auto"
 
 
 @dataclass(slots=True)
@@ -171,8 +183,59 @@ class OllamaRuntimeSession:
         return result.stdout
 
 
+@dataclass(slots=True)
+class LlamaCppRuntimeSession:
+    """Private llama.cpp server runtime used by bundled builds."""
+
+    binary_path: Path
+    model_path: Path
+    host: str
+    server_process: subprocess.Popen[str] | None = None
+
+    def ensure_model_available(self, model: str) -> None:
+        if not self.binary_path.exists():
+            raise NotesRuntimeError(
+                f"Bundled notes runtime is missing llama-server binary: {self.binary_path}"
+            )
+        if not self.model_path.exists():
+            raise NotesRuntimeError(
+                f"Bundled notes model for {model!r} is missing: {self.model_path}"
+            )
+
+    def run_prompt(self, *, model: str, prompt: str) -> str:
+        del model
+        payload = {
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 2048,
+            "stream": False,
+        }
+        response = _llama_server_request(
+            host=self.host,
+            path="/v1/chat/completions",
+            payload=payload,
+            timeout_sec=_PROMPT_TIMEOUT_SEC,
+        )
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise NotesRuntimeError("Bundled notes runtime returned no completion choices.")
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise NotesRuntimeError("Bundled notes runtime returned an invalid completion payload.")
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise NotesRuntimeError("Bundled notes runtime returned no message content.")
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise NotesRuntimeError("Bundled notes runtime returned non-text content.")
+        return content
+
+
 def default_notes_prompt_path() -> Path:
     """Return the repository-managed clinical note prompt path."""
+    runtime_paths = resolve_app_runtime_paths()
+    if runtime_paths.mode == RuntimeMode.PACKAGED:
+        return runtime_paths.notes_prompt_path
     return Path(__file__).resolve().parent.parent / "clinical note synthesis llm prompt.md"
 
 
@@ -233,7 +296,7 @@ def run_post_transcription_notes(
     prompt_template = load_session_note_prompt(config.prompt_path)
     clean_transcript_path = config.output_dir / config.clean_transcript_filename
     client_notes_path = config.output_dir / config.client_notes_filename
-    factory = runtime_factory or open_ollama_runtime
+    factory = runtime_factory or _default_runtime_factory(config)
 
     def _generate_once(*, cpu_only: bool) -> tuple[str, str, float, float]:
         with factory(cpu_only=cpu_only) as runtime:
@@ -328,6 +391,20 @@ def _emit_progress(
     if progress_callback is None:
         return
     progress_callback(event, dict(fields))
+
+
+def _default_runtime_factory(
+    config: SessionNotesConfig,
+) -> Callable[..., contextlib.AbstractContextManager[PromptRuntime]]:
+    """Resolve the default notes runtime factory for one request."""
+    runtime_name = (config.runtime or "auto").strip().lower()
+    if runtime_name in {"", "auto"}:
+        runtime_name = default_notes_runtime()
+    if runtime_name == "ollama":
+        return open_ollama_runtime
+    if runtime_name == "llama_cpp":
+        return lambda *, cpu_only=False: open_llama_cpp_runtime(model=config.model, cpu_only=cpu_only)
+    raise NotesRuntimeError(f"Unsupported notes runtime {config.runtime!r}. Use 'auto', 'ollama', or 'llama_cpp'.")
 
 
 def load_transcript_units(transcript_path: Path) -> list[str]:
@@ -479,6 +556,82 @@ def _word_count(text: str) -> int:
 
 
 @contextlib.contextmanager
+def open_llama_cpp_runtime(
+    *,
+    model: str,
+    cpu_only: bool = False,
+) -> Iterator[PromptRuntime]:
+    """Yield a private bundled llama.cpp server runtime."""
+    runtime_paths = resolve_app_runtime_paths()
+    try:
+        model_path = resolve_bundled_notes_model_path(model, runtime_paths=runtime_paths)
+    except ValueError as exc:
+        raise NotesRuntimeError(str(exc)) from exc
+    executable = runtime_paths.notes_runtime_binary
+    if not executable.exists():
+        path_lookup = shutil.which("llama-server")
+        if path_lookup is None:
+            raise NotesRuntimeError(
+                "Session notes generation requires bundled llama-server or a local `llama-server` on PATH."
+            )
+        executable = Path(path_lookup)
+    with _temporary_llama_cpp_runtime(
+        executable=executable,
+        model_path=model_path,
+        cpu_only=cpu_only,
+    ) as runtime:
+        yield runtime
+
+
+@contextlib.contextmanager
+def _temporary_llama_cpp_runtime(
+    *,
+    executable: Path,
+    model_path: Path,
+    cpu_only: bool,
+) -> Iterator[LlamaCppRuntimeSession]:
+    """Run a private llama.cpp server process on a free loopback port."""
+    host = _loopback_host_for_free_port()
+    host_name, port = _split_host_port(host)
+    env = os.environ.copy()
+    env["LLAMA_ARG_N_GPU_LAYERS"] = "0" if cpu_only else "999"
+    if cpu_only:
+        env.update(
+            {
+                "CUDA_VISIBLE_DEVICES": "-1",
+                "HIP_VISIBLE_DEVICES": "-1",
+                "ROCR_VISIBLE_DEVICES": "-1",
+                "GPU_DEVICE_ORDINAL": "-1",
+            }
+        )
+    process = subprocess.Popen(
+        [
+            str(executable),
+            "-m",
+            str(model_path),
+            "--host",
+            host_name or DEFAULT_LLAMA_SERVER_HOST,
+            "--port",
+            str(port),
+        ],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_llama_cpp_runtime_ready(process=process, host=host)
+        yield LlamaCppRuntimeSession(
+            binary_path=executable,
+            model_path=model_path,
+            host=host,
+            server_process=process,
+        )
+    finally:
+        _terminate_process(process)
+
+
+@contextlib.contextmanager
 def open_ollama_runtime(*, cpu_only: bool = False) -> Iterator[PromptRuntime]:
     """Yield a usable local Ollama runtime, starting a private server when needed."""
     default_env = _base_ollama_env(host=DEFAULT_OLLAMA_HOST)
@@ -549,12 +702,54 @@ def _ollama_executable() -> str:
     return executable
 
 
+def _split_host_port(host: str) -> tuple[str, int]:
+    """Split a loopback host string into host and integer port."""
+    host_name, separator, raw_port = host.rpartition(":")
+    if not separator or not host_name:
+        raise NotesRuntimeError(f"Invalid runtime host value: {host!r}")
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise NotesRuntimeError(f"Invalid runtime port value in host {host!r}") from exc
+    return host_name, port
+
+
 def _loopback_host_for_free_port() -> str:
     """Allocate a loopback port for a private Ollama runtime."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     return f"127.0.0.1:{port}"
+
+
+def _wait_for_llama_cpp_runtime_ready(*, process: subprocess.Popen[str], host: str) -> None:
+    """Poll until a private llama.cpp server is ready to accept requests."""
+    deadline = time.monotonic() + _TEMP_SERVER_START_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            stderr = ""
+            if process.stderr is not None:
+                stderr = process.stderr.read().strip()
+            if _is_gpu_runtime_error(stderr):
+                raise NotesGpuRuntimeError(stderr)
+            detail = stderr or "temporary llama.cpp server exited before becoming ready"
+            raise NotesRuntimeError(f"Unable to start bundled llama.cpp runtime: {detail}")
+
+        try:
+            _llama_server_request(
+                host=host,
+                path="/v1/models",
+                payload=None,
+                timeout_sec=5.0,
+                method="GET",
+            )
+            return
+        except NotesRuntimeError as exc:
+            if not _is_server_unavailable_error(str(exc)):
+                raise
+        time.sleep(0.25)
+
+    raise NotesRuntimeError("Timed out while waiting for a private bundled llama.cpp runtime to start.")
 
 
 def _wait_for_runtime_ready(*, process: subprocess.Popen[str], env: dict[str, str]) -> None:
@@ -576,6 +771,53 @@ def _wait_for_runtime_ready(*, process: subprocess.Popen[str], env: dict[str, st
         time.sleep(0.25)
 
     raise NotesRuntimeError("Timed out while waiting for a private local Ollama runtime to start.")
+
+
+def _llama_server_request(
+    *,
+    host: str,
+    path: str,
+    payload: dict[str, object] | None,
+    timeout_sec: float,
+    method: str = "POST",
+) -> dict[str, object]:
+    """Call one private llama.cpp server endpoint and decode JSON."""
+    data: bytes | None = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib_request.Request(
+        f"http://{host}{path}",
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_sec) as response:
+            body = response.read().decode("utf-8").strip()
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        if _is_gpu_runtime_error(detail):
+            raise NotesGpuRuntimeError(detail) from exc
+        raise NotesRuntimeError(detail or f"llama.cpp server returned HTTP {exc.code}") from exc
+    except urllib_error.URLError as exc:
+        detail = str(exc.reason or exc).strip()
+        if _is_server_unavailable_error(detail):
+            raise NotesRuntimeError(detail) from exc
+        raise NotesRuntimeError(f"Unable to contact bundled llama.cpp runtime: {detail}") from exc
+    except TimeoutError as exc:
+        raise NotesRuntimeError("Bundled llama.cpp request timed out.") from exc
+
+    if not body:
+        return {}
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise NotesRuntimeError("Bundled llama.cpp runtime returned invalid JSON.") from exc
+    if not isinstance(parsed, dict):
+        raise NotesRuntimeError("Bundled llama.cpp runtime returned an unexpected JSON payload.")
+    return parsed
 
 
 def _run_ollama_command(
