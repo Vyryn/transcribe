@@ -21,6 +21,11 @@ _ORIGINAL_CREATE_CONNECTION: Callable[..., socket.socket] | None = None
 _INSTALLED = False
 
 
+def _is_unix_socket_family(family: int) -> bool:
+    """Return True when a socket family represents a Unix domain socket."""
+    af_unix = getattr(socket, "AF_UNIX", None)
+    return af_unix is not None and family == af_unix
+
 def is_loopback(host: str) -> bool:
     """Check whether a host string resolves to a loopback address.
 
@@ -68,7 +73,7 @@ def extract_host(address: Any) -> str | None:
 def guarded_connect(self: socket.socket, address: Any) -> Any:
     """Guard ``socket.connect`` to enforce outbound network policy."""
     assert _ORIGINAL_CONNECT is not None
-    if self.family == socket.AF_UNIX:
+    if _is_unix_socket_family(self.family):
         return _ORIGINAL_CONNECT(self, address)
 
     host = extract_host(address)
@@ -81,7 +86,7 @@ def guarded_connect(self: socket.socket, address: Any) -> Any:
 def guarded_connect_ex(self: socket.socket, address: Any) -> Any:
     """Guard ``socket.connect_ex`` to enforce outbound network policy."""
     assert _ORIGINAL_CONNECT_EX is not None
-    if self.family == socket.AF_UNIX:
+    if _is_unix_socket_family(self.family):
         return _ORIGINAL_CONNECT_EX(self, address)
 
     host = extract_host(address)
@@ -157,7 +162,10 @@ def run_network_guard_self_test() -> dict[str, bool]:
 
             def accept_once() -> None:
                 ready.set()
-                conn, _ = server.accept()
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    return
                 conn.close()
 
             thread = threading.Thread(target=accept_once, daemon=True)

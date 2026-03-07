@@ -25,6 +25,8 @@ SolidCompression=yes
 WizardStyle=modern
 OutputDir={#OutputDir}
 OutputBaseFilename=transcribe-windows-standalone
+DiskSpanning=yes
+DiskSliceSize=max
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion

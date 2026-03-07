@@ -409,7 +409,7 @@ def test_apply_parakeet_runtime_compatibility_skips_non_parakeet_models() -> Non
 
 
 def test_apply_parakeet_runtime_compatibility_supports_structured_omegaconf() -> None:
-    from omegaconf import OmegaConf
+    OmegaConf = pytest.importorskip("omegaconf").OmegaConf
 
     class FakeModel:
         def __init__(self) -> None:
