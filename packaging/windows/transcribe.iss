@@ -37,3 +37,35 @@ Name: "{group}\Uninstall Transcribe"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{app}\transcribe.exe"; Description: "Launch Transcribe"; Flags: nowait postinstall skipifsilent
+
+[Code]
+procedure FailBootstrap(const MessageText: string);
+begin
+  MsgBox(MessageText, mbCriticalError, MB_OK);
+  Abort;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+begin
+  if CurStep <> ssPostInstall then
+    exit;
+
+  if not Exec(
+    ExpandConstant('{app}\transcribe.exe'),
+    'models install --default --quiet',
+    ExpandConstant('{app}'),
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+  begin
+    FailBootstrap('Failed to start packaged-model bootstrap.');
+  end;
+
+  if ResultCode <> 0 then
+  begin
+    FailBootstrap(Format('Packaged-model bootstrap failed with exit code %d.', [ResultCode]));
+  end;
+end;

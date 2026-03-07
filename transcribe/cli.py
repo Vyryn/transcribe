@@ -191,8 +191,13 @@ def _build_notes_progress_reporter() -> Callable[[str, dict[str, object]], None]
     return _report
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, packaged_runtime: bool = False) -> argparse.ArgumentParser:
     """Construct the top-level CLI parser.
+
+    Parameters
+    ----------
+    packaged_runtime : bool, optional
+        When ``True``, build the end-user packaged parser surface.
 
     Returns
     -------
@@ -228,42 +233,43 @@ def build_parser() -> argparse.ArgumentParser:
     capture_devices = capture_subparsers.add_parser("devices", help="List available capture devices")
     add_common_config_flags(capture_devices)
 
-    bench_parser = subparsers.add_parser("bench", help="Benchmark commands")
-    bench_subparsers = bench_parser.add_subparsers(dest="bench_command", required=True)
+    if not packaged_runtime:
+        bench_parser = subparsers.add_parser("bench", help="Benchmark commands")
+        bench_subparsers = bench_parser.add_subparsers(dest="bench_command", required=True)
 
-    bench_run = bench_subparsers.add_parser("run", help="Run capture synchronization benchmark")
-    add_common_config_flags(bench_run)
-    bench_run.add_argument("--scenario", default="capture_sync")
-    bench_run.add_argument("--runs", type=int, default=5)
-    bench_run.add_argument("--duration-sec", type=float, default=10.0)
-    bench_run.add_argument("--out", type=Path, default=_default_data_subdir("benchmarks"))
-    bench_run.add_argument("--real-devices", action="store_true", help="Use live devices instead of fixture")
-    bench_run.add_argument(
-        "--hf-dataset",
-        default="edinburghcstr/ami",
-        help="Hugging Face dataset id for diarized-transcription benchmarking",
-    )
-    bench_run.add_argument("--hf-config", default="ihm", help="Hugging Face dataset config/subset")
-    bench_run.add_argument("--hf-split", default="test", help="Hugging Face split name")
-    bench_run.add_argument(
-        "--hf-limit",
-        type=int,
-        default=100,
-        help="Row limit for Hugging Face benchmark runs",
-    )
-    bench_run.add_argument(
-        "--model",
-        "--transcription-model",
-        dest="transcription_model",
-        default="faster-whisper-medium",
-        help="Model id under test (whisper*=>faster-whisper, nvidia/*=>nemo_asr, qwen/*=>qwen-asr)",
-    )
-    bench_run.add_argument(
-        "--max-model-ram-gb",
-        type=float,
-        default=8.0,
-        help="Reject models with estimated runtime RAM above this threshold",
-    )
+        bench_run = bench_subparsers.add_parser("run", help="Run capture synchronization benchmark")
+        add_common_config_flags(bench_run)
+        bench_run.add_argument("--scenario", default="capture_sync")
+        bench_run.add_argument("--runs", type=int, default=5)
+        bench_run.add_argument("--duration-sec", type=float, default=10.0)
+        bench_run.add_argument("--out", type=Path, default=_default_data_subdir("benchmarks"))
+        bench_run.add_argument("--real-devices", action="store_true", help="Use live devices instead of fixture")
+        bench_run.add_argument(
+            "--hf-dataset",
+            default="edinburghcstr/ami",
+            help="Hugging Face dataset id for diarized-transcription benchmarking",
+        )
+        bench_run.add_argument("--hf-config", default="ihm", help="Hugging Face dataset config/subset")
+        bench_run.add_argument("--hf-split", default="test", help="Hugging Face split name")
+        bench_run.add_argument(
+            "--hf-limit",
+            type=int,
+            default=100,
+            help="Row limit for Hugging Face benchmark runs",
+        )
+        bench_run.add_argument(
+            "--model",
+            "--transcription-model",
+            dest="transcription_model",
+            default="faster-whisper-medium",
+            help="Model id under test (whisper*=>faster-whisper, nvidia/*=>nemo_asr, qwen/*=>qwen-asr)",
+        )
+        bench_run.add_argument(
+            "--max-model-ram-gb",
+            type=float,
+            default=8.0,
+            help="Reject models with estimated runtime RAM above this threshold",
+        )
 
     session_parser = subparsers.add_parser("session", help="Live transcription session commands")
     session_subparsers = session_parser.add_subparsers(dest="session_command", required=True)
@@ -397,6 +403,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     compliance_urls = compliance_subparsers.add_parser("check-no-urls", help="Verify no URL literals in runtime source")
     add_common_config_flags(compliance_urls)
+
+    models_parser = subparsers.add_parser("models", help="Packaged model asset commands")
+    models_subparsers = models_parser.add_subparsers(dest="models_command", required=True)
+
+    models_list = models_subparsers.add_parser("list", help="List packaged model assets")
+    add_common_config_flags(models_list)
+
+    models_install = models_subparsers.add_parser("install", help="Install packaged model assets")
+    add_common_config_flags(models_install)
+    models_install.add_argument(
+        "--model",
+        dest="model_ids",
+        action="append",
+        default=[],
+        help="Packaged model id to install; may be repeated",
+    )
+    models_install.add_argument(
+        "--default",
+        action="store_true",
+        help="Install the default packaged model set",
+    )
+    models_install.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress per-model output",
+    )
 
     return parser
 
@@ -616,7 +648,7 @@ def run_session(args: argparse.Namespace) -> int:
     if not notes_enabled:
         return 0
 
-    from transcribe.bench.harness import release_transcription_runtime_resources
+    from transcribe.transcription_runtime import release_transcription_runtime_resources
     from transcribe.notes import SessionNotesConfig, run_post_transcription_notes
 
     print("Preparing notes: releasing transcription model resources...")
@@ -679,6 +711,70 @@ def run_notes(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_models(args: argparse.Namespace) -> int:
+    """Execute packaged model-management commands."""
+    from transcribe.packaged_assets import (
+        install_packaged_model_assets,
+        load_packaged_asset_manifest,
+        verify_installed_asset,
+    )
+
+    runtime_paths = resolve_app_runtime_paths()
+    manifest_path = runtime_paths.packaged_assets_manifest_path
+    if not manifest_path.exists():
+        print(f"Models command failed: packaged asset manifest not found: {manifest_path}")
+        return 2
+
+    try:
+        manifest = load_packaged_asset_manifest(manifest_path)
+    except (OSError, ValueError) as exc:
+        print(f"Models command failed: {exc}")
+        return 2
+
+    if args.models_command == "list":
+        for asset in manifest.assets:
+            install_class = "default" if asset.default_install else "optional"
+            status = "installed" if verify_installed_asset(asset, models_root=runtime_paths.models_root) else "not installed"
+            print(f"{asset.model_id}\t{asset.kind}\t{install_class}\t{status}")
+        return 0
+
+    if args.models_command != "install":
+        print(f"Models command failed: unsupported subcommand {args.models_command!r}.")
+        return 2
+
+    if not getattr(args, "default", False) and not getattr(args, "model_ids", []):
+        print("Models install failed: pass --default or --model <id>.")
+        return 2
+
+    def _report(event: str, asset, target_path: Path) -> None:
+        if getattr(args, "quiet", False):
+            return
+        if event == "installing":
+            print(f"Installing {asset.model_id} -> {target_path}")
+            return
+        if event == "installed":
+            print(f"Installed {asset.model_id}")
+            return
+        if event == "skipped":
+            print(f"Already installed {asset.model_id}")
+
+    try:
+        results = install_packaged_model_assets(
+            manifest,
+            models_root=runtime_paths.models_root,
+            installed_state_path=runtime_paths.installed_assets_state_path,
+            model_ids=list(getattr(args, "model_ids", [])),
+            default_only=bool(getattr(args, "default", False)),
+            progress_callback=_report,
+        )
+    except Exception as exc:
+        print(f"Models install failed: {exc}")
+        return 2
+
+    if not getattr(args, "quiet", False):
+        print(f"Models ready: {len(results)}")
+    return 0
+
 def run_check_no_network(args: argparse.Namespace) -> int:
     """Execute the ``compliance check-no-network`` command.
 
@@ -713,20 +809,22 @@ def run_check_no_urls(args: argparse.Namespace) -> int:
     return enforce_no_url_literals(Path.cwd())
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, packaged_runtime: bool = False) -> int:
     """CLI entrypoint.
 
     Parameters
     ----------
     argv : list[str] | None, optional
         CLI arguments. Uses process argv when ``None``.
+    packaged_runtime : bool, optional
+        When ``True``, expose the packaged runtime command surface.
 
     Returns
     -------
     int
         Process exit code.
     """
-    parser = build_parser()
+    parser = build_parser(packaged_runtime=packaged_runtime)
     args = parser.parse_args(argv)
 
     if args.command == "capture" and args.capture_command == "run":
@@ -743,10 +841,13 @@ def main(argv: list[str] | None = None) -> int:
         return run_check_no_network(args)
     if args.command == "compliance" and args.compliance_command == "check-no-urls":
         return run_check_no_urls(args)
+    if args.command == "models":
+        return run_models(args)
 
     parser.print_help()
     return 1
 
-
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

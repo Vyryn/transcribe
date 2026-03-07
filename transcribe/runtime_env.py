@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from transcribe.packaged_assets import (
+    INSTALLED_ASSET_STATE_FILENAME,
+    PACKAGED_ASSET_MANIFEST_FILENAME,
+    load_packaged_asset_manifest,
+)
 from transcribe.runtime_defaults import (
     ALTERNATE_SESSION_NOTES_MODEL,
     DEFAULT_LIVE_TRANSCRIPTION_MODEL,
@@ -28,7 +33,7 @@ class RuntimeMode(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class BundledModelSpec:
-    """One packaged model artifact resolved relative to the install root."""
+    """One packaged model artifact resolved relative to the models root."""
 
     model_id: str
     relative_path: Path
@@ -52,6 +57,8 @@ class AppRuntimePaths:
     runtime_root: Path
     models_root: Path
     prompt_root: Path
+    packaged_assets_manifest_path: Path
+    installed_assets_state_path: Path
     notes_runtime_binary: Path
     notes_prompt_path: Path
     notes_models: dict[str, Path]
@@ -103,61 +110,96 @@ def _notes_binary_specs() -> tuple[BundledBinarySpec, ...]:
 
 
 def bundled_notes_model_specs() -> tuple[BundledModelSpec, ...]:
-    """Return the packaged note-model mapping."""
+    """Return the packaged note-model mapping relative to the models root."""
     return (
         BundledModelSpec(
             DEFAULT_SESSION_NOTES_MODEL,
-            Path("models/notes/qwen3.5-4b-q4_k_m.gguf"),
+            Path("notes/qwen3.5-4b-q4_k_m.gguf"),
         ),
         BundledModelSpec(
             ALTERNATE_SESSION_NOTES_MODEL,
-            Path("models/notes/qwen3.5-2b-q4_k_m.gguf"),
+            Path("notes/qwen3.5-2b-q4_k_m.gguf"),
         ),
     )
 
 
 def bundled_transcription_model_specs() -> tuple[BundledModelSpec, ...]:
-    """Return the packaged ASR model mapping."""
+    """Return the packaged ASR model mapping relative to the models root."""
     return (
         BundledModelSpec(
             DEFAULT_LIVE_TRANSCRIPTION_MODEL,
-            Path("models/asr/nvidia/parakeet-tdt-0.6b-v3"),
+            Path("asr/nvidia/parakeet-tdt-0.6b-v3"),
         ),
         BundledModelSpec(
             PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
-            Path("models/asr/nvidia/canary-qwen-2.5b"),
+            Path("asr/nvidia/canary-qwen-2.5b"),
         ),
     )
+
+
+def _manifest_model_specs(manifest_path: Path, *, kind: str) -> tuple[BundledModelSpec, ...]:
+    manifest = load_packaged_asset_manifest(manifest_path)
+    specs: list[BundledModelSpec] = []
+    for asset in manifest.assets:
+        if asset.kind != kind:
+            continue
+        specs.append(BundledModelSpec(asset.model_id, Path(asset.relative_path.replace("/", os.sep))))
+    return tuple(specs)
+
+
+def _resolve_model_specs(
+    *,
+    mode: RuntimeMode,
+    manifest_path: Path,
+) -> tuple[tuple[BundledModelSpec, ...], tuple[BundledModelSpec, ...]]:
+    notes_specs = bundled_notes_model_specs()
+    transcription_specs = bundled_transcription_model_specs()
+    if mode != RuntimeMode.PACKAGED or not manifest_path.exists():
+        return notes_specs, transcription_specs
+
+    manifest_notes = _manifest_model_specs(manifest_path, kind="notes")
+    manifest_transcription = _manifest_model_specs(manifest_path, kind="transcription")
+    if manifest_notes:
+        notes_specs = manifest_notes
+    if manifest_transcription:
+        transcription_specs = manifest_transcription
+    return notes_specs, transcription_specs
 
 
 def resolve_app_runtime_paths() -> AppRuntimePaths:
     """Resolve install, runtime, and bundled-model paths for the current process."""
     mode = detect_runtime_mode()
     install_root = default_install_root()
+    data_root = default_data_root(mode=mode, install_root=install_root)
     runtime_root = install_root / "runtime"
-    models_root = install_root / "models"
+    models_root = (data_root / "models") if mode == RuntimeMode.PACKAGED else (install_root / "models")
     prompt_root = install_root / "prompts"
+    manifest_path = install_root / PACKAGED_ASSET_MANIFEST_FILENAME
+    installed_assets_state_path = data_root / INSTALLED_ASSET_STATE_FILENAME
+    notes_specs, transcription_specs = _resolve_model_specs(mode=mode, manifest_path=manifest_path)
 
     binary_map = {
         spec.logical_name: install_root / spec.relative_path
         for spec in _notes_binary_specs()
     }
     notes_models = {
-        spec.model_id: install_root / spec.relative_path
-        for spec in bundled_notes_model_specs()
+        spec.model_id: models_root / spec.relative_path
+        for spec in notes_specs
     }
     transcription_models = {
-        spec.model_id: install_root / spec.relative_path
-        for spec in bundled_transcription_model_specs()
+        spec.model_id: models_root / spec.relative_path
+        for spec in transcription_specs
     }
 
     return AppRuntimePaths(
         mode=mode,
         install_root=install_root,
-        data_root=default_data_root(mode=mode, install_root=install_root),
+        data_root=data_root,
         runtime_root=runtime_root,
         models_root=models_root,
         prompt_root=prompt_root,
+        packaged_assets_manifest_path=manifest_path,
+        installed_assets_state_path=installed_assets_state_path,
         notes_runtime_binary=binary_map["llama_server"],
         notes_prompt_path=prompt_root / "clinical_note_synthesis_llm_prompt.md",
         notes_models=notes_models,
@@ -180,14 +222,20 @@ def validate_transcription_model_for_runtime(transcription_model: str) -> str:
     if detect_runtime_mode() != RuntimeMode.PACKAGED:
         return normalized
 
-    supported = {spec.model_id for spec in bundled_transcription_model_specs()}
-    if normalized in supported:
-        return normalized
-    supported_list = ", ".join(sorted(supported))
-    raise ValueError(
-        f"Packaged runtime supports only bundled ASR models: {supported_list}. "
-        f"Received {normalized!r}."
-    )
+    runtime_paths = resolve_app_runtime_paths()
+    supported = runtime_paths.transcription_models
+    if normalized not in supported:
+        supported_list = ", ".join(sorted(supported))
+        raise ValueError(
+            f"Packaged runtime supports only packaged ASR models: {supported_list}. "
+            f"Received {normalized!r}."
+        )
+    if not supported[normalized].exists():
+        raise ValueError(
+            f"Packaged ASR model {normalized!r} is not installed at {supported[normalized]}. "
+            f"Run `transcribe models install --model {normalized}`."
+        )
+    return normalized
 
 
 def resolve_bundled_notes_model_path(model_id: str, *, runtime_paths: AppRuntimePaths | None = None) -> Path:
@@ -197,4 +245,28 @@ def resolve_bundled_notes_model_path(model_id: str, *, runtime_paths: AppRuntime
     if path is None:
         supported = ", ".join(sorted(resolved_paths.notes_models))
         raise ValueError(f"Unsupported bundled notes model {model_id!r}. Supported: {supported}.")
+    if resolved_paths.mode == RuntimeMode.PACKAGED and not path.exists():
+        raise ValueError(
+            f"Packaged notes model {model_id!r} is not installed at {path}. "
+            f"Run `transcribe models install --model {model_id}`."
+        )
+    return path
+
+
+def resolve_bundled_transcription_model_path(
+    model_id: str,
+    *,
+    runtime_paths: AppRuntimePaths | None = None,
+) -> Path:
+    """Return the packaged ASR model path for a model identifier."""
+    resolved_paths = runtime_paths or resolve_app_runtime_paths()
+    path = resolved_paths.transcription_models.get(model_id)
+    if path is None:
+        supported = ", ".join(sorted(resolved_paths.transcription_models))
+        raise ValueError(f"Unsupported bundled transcription model {model_id!r}. Supported: {supported}.")
+    if resolved_paths.mode == RuntimeMode.PACKAGED and not path.exists():
+        raise ValueError(
+            f"Packaged ASR model {model_id!r} is not installed at {path}. "
+            f"Run `transcribe models install --model {model_id}`."
+        )
     return path

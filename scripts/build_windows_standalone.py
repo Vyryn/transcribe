@@ -16,6 +16,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from transcribe.packaged_assets import (
+    PACKAGED_ASSET_MANIFEST_FILENAME,
+    PACKAGED_ASSET_SCHEMA_VERSION,
+    PackagedAssetsManifest,
+    build_directory_asset,
+    build_single_file_asset,
+    write_packaged_asset_manifest,
+)
 from transcribe.runtime_env import bundled_notes_model_specs, bundled_transcription_model_specs
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +44,14 @@ DEFAULT_NOTES_MODEL_4B_REPO = "unsloth/Qwen3.5-4B-GGUF"
 DEFAULT_NOTES_MODEL_4B_FILE = "Qwen3.5-4B-Q4_K_M.gguf"
 DEFAULT_NOTES_MODEL_2B_REPO = "unsloth/Qwen3.5-2B-GGUF"
 DEFAULT_NOTES_MODEL_2B_FILE = "Qwen3.5-2B-Q4_K_M.gguf"
+DEFAULT_NOTES_MODEL_4B_REVISION = "e87f176479d0855a907a41277aca2f8ee7a09523"
+DEFAULT_NOTES_MODEL_2B_REVISION = "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+DEFAULT_PARAKEET_MODEL_REPO = "nvidia/parakeet-tdt-0.6b-v3"
+DEFAULT_PARAKEET_MODEL_REVISION = "6d590f77001d318fb17a0b5bf7ee329a91b52598"
+DEFAULT_PARAKEET_REQUIRED_FILES = ("parakeet-tdt-0.6b-v3.nemo",)
+DEFAULT_CANARY_MODEL_REPO = "nvidia/canary-qwen-2.5b"
+DEFAULT_CANARY_MODEL_REVISION = "6cfc37ec7edc35a0545c403f551ecdfa28133d72"
+DEFAULT_CANARY_REQUIRED_FILES = ("config.json", "LICENSES", "model.safetensors")
 DEFAULT_VS_BUILDTOOLS_BOOTSTRAPPER_URL = "https://aka.ms/vs/17/release/vs_BuildTools.exe"
 DEFAULT_VS_BUILDTOOLS_WORKLOAD = "Microsoft.VisualStudio.Workload.VCTools"
 DEFAULT_CMAKE_PYTHON_PACKAGE = "cmake<4"
@@ -507,6 +523,16 @@ def _build_pyinstaller_command(
         "--hidden-import",
         "transcribe.notes",
         "--hidden-import",
+        "transcribe.packaged_assets",
+        "--hidden-import",
+        "transcribe.packaged_cli",
+        "--hidden-import",
+        "transcribe.transcription_runtime",
+        "--hidden-import",
+        "huggingface_hub",
+        "--hidden-import",
+        "huggingface_hub.file_download",
+        "--hidden-import",
         "sounddevice",
         "--collect-all",
         "sounddevice",
@@ -518,13 +544,24 @@ def _build_pyinstaller_command(
                 "nemo.collections.asr",
                 "--hidden-import",
                 "nemo.collections.speechlm2.models",
-                "--collect-all",
-                "nemo",
-                "--collect-all",
+                "--hidden-import",
                 "omegaconf",
             ]
         )
-    command.append(str(REPO_ROOT / "main.py"))
+    for excluded_module in (
+        "datasets",
+        "pyarrow",
+        "matplotlib",
+        "_pytest",
+        "coverage",
+        "mypy",
+        "IPython",
+        "pytest",
+        "transcribe.bench",
+        "transcribe.test_cov",
+    ):
+        command.extend(["--exclude-module", excluded_module])
+    command.append(str(REPO_ROOT / "packaged_main.py"))
     return command
 
 
@@ -540,25 +577,136 @@ def _build_pyinstaller_bundle(*, pyinstaller_command: Sequence[str], stage_dir: 
     return stage_dir
 
 
+def _copy_llama_runtime_files(*, llama_runtime_dir: Path, stage_dir: Path) -> None:
+    runtime_target_dir = stage_dir / "runtime" / "llm"
+    if runtime_target_dir.exists():
+        shutil.rmtree(runtime_target_dir)
+    runtime_target_dir.mkdir(parents=True, exist_ok=True)
+
+    llama_server = llama_runtime_dir / "llama-server.exe"
+    if not llama_server.exists():
+        raise FileNotFoundError(f"llama-server.exe was not found in runtime directory {llama_runtime_dir}")
+    _copy_file(llama_server, runtime_target_dir / llama_server.name)
+
+    for runtime_dependency in sorted(llama_runtime_dir.iterdir()):
+        if not runtime_dependency.is_file():
+            continue
+        if runtime_dependency.name == llama_server.name:
+            continue
+        if runtime_dependency.suffix.lower() != ".dll":
+            continue
+        _copy_file(runtime_dependency, runtime_target_dir / runtime_dependency.name)
+
+
+def _build_packaged_assets_manifest(
+    *,
+    notes_model_4b: Path,
+    notes_model_4b_repo: str,
+    notes_model_4b_revision: str,
+    notes_model_4b_file: str,
+    notes_model_2b: Path,
+    notes_model_2b_repo: str,
+    notes_model_2b_revision: str,
+    notes_model_2b_file: str,
+    parakeet_model_dir: Path,
+    parakeet_model_repo: str,
+    parakeet_model_revision: str,
+    canary_model_dir: Path,
+    canary_model_repo: str,
+    canary_model_revision: str,
+) -> PackagedAssetsManifest:
+    notes_specs = bundled_notes_model_specs()
+    transcription_specs = {spec.model_id: spec.relative_path.as_posix() for spec in bundled_transcription_model_specs()}
+
+    return PackagedAssetsManifest(
+        schema_version=PACKAGED_ASSET_SCHEMA_VERSION,
+        assets=(
+            build_single_file_asset(
+                model_id=notes_specs[0].model_id,
+                kind="notes",
+                relative_path=notes_specs[0].relative_path.as_posix(),
+                repo_id=notes_model_4b_repo,
+                revision=notes_model_4b_revision,
+                filename=notes_model_4b_file,
+                source_path=notes_model_4b,
+                default_install=True,
+            ),
+            build_single_file_asset(
+                model_id=notes_specs[1].model_id,
+                kind="notes",
+                relative_path=notes_specs[1].relative_path.as_posix(),
+                repo_id=notes_model_2b_repo,
+                revision=notes_model_2b_revision,
+                filename=notes_model_2b_file,
+                source_path=notes_model_2b,
+                default_install=False,
+            ),
+            build_directory_asset(
+                model_id=DEFAULT_PARAKEET_MODEL_REPO,
+                kind="transcription",
+                relative_path=transcription_specs[DEFAULT_PARAKEET_MODEL_REPO],
+                repo_id=parakeet_model_repo,
+                revision=parakeet_model_revision,
+                source_root=parakeet_model_dir,
+                required_files=DEFAULT_PARAKEET_REQUIRED_FILES,
+                default_install=True,
+            ),
+            build_directory_asset(
+                model_id=DEFAULT_CANARY_MODEL_REPO,
+                kind="transcription",
+                relative_path=transcription_specs[DEFAULT_CANARY_MODEL_REPO],
+                repo_id=canary_model_repo,
+                revision=canary_model_revision,
+                source_root=canary_model_dir,
+                required_files=DEFAULT_CANARY_REQUIRED_FILES,
+                default_install=False,
+            ),
+        ),
+    )
+
+
 def _stage_runtime_assets(
     *,
     stage_dir: Path,
     llama_runtime_dir: Path,
     notes_model_4b: Path,
+    notes_model_4b_repo: str,
+    notes_model_4b_revision: str,
+    notes_model_4b_file: str,
     notes_model_2b: Path,
+    notes_model_2b_repo: str,
+    notes_model_2b_revision: str,
+    notes_model_2b_file: str,
     parakeet_model_dir: Path,
+    parakeet_model_repo: str,
+    parakeet_model_revision: str,
     canary_model_dir: Path,
+    canary_model_repo: str,
+    canary_model_revision: str,
 ) -> None:
+    stage_models_dir = stage_dir / "models"
+    if stage_models_dir.exists():
+        shutil.rmtree(stage_models_dir)
+
     _copy_file(PROMPT_SOURCE_PATH, stage_dir / "prompts" / "clinical_note_synthesis_llm_prompt.md")
-    _copy_tree(llama_runtime_dir, stage_dir / "runtime" / "llm")
-
-    notes_specs = bundled_notes_model_specs()
-    _copy_file(notes_model_4b, stage_dir / notes_specs[0].relative_path)
-    _copy_file(notes_model_2b, stage_dir / notes_specs[1].relative_path)
-
-    transcription_specs = {spec.model_id: spec.relative_path for spec in bundled_transcription_model_specs()}
-    _copy_tree(parakeet_model_dir, stage_dir / transcription_specs["nvidia/parakeet-tdt-0.6b-v3"])
-    _copy_tree(canary_model_dir, stage_dir / transcription_specs["nvidia/canary-qwen-2.5b"])
+    _copy_llama_runtime_files(llama_runtime_dir=llama_runtime_dir, stage_dir=stage_dir)
+    manifest = _build_packaged_assets_manifest(
+        notes_model_4b=notes_model_4b,
+        notes_model_4b_repo=notes_model_4b_repo,
+        notes_model_4b_revision=notes_model_4b_revision,
+        notes_model_4b_file=notes_model_4b_file,
+        notes_model_2b=notes_model_2b,
+        notes_model_2b_repo=notes_model_2b_repo,
+        notes_model_2b_revision=notes_model_2b_revision,
+        notes_model_2b_file=notes_model_2b_file,
+        parakeet_model_dir=parakeet_model_dir,
+        parakeet_model_repo=parakeet_model_repo,
+        parakeet_model_revision=parakeet_model_revision,
+        canary_model_dir=canary_model_dir,
+        canary_model_repo=canary_model_repo,
+        canary_model_revision=canary_model_revision,
+    )
+    write_packaged_asset_manifest(manifest, stage_dir / PACKAGED_ASSET_MANIFEST_FILENAME)
 
 
 def _build_inno_installer(*, inno_setup_exe: str, stage_dir: Path, installer_dir: Path) -> Path:
@@ -742,7 +890,7 @@ def _download_llama_cpp_runtime(*, tools_dir: Path, release: str) -> Path:
     return llama_server.parent
 
 
-def _download_hf_file(*, repo_id: str, filename: str, hf_cache_dir: Path) -> Path:
+def _download_hf_file(*, repo_id: str, revision: str, filename: str, hf_cache_dir: Path) -> Path:
     try:
         from huggingface_hub import hf_hub_download
     except ImportError as exc:
@@ -762,6 +910,7 @@ def _download_hf_file(*, repo_id: str, filename: str, hf_cache_dir: Path) -> Pat
         downloaded = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
+            revision=revision,
             local_files_only=False,
             cache_dir=str(hub_cache),
         )
@@ -771,11 +920,11 @@ def _download_hf_file(*, repo_id: str, filename: str, hf_cache_dir: Path) -> Pat
     return path
 
 
-def _bootstrap_notes_model(*, repo_id: str, filename: str, hf_cache_dir: Path) -> Path:
-    return _download_hf_file(repo_id=repo_id, filename=filename, hf_cache_dir=hf_cache_dir)
+def _bootstrap_notes_model(*, repo_id: str, revision: str, filename: str, hf_cache_dir: Path) -> Path:
+    return _download_hf_file(repo_id=repo_id, revision=revision, filename=filename, hf_cache_dir=hf_cache_dir)
 
 
-def _bootstrap_transcription_model(*, model_id: str, hf_cache_dir: Path) -> Path:
+def _bootstrap_transcription_model(*, model_id: str, revision: str, hf_cache_dir: Path) -> Path:
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
@@ -796,6 +945,7 @@ def _bootstrap_transcription_model(*, model_id: str, hf_cache_dir: Path) -> Path
     ):
         snapshot_dir = snapshot_download(
             repo_id=model_id,
+            revision=revision,
             cache_dir=str(hub_cache),
             local_dir=str(target_dir),
             local_dir_use_symlinks=False,
@@ -850,6 +1000,7 @@ def _resolve_or_bootstrap_build_inputs(args: argparse.Namespace) -> ResolvedBuil
             raise FileNotFoundError("Missing bundled 4B notes model. Pass --notes-model-4b.")
         notes_model_4b = _bootstrap_notes_model(
             repo_id=args.notes_model_4b_repo,
+            revision=args.notes_model_4b_revision,
             filename=args.notes_model_4b_file,
             hf_cache_dir=hf_cache_dir,
         )
@@ -860,6 +1011,7 @@ def _resolve_or_bootstrap_build_inputs(args: argparse.Namespace) -> ResolvedBuil
             raise FileNotFoundError("Missing bundled 2B notes model. Pass --notes-model-2b.")
         notes_model_2b = _bootstrap_notes_model(
             repo_id=args.notes_model_2b_repo,
+            revision=args.notes_model_2b_revision,
             filename=args.notes_model_2b_file,
             hf_cache_dir=hf_cache_dir,
         )
@@ -869,7 +1021,8 @@ def _resolve_or_bootstrap_build_inputs(args: argparse.Namespace) -> ResolvedBuil
         if not args.bootstrap_missing:
             raise FileNotFoundError("Missing Parakeet ASR model directory. Pass --parakeet-model-dir.")
         parakeet_model_dir = _bootstrap_transcription_model(
-            model_id="nvidia/parakeet-tdt-0.6b-v3",
+            model_id=args.parakeet_model_repo,
+            revision=args.parakeet_model_revision,
             hf_cache_dir=hf_cache_dir,
         )
 
@@ -878,7 +1031,8 @@ def _resolve_or_bootstrap_build_inputs(args: argparse.Namespace) -> ResolvedBuil
         if not args.bootstrap_missing:
             raise FileNotFoundError("Missing Canary ASR model directory. Pass --canary-model-dir.")
         canary_model_dir = _bootstrap_transcription_model(
-            model_id="nvidia/canary-qwen-2.5b",
+            model_id=args.canary_model_repo,
+            revision=args.canary_model_revision,
             hf_cache_dir=hf_cache_dir,
         )
 
@@ -914,10 +1068,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--notes-model-2b", type=Path, default=None)
     parser.add_argument("--notes-model-4b-repo", default=DEFAULT_NOTES_MODEL_4B_REPO)
     parser.add_argument("--notes-model-4b-file", default=DEFAULT_NOTES_MODEL_4B_FILE)
+    parser.add_argument("--notes-model-4b-revision", default=DEFAULT_NOTES_MODEL_4B_REVISION)
     parser.add_argument("--notes-model-2b-repo", default=DEFAULT_NOTES_MODEL_2B_REPO)
     parser.add_argument("--notes-model-2b-file", default=DEFAULT_NOTES_MODEL_2B_FILE)
+    parser.add_argument("--notes-model-2b-revision", default=DEFAULT_NOTES_MODEL_2B_REVISION)
     parser.add_argument("--parakeet-model-dir", type=Path, default=None)
+    parser.add_argument("--parakeet-model-repo", default=DEFAULT_PARAKEET_MODEL_REPO)
+    parser.add_argument("--parakeet-model-revision", default=DEFAULT_PARAKEET_MODEL_REVISION)
     parser.add_argument("--canary-model-dir", type=Path, default=None)
+    parser.add_argument("--canary-model-repo", default=DEFAULT_CANARY_MODEL_REPO)
+    parser.add_argument("--canary-model-revision", default=DEFAULT_CANARY_MODEL_REVISION)
     return parser
 
 
@@ -939,9 +1099,19 @@ def main(argv: list[str] | None = None) -> int:
         stage_dir=stage_dir,
         llama_runtime_dir=build_inputs.llama_runtime_dir,
         notes_model_4b=build_inputs.notes_model_4b,
+        notes_model_4b_repo=args.notes_model_4b_repo,
+        notes_model_4b_revision=args.notes_model_4b_revision,
+        notes_model_4b_file=args.notes_model_4b_file,
         notes_model_2b=build_inputs.notes_model_2b,
+        notes_model_2b_repo=args.notes_model_2b_repo,
+        notes_model_2b_revision=args.notes_model_2b_revision,
+        notes_model_2b_file=args.notes_model_2b_file,
         parakeet_model_dir=build_inputs.parakeet_model_dir,
+        parakeet_model_repo=args.parakeet_model_repo,
+        parakeet_model_revision=args.parakeet_model_revision,
         canary_model_dir=build_inputs.canary_model_dir,
+        canary_model_repo=args.canary_model_repo,
+        canary_model_revision=args.canary_model_revision,
     )
 
     installer_path: Path | None = None
@@ -961,3 +1131,18 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

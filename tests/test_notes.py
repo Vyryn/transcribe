@@ -284,7 +284,7 @@ def test_cli_parser_allows_disabling_session_notes() -> None:
 
 def test_run_session_runs_notes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
     import transcribe.cli as cli_module
-    import transcribe.bench.harness as bench_harness
+    import transcribe.transcription_runtime as transcription_runtime
     import transcribe.live.session as live_session_module
     import transcribe.notes as notes_module
 
@@ -337,7 +337,7 @@ def test_run_session_runs_notes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setattr(live_session_module, "run_live_transcription_session", fake_runner)
     monkeypatch.setattr(notes_module, "run_post_transcription_notes", fake_run_post_transcription_notes)
     monkeypatch.setattr(
-        bench_harness,
+        transcription_runtime,
         "release_transcription_runtime_resources",
         lambda transcription_model: released.setdefault("model", transcription_model) or 1,
     )
@@ -385,7 +385,7 @@ def test_run_session_runs_notes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_
 
 def test_run_session_skips_notes_when_disabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import transcribe.cli as cli_module
-    import transcribe.bench.harness as bench_harness
+    import transcribe.transcription_runtime as transcription_runtime
     import transcribe.live.session as live_session_module
     import transcribe.notes as notes_module
 
@@ -421,7 +421,7 @@ def test_run_session_skips_notes_when_disabled(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setattr(live_session_module, "run_live_transcription_session", fake_runner)
     monkeypatch.setattr(notes_module, "run_post_transcription_notes", fail_run_post_transcription_notes)
     monkeypatch.setattr(
-        bench_harness,
+        transcription_runtime,
         "release_transcription_runtime_resources",
         lambda transcription_model: release_calls.__setitem__("count", release_calls["count"] + 1) or 1,
     )
@@ -537,3 +537,5 @@ def test_default_runtime_factory_uses_llama_cpp_when_auto_resolves_to_packaged(
         pass
 
     assert observed == [True]
+
+

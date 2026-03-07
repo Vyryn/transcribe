@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from transcribe.packaged_assets import load_packaged_asset_manifest
+from transcribe.runtime_defaults import DEFAULT_LIVE_TRANSCRIPTION_MODEL, DEFAULT_SESSION_NOTES_MODEL
+
 SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "build_windows_standalone.py"
 
 
@@ -30,6 +33,8 @@ def test_build_parser_uses_bootstrap_defaults() -> None:
     assert args.notes_model_2b is None
     assert args.notes_model_4b_repo == build_script.DEFAULT_NOTES_MODEL_4B_REPO
     assert args.notes_model_2b_file == build_script.DEFAULT_NOTES_MODEL_2B_FILE
+    assert args.notes_model_4b_revision == build_script.DEFAULT_NOTES_MODEL_4B_REVISION
+    assert args.parakeet_model_repo == build_script.DEFAULT_PARAKEET_MODEL_REPO
 
 
 def test_select_llama_cpp_windows_asset_prefers_cpu_x64_archive() -> None:
@@ -68,7 +73,7 @@ def test_select_inno_setup_asset_prefers_installer_exe() -> None:
     assert asset.download_url == "https://example.invalid/installer.exe"
 
 
-def test_stage_runtime_assets_copies_runtime_tree_and_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stage_runtime_assets_copies_prompt_runtime_and_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("prompt body\n", encoding="utf-8")
     monkeypatch.setattr(build_script, "PROMPT_SOURCE_PATH", prompt_path)
@@ -77,9 +82,10 @@ def test_stage_runtime_assets_copies_runtime_tree_and_models(tmp_path: Path, mon
     llama_runtime_dir.mkdir()
     (llama_runtime_dir / "llama-server.exe").write_bytes(b"exe")
     (llama_runtime_dir / "ggml-base.dll").write_bytes(b"dll")
+    (llama_runtime_dir / "llama-cli.exe").write_bytes(b"skip")
 
-    notes_model_4b = tmp_path / "Qwen3.5-4B.Q4_K_M.gguf"
-    notes_model_2b = tmp_path / "Qwen3.5-2B.Q4_K_M.gguf"
+    notes_model_4b = tmp_path / "Qwen3.5-4B-Q4_K_M.gguf"
+    notes_model_2b = tmp_path / "Qwen3.5-2B-Q4_K_M.gguf"
     notes_model_4b.write_bytes(b"4b")
     notes_model_2b.write_bytes(b"2b")
 
@@ -87,35 +93,54 @@ def test_stage_runtime_assets_copies_runtime_tree_and_models(tmp_path: Path, mon
     canary_model_dir = tmp_path / "canary"
     parakeet_model_dir.mkdir()
     canary_model_dir.mkdir()
-    (parakeet_model_dir / "config.json").write_text("{}", encoding="utf-8")
-    (canary_model_dir / "model.nemo").write_bytes(b"nemo")
+    (parakeet_model_dir / "parakeet-tdt-0.6b-v3.nemo").write_bytes(b"nemo")
+    (parakeet_model_dir / "README.md").write_text("skip", encoding="utf-8")
+    (canary_model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (canary_model_dir / "LICENSES").write_text("license", encoding="utf-8")
+    (canary_model_dir / "model.safetensors").write_bytes(b"canary")
+    (canary_model_dir / "README.md").write_text("skip", encoding="utf-8")
 
     stage_dir = tmp_path / "stage"
     build_script._stage_runtime_assets(
         stage_dir=stage_dir,
         llama_runtime_dir=llama_runtime_dir,
         notes_model_4b=notes_model_4b,
+        notes_model_4b_repo=build_script.DEFAULT_NOTES_MODEL_4B_REPO,
+        notes_model_4b_revision=build_script.DEFAULT_NOTES_MODEL_4B_REVISION,
+        notes_model_4b_file=build_script.DEFAULT_NOTES_MODEL_4B_FILE,
         notes_model_2b=notes_model_2b,
+        notes_model_2b_repo=build_script.DEFAULT_NOTES_MODEL_2B_REPO,
+        notes_model_2b_revision=build_script.DEFAULT_NOTES_MODEL_2B_REVISION,
+        notes_model_2b_file=build_script.DEFAULT_NOTES_MODEL_2B_FILE,
         parakeet_model_dir=parakeet_model_dir,
+        parakeet_model_repo=build_script.DEFAULT_PARAKEET_MODEL_REPO,
+        parakeet_model_revision=build_script.DEFAULT_PARAKEET_MODEL_REVISION,
         canary_model_dir=canary_model_dir,
+        canary_model_repo=build_script.DEFAULT_CANARY_MODEL_REPO,
+        canary_model_revision=build_script.DEFAULT_CANARY_MODEL_REVISION,
     )
 
-    notes_specs = build_script.bundled_notes_model_specs()
-    transcription_specs = {
-        spec.model_id: spec.relative_path
-        for spec in build_script.bundled_transcription_model_specs()
-    }
+    manifest = load_packaged_asset_manifest(stage_dir / build_script.PACKAGED_ASSET_MANIFEST_FILENAME)
 
     assert (stage_dir / "prompts" / "clinical_note_synthesis_llm_prompt.md").read_text(encoding="utf-8") == "prompt body\n"
     assert (stage_dir / "runtime" / "llm" / "llama-server.exe").read_bytes() == b"exe"
     assert (stage_dir / "runtime" / "llm" / "ggml-base.dll").read_bytes() == b"dll"
-    assert (stage_dir / notes_specs[0].relative_path).read_bytes() == b"4b"
-    assert (stage_dir / notes_specs[1].relative_path).read_bytes() == b"2b"
-    assert (stage_dir / transcription_specs["nvidia/parakeet-tdt-0.6b-v3"] / "config.json").exists()
-    assert (stage_dir / transcription_specs["nvidia/canary-qwen-2.5b"] / "model.nemo").exists()
+    assert not (stage_dir / "runtime" / "llm" / "llama-cli.exe").exists()
+    assert not (stage_dir / "models").exists()
+    assert [asset.model_id for asset in manifest.assets] == [
+        DEFAULT_SESSION_NOTES_MODEL,
+        "qwen3.5:2b-q4_K_M",
+        DEFAULT_LIVE_TRANSCRIPTION_MODEL,
+        "nvidia/canary-qwen-2.5b",
+    ]
+    assert manifest.assets[0].default_install is True
+    assert manifest.assets[2].required_files[0].path == "parakeet-tdt-0.6b-v3.nemo"
 
 
-def test_build_pyinstaller_command_collects_nemo_when_available(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_pyinstaller_command_targets_packaged_entrypoint_and_excludes_dev_modules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         build_script,
         "_module_available",
@@ -128,10 +153,15 @@ def test_build_pyinstaller_command_collects_nemo_when_available(tmp_path: Path, 
         build_dir=tmp_path / "build",
     )
 
+    assert str(build_script.REPO_ROOT / "packaged_main.py") == command[-1]
+    assert "huggingface_hub" in command
+    assert "transcribe.packaged_assets" in command
+    assert "datasets" in command
+    assert "transcribe.bench" in command
+    assert "nemo.collections.asr" in command
     assert "--collect-all" in command
     assert "sounddevice" in command
-    assert "nemo" in command
-    assert str(build_script.REPO_ROOT / "main.py") == command[-1]
+    assert "nemo" not in command[command.index("--collect-all") + 1 :]
 
 
 def test_ensure_inno_setup_bootstraps_local_install_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

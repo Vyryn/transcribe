@@ -310,8 +310,8 @@ def _stitch_text_overlap(previous_text: str, current_text: str, *, max_overlap_w
 
 
 def _build_default_chunk_transcriber(transcription_model: str, max_model_ram_gb: float) -> ChunkTranscriber:
-    """Build a model-routed chunk transcriber backed by benchmark ASR loaders."""
-    from transcribe.bench.harness import (
+    """Build a model-routed chunk transcriber backed by runtime ASR loaders."""
+    from transcribe.transcription_runtime import (
         _default_hf_segment_transcriber,
         _enforce_model_ram_limit,
     )
@@ -1013,3 +1013,4 @@ def run_live_transcription_session(
         source_selection_counts=source_selection_counts,
         interrupted=interrupted,
     )
+
