@@ -1,0 +1,27 @@
+- module-name: 'librosa.core.fft'
+  anti-bloat:
+    - description: 'replace librosa FFT shim with Nuitka-safe equivalent'
+      module_code: |
+        import scipy.fft
+
+        from types import ModuleType
+        from typing import Optional
+        from ..util.decorators import deprecated
+
+        __all__ = ["get_fftlib", "set_fftlib"]
+
+        class _FFTState:
+            current: Optional[ModuleType] = scipy.fft
+
+        _STATE = _FFTState()
+
+        @deprecated(version="0.11.0", version_removed="1.0")
+        def set_fftlib(lib: Optional[ModuleType] = None) -> None:
+            if lib is None:
+                lib = scipy.fft
+            _STATE.current = lib
+
+        def get_fftlib() -> ModuleType:
+            if _STATE.current is None:
+                assert False  # pragma: no cover
+            return _STATE.current
