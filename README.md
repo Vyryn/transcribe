@@ -5,6 +5,12 @@ Designed for psychotherapy workflows with a delivery path to clinical-grade comp
 
 As of March 2, 2026, this README defines an implementation plan from prototype to a clinically deployable v1.
 
+## Python Support
+
+- Runtime and development environments support Python 3.13+.
+- Windows standalone packaging with `uv run .\scripts\build_windows_standalone.py --backend nuitka` currently requires Python 3.13 specifically.
+- If you are building the Windows standalone package from Python 3.14+, use `--backend pyinstaller` or switch the build environment to Python 3.13 until Nuitka's Python 3.14 support is stable for the NeMo/librosa dependency path.
+
 ## Regulatory Baseline
 
 This plan must align with:
@@ -479,3 +485,6 @@ Exit criteria:
 3. Add audit event schema, data classification fields, and PHI-safe logging guardrails.
 4. Continue benchmark regressions and validate `nvidia/canary-qwen-2.5b` + `nvidia/parakeet-tdt-0.6b-v3` on target hardware tiers.
 5. Implement local auth/session lock and encrypted persistence before any clinical pilot.
+
+
+

@@ -3,7 +3,7 @@ name = "transcribe"
 version = "0.1.0"
 description = "HIPAA aware transcription and client note utility for psychotherapists"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13, <3.14"
 dependencies = [
   "datasets>=4.6.1",
   "faster-whisper>=1.2.1",
@@ -37,3 +37,4 @@ dev = [
 [build-system]
 requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
+
