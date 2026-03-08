@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 import zipfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -56,8 +57,15 @@ DEFAULT_VS_BUILDTOOLS_BOOTSTRAPPER_URL = "https://aka.ms/vs/17/release/vs_BuildT
 DEFAULT_VS_BUILDTOOLS_WORKLOAD = "Microsoft.VisualStudio.Workload.VCTools"
 DEFAULT_CMAKE_PYTHON_PACKAGE = "cmake<4"
 DEFAULT_NINJA_PYTHON_PACKAGE = "ninja"
+DEFAULT_BUILD_REPORT_PATH = REPO_ROOT / "dist" / "windows" / "build-report.json"
+DEFAULT_BUILD_PHASE = "all"
+DEFAULT_BUILD_BACKEND = "nuitka"
+BUILD_PHASE_CHOICES = ("prepare", "package", "stage-assets", "installer", "all")
+BUILD_BACKEND_CHOICES = ("pyinstaller", "nuitka")
+SUPPORTED_NUITKA_PYTHON = (3, 13)
 PROMPT_SOURCE_PATH = REPO_ROOT / "clinical note synthesis llm prompt.md"
 INNO_SCRIPT_PATH = REPO_ROOT / "packaging" / "windows" / "transcribe.iss"
+NUITKA_PACKAGE_CONFIG_PATH = REPO_ROOT / "packaging" / "windows" / "nuitka-librosa-workaround.yml"
 
 _LLAMA_CPP_WINDOWS_ASSET_PATTERNS = (
     re.compile(r"llama-b\d+-bin-win-cpu-x64\.zip$", re.IGNORECASE),
@@ -75,13 +83,14 @@ _VS_YEARS = ("2022", "2019", "2017")
 class ResolvedBuildInputs:
     """Resolved toolchain and asset paths required for a Windows package build."""
 
-    pyinstaller_command: tuple[str, ...]
+    backend: str
+    package_command: tuple[str, ...]
     inno_setup_exe: str | None
     llama_runtime_dir: Path
     notes_model_4b: Path
     notes_model_2b: Path
     parakeet_model_dir: Path
-    canary_model_dir: Path
+    canary_model_dir: Path | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +99,158 @@ class GitHubReleaseAsset:
 
     name: str
     download_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseResult:
+    """Outcome metadata for one build phase."""
+
+    name: str
+    status: str
+    duration_sec: float
+    details: dict[str, Any]
+
+
+def _summarize_file(path: Path) -> dict[str, Any]:
+    resolved = path.resolve()
+    size_bytes = resolved.stat().st_size if resolved.exists() and resolved.is_file() else 0
+    return {
+        "path": str(resolved),
+        "exists": resolved.exists(),
+        "size_bytes": size_bytes,
+    }
+
+
+def _directory_size_bytes(root: Path) -> int:
+    if not root.exists():
+        return 0
+    return sum(file_path.stat().st_size for file_path in root.rglob('*') if file_path.is_file())
+
+
+def _top_directory_sizes(root: Path, *, limit: int = 10) -> list[dict[str, Any]]:
+    if not root.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        rows.append(
+            {
+                "path": str(child.resolve()),
+                "size_bytes": _directory_size_bytes(child),
+                "file_count": sum(1 for file_path in child.rglob('*') if file_path.is_file()),
+            }
+        )
+    rows.sort(key=lambda item: item["size_bytes"], reverse=True)
+    return rows[:limit]
+
+
+def _top_files(root: Path, *, limit: int = 10) -> list[dict[str, Any]]:
+    if not root.exists():
+        return []
+    rows = [
+        {
+            "path": str(file_path.resolve()),
+            "size_bytes": file_path.stat().st_size,
+        }
+        for file_path in root.rglob('*')
+        if file_path.is_file()
+    ]
+    rows.sort(key=lambda item: item["size_bytes"], reverse=True)
+    return rows[:limit]
+
+
+def _collect_directory_inventory(root: Path) -> dict[str, Any]:
+    resolved = root.resolve()
+    exists = resolved.exists()
+    files = [file_path for file_path in resolved.rglob('*') if file_path.is_file()] if exists else []
+    inventory: dict[str, Any] = {
+        "path": str(resolved),
+        "exists": exists,
+        "size_bytes": sum(file_path.stat().st_size for file_path in files),
+        "file_count": len(files),
+        "top_directories": _top_directory_sizes(resolved),
+        "top_files": _top_files(resolved),
+    }
+    internal_root = resolved / '_internal'
+    if internal_root.exists():
+        inventory["internal_top_directories"] = _top_directory_sizes(internal_root)
+    return inventory
+
+
+def _write_build_report(
+    report_path: Path,
+    *,
+    backend: str,
+    requested_backend: str | None,
+    selected_phase: str,
+    clean: bool,
+    phase_results: Sequence[PhaseResult],
+    stage_dir: Path,
+    build_dir: Path,
+    bootstrap_dir: Path,
+    installer_dir: Path,
+    installer_path: Path | None,
+) -> dict[str, Any]:
+    payload = {
+        "generated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        "backend": backend,
+        "requested_backend": requested_backend,
+        "selected_phase": selected_phase,
+        "clean": clean,
+        "phases": [
+            {
+                "name": result.name,
+                "status": result.status,
+                "duration_sec": round(result.duration_sec, 6),
+                "details": result.details,
+            }
+            for result in phase_results
+        ],
+        "artifacts": {
+            "stage": _collect_directory_inventory(stage_dir),
+            "build": _collect_directory_inventory(build_dir),
+            "bootstrap": _collect_directory_inventory(bootstrap_dir),
+            "installer_dir": _collect_directory_inventory(installer_dir),
+            "installer_file": _summarize_file(installer_path) if installer_path is not None else None,
+        },
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
+    return payload
+
+
+def _run_timed_phase(
+    phase_results: list[PhaseResult],
+    name: str,
+    callback,
+    *,
+    skip: bool = False,
+    skip_details: dict[str, Any] | None = None,
+) -> Any:
+    if skip:
+        phase_results.append(
+            PhaseResult(
+                name=name,
+                status='skipped',
+                duration_sec=0.0,
+                details=skip_details or {},
+            )
+        )
+        return None
+    started = time.perf_counter()
+    result = callback()
+    duration_sec = time.perf_counter() - started
+    details = result if isinstance(result, dict) else {}
+    phase_results.append(
+        PhaseResult(
+            name=name,
+            status='completed',
+            duration_sec=duration_sec,
+            details=details,
+        )
+    )
+    return result
 
 
 def _copy_file(source: Path, destination: Path) -> None:
@@ -495,16 +656,99 @@ def _ensure_python_build_dependencies(*, bootstrap_missing: bool, bootstrap_dir:
     return (sys.executable, "-m", "PyInstaller")
 
 
+def _validate_nuitka_python_runtime() -> None:
+    current = sys.version_info[:2]
+    if current == SUPPORTED_NUITKA_PYTHON:
+        return
+    expected = ".".join(str(part) for part in SUPPORTED_NUITKA_PYTHON)
+    current_text = ".".join(str(part) for part in current)
+    raise RuntimeError(
+        "Nuitka Windows standalone builds currently require Python "
+        f"{expected}. Detected Python {current_text}. "
+        "Run this build from a Python 3.13 environment or use --backend pyinstaller."
+    )
+
+def _ensure_nuitka_build_dependencies(*, bootstrap_missing: bool, bootstrap_dir: Path) -> tuple[str, ...]:
+    _validate_nuitka_python_runtime()
+    nuitka_ready = _module_available("Nuitka")
+    nemo_ready = _module_available("nemo.collections.asr")
+    if nuitka_ready and nemo_ready:
+        return (sys.executable, "-m", "nuitka")
+    if not bootstrap_missing:
+        missing = []
+        if not nuitka_ready:
+            missing.append("nuitka")
+        if not nemo_ready:
+            missing.append("nemo_toolkit[asr]")
+        raise RuntimeError(
+            "Missing Python build dependencies for the Windows standalone package: "
+            + ", ".join(missing)
+        )
+
+    dependency_env = _prepend_path(os.environ.copy(), _python_scripts_dir())
+    if os.name == "nt" and not nemo_ready:
+        dependency_env = _ensure_windows_native_build_environment(
+            bootstrap_missing=bootstrap_missing,
+            bootstrap_dir=bootstrap_dir,
+        )
+
+    uv_exe = _resolve_executable("uv")
+    if uv_exe is not None:
+        uv_cache_dir = bootstrap_dir / "uv-cache"
+        if os.name == "nt":
+            uv_cache_dir = _short_windows_work_root() / "uv"
+        uv_cache_dir.mkdir(parents=True, exist_ok=True)
+        env = _merged_environment(dependency_env)
+        env["UV_CACHE_DIR"] = str(uv_cache_dir)
+        if os.name == "nt":
+            temp_dir = _short_windows_work_root() / "tmp"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            env["TMP"] = str(temp_dir)
+            env["TEMP"] = str(temp_dir)
+            if not nemo_ready:
+                _clear_uv_sdist_cache(uv_cache_dir, package_name="kaldialign")
+        if not nemo_ready:
+            _run([uv_exe, "sync", "--extra", "nemo-asr", "--inexact"], env=env, cwd=REPO_ROOT)
+        if not nuitka_ready:
+            _run([uv_exe, "pip", "install", "--python", sys.executable, "nuitka"], env=env, cwd=REPO_ROOT)
+        return (sys.executable, "-m", "nuitka")
+
+    _ensure_pip_available()
+    requirements: list[str] = []
+    if not nemo_ready:
+        requirements.append("nemo_toolkit[asr]")
+    if not nuitka_ready:
+        requirements.append("nuitka")
+    if requirements:
+        _run([sys.executable, "-m", "pip", "install", *requirements], env=dependency_env, cwd=REPO_ROOT)
+    return (sys.executable, "-m", "nuitka")
+
+
+def _resolve_packaging_command(*, backend: str, bootstrap_missing: bool, bootstrap_dir: Path) -> tuple[str, ...]:
+    if backend == "pyinstaller":
+        return _ensure_python_build_dependencies(
+            bootstrap_missing=bootstrap_missing,
+            bootstrap_dir=bootstrap_dir,
+        )
+    if backend == "nuitka":
+        return _ensure_nuitka_build_dependencies(
+            bootstrap_missing=bootstrap_missing,
+            bootstrap_dir=bootstrap_dir,
+        )
+    raise ValueError(f"Unsupported packaging backend {backend!r}")
+
+
 def _build_pyinstaller_command(
     *,
-    pyinstaller_command: Sequence[str],
+    package_command: Sequence[str],
     stage_dir: Path,
     build_dir: Path,
+    clean: bool,
+    include_canary_model: bool,
 ) -> list[str]:
     command = [
-        *pyinstaller_command,
+        *package_command,
         "--noconfirm",
-        "--clean",
         "--onedir",
         "--name",
         "transcribe",
@@ -537,17 +781,19 @@ def _build_pyinstaller_command(
         "--collect-all",
         "sounddevice",
     ]
+    if clean:
+        command.append("--clean")
     if _module_available("nemo.collections.asr"):
         command.extend(
             [
                 "--hidden-import",
                 "nemo.collections.asr",
                 "--hidden-import",
-                "nemo.collections.speechlm2.models",
-                "--hidden-import",
                 "omegaconf",
             ]
         )
+        if include_canary_model:
+            command.extend(["--hidden-import", "nemo.collections.speechlm2.models"])
     for excluded_module in (
         "datasets",
         "pyarrow",
@@ -565,37 +811,115 @@ def _build_pyinstaller_command(
     return command
 
 
-def _build_pyinstaller_bundle(*, pyinstaller_command: Sequence[str], stage_dir: Path, build_dir: Path) -> Path:
+def _build_nuitka_command(
+    *,
+    package_command: Sequence[str],
+    build_dir: Path,
+    clean: bool,
+    include_canary_model: bool,
+) -> list[str]:
+    output_dir = build_dir / "nuitka"
+    if clean and output_dir.exists():
+        shutil.rmtree(output_dir)
+    command = [
+        *package_command,
+        "--standalone",
+        "--assume-yes-for-downloads",
+        f"--output-dir={output_dir}",
+        "--output-filename=transcribe.exe",
+        "--company-name=Transcribe",
+        "--product-name=Transcribe",
+        "--file-version=0.1.0",
+        "--product-version=0.1.0",
+        "--include-package=transcribe",
+        "--include-module=transcribe.audio.windows_capture",
+        "--include-module=transcribe.audio.backend_loader",
+        "--include-module=transcribe.notes",
+        "--include-module=transcribe.packaged_assets",
+        "--include-module=transcribe.packaged_cli",
+        "--include-module=transcribe.transcription_runtime",
+        "--include-module=huggingface_hub",
+        "--include-module=huggingface_hub.file_download",
+        "--include-module=sounddevice",
+        "--noinclude-numba-mode=nofollow",
+        "--module-parameter=numba-disable-jit=yes",
+        f"--user-package-configuration-file={NUITKA_PACKAGE_CONFIG_PATH}",
+        "--nofollow-import-to=datasets,pyarrow,matplotlib,_pytest,coverage,mypy,IPython,pytest,transcribe.bench,transcribe.test_cov",
+    ]
+    if _module_available("nemo.collections.asr"):
+        command.extend(
+            [
+                "--include-module=nemo.collections.asr",
+                "--include-module=omegaconf",
+            ]
+        )
+        if include_canary_model:
+            command.append("--include-module=nemo.collections.speechlm2.models")
+    command.append(str(REPO_ROOT / "packaged_main.py"))
+    return command
+
+
+def _resolve_nuitka_bundle_dir(output_dir: Path) -> Path:
+    candidates = sorted(path for path in output_dir.glob("*.dist") if path.is_dir())
+    if not candidates:
+        raise FileNotFoundError(f"No Nuitka standalone bundle directory was created in {output_dir}")
+    return candidates[-1]
+
+
+def _build_package_bundle(
+    *,
+    backend: str,
+    package_command: Sequence[str],
+    stage_dir: Path,
+    build_dir: Path,
+    clean: bool,
+    include_canary_model: bool,
+) -> Path:
     stage_dir.parent.mkdir(parents=True, exist_ok=True)
     build_dir.mkdir(parents=True, exist_ok=True)
-    _run(_build_pyinstaller_command(pyinstaller_command=pyinstaller_command, stage_dir=stage_dir, build_dir=build_dir), cwd=REPO_ROOT)
-    bundle_dir = stage_dir.parent / "transcribe"
-    if bundle_dir != stage_dir:
+    if backend == "pyinstaller":
+        _run(
+            _build_pyinstaller_command(
+                package_command=package_command,
+                stage_dir=stage_dir,
+                build_dir=build_dir,
+                clean=clean,
+                include_canary_model=include_canary_model,
+            ),
+            cwd=REPO_ROOT,
+        )
+        bundle_dir = stage_dir.parent / "transcribe"
+        if bundle_dir != stage_dir:
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir)
+            shutil.move(str(bundle_dir), str(stage_dir))
+        return stage_dir
+
+    if backend == "nuitka":
+        _run(
+            _build_nuitka_command(
+                package_command=package_command,
+                build_dir=build_dir,
+                clean=clean,
+                include_canary_model=include_canary_model,
+            ),
+            cwd=REPO_ROOT,
+        )
+        bundle_dir = _resolve_nuitka_bundle_dir(build_dir / "nuitka")
         if stage_dir.exists():
             shutil.rmtree(stage_dir)
         shutil.move(str(bundle_dir), str(stage_dir))
-    return stage_dir
+        return stage_dir
+
+    raise ValueError(f"Unsupported packaging backend {backend!r}")
 
 
 def _copy_llama_runtime_files(*, llama_runtime_dir: Path, stage_dir: Path) -> None:
-    runtime_target_dir = stage_dir / "runtime" / "llm"
-    if runtime_target_dir.exists():
-        shutil.rmtree(runtime_target_dir)
-    runtime_target_dir.mkdir(parents=True, exist_ok=True)
-
-    llama_server = llama_runtime_dir / "llama-server.exe"
-    if not llama_server.exists():
-        raise FileNotFoundError(f"llama-server.exe was not found in runtime directory {llama_runtime_dir}")
-    _copy_file(llama_server, runtime_target_dir / llama_server.name)
-
-    for runtime_dependency in sorted(llama_runtime_dir.iterdir()):
-        if not runtime_dependency.is_file():
-            continue
-        if runtime_dependency.name == llama_server.name:
-            continue
-        if runtime_dependency.suffix.lower() != ".dll":
-            continue
-        _copy_file(runtime_dependency, runtime_target_dir / runtime_dependency.name)
+    runtime_dir = stage_dir / "runtime" / "llm"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    _copy_file(llama_runtime_dir / "llama-server.exe", runtime_dir / "llama-server.exe")
+    for file_path in sorted(llama_runtime_dir.glob("*.dll")):
+        _copy_file(file_path, runtime_dir / file_path.name)
 
 
 def _build_packaged_assets_manifest(
@@ -611,46 +935,51 @@ def _build_packaged_assets_manifest(
     parakeet_model_dir: Path,
     parakeet_model_repo: str,
     parakeet_model_revision: str,
-    canary_model_dir: Path,
+    canary_model_dir: Path | None,
     canary_model_repo: str,
     canary_model_revision: str,
 ) -> PackagedAssetsManifest:
     notes_specs = bundled_notes_model_specs()
-    transcription_specs = {spec.model_id: spec.relative_path.as_posix() for spec in bundled_transcription_model_specs()}
+    transcription_specs = {
+        spec.model_id: spec.relative_path.as_posix()
+        for spec in bundled_transcription_model_specs()
+    }
 
-    return PackagedAssetsManifest(
-        schema_version=PACKAGED_ASSET_SCHEMA_VERSION,
-        assets=(
-            build_single_file_asset(
-                model_id=notes_specs[0].model_id,
-                kind="notes",
-                relative_path=notes_specs[0].relative_path.as_posix(),
-                repo_id=notes_model_4b_repo,
-                revision=notes_model_4b_revision,
-                filename=notes_model_4b_file,
-                source_path=notes_model_4b,
-                default_install=True,
-            ),
-            build_single_file_asset(
-                model_id=notes_specs[1].model_id,
-                kind="notes",
-                relative_path=notes_specs[1].relative_path.as_posix(),
-                repo_id=notes_model_2b_repo,
-                revision=notes_model_2b_revision,
-                filename=notes_model_2b_file,
-                source_path=notes_model_2b,
-                default_install=False,
-            ),
-            build_directory_asset(
-                model_id=DEFAULT_PARAKEET_MODEL_REPO,
-                kind="transcription",
-                relative_path=transcription_specs[DEFAULT_PARAKEET_MODEL_REPO],
-                repo_id=parakeet_model_repo,
-                revision=parakeet_model_revision,
-                source_root=parakeet_model_dir,
-                required_files=DEFAULT_PARAKEET_REQUIRED_FILES,
-                default_install=True,
-            ),
+    assets = [
+        build_single_file_asset(
+            model_id=notes_specs[0].model_id,
+            kind="notes",
+            relative_path=notes_specs[0].relative_path.as_posix(),
+            repo_id=notes_model_4b_repo,
+            revision=notes_model_4b_revision,
+            filename=notes_model_4b_file,
+            source_path=notes_model_4b,
+            default_install=True,
+        ),
+        build_single_file_asset(
+            model_id=notes_specs[1].model_id,
+            kind="notes",
+            relative_path=notes_specs[1].relative_path.as_posix(),
+            repo_id=notes_model_2b_repo,
+            revision=notes_model_2b_revision,
+            filename=notes_model_2b_file,
+            source_path=notes_model_2b,
+            default_install=False,
+        ),
+        build_directory_asset(
+            model_id=DEFAULT_PARAKEET_MODEL_REPO,
+            kind="transcription",
+            relative_path=transcription_specs[DEFAULT_PARAKEET_MODEL_REPO],
+            repo_id=parakeet_model_repo,
+            revision=parakeet_model_revision,
+            source_root=parakeet_model_dir,
+            required_files=DEFAULT_PARAKEET_REQUIRED_FILES,
+            default_install=True,
+        ),
+    ]
+
+    if canary_model_dir is not None:
+        assets.append(
             build_directory_asset(
                 model_id=DEFAULT_CANARY_MODEL_REPO,
                 kind="transcription",
@@ -660,8 +989,12 @@ def _build_packaged_assets_manifest(
                 source_root=canary_model_dir,
                 required_files=DEFAULT_CANARY_REQUIRED_FILES,
                 default_install=False,
-            ),
-        ),
+            )
+        )
+
+    return PackagedAssetsManifest(
+        schema_version=PACKAGED_ASSET_SCHEMA_VERSION,
+        assets=tuple(assets),
     )
 
 
@@ -680,7 +1013,7 @@ def _stage_runtime_assets(
     parakeet_model_dir: Path,
     parakeet_model_repo: str,
     parakeet_model_revision: str,
-    canary_model_dir: Path,
+    canary_model_dir: Path | None,
     canary_model_repo: str,
     canary_model_revision: str,
 ) -> None:
@@ -961,14 +1294,16 @@ def _resolve_or_bootstrap_build_inputs(args: argparse.Namespace) -> ResolvedBuil
     bootstrap_dir = args.bootstrap_dir.resolve()
     tools_dir = args.tools_dir.resolve()
     hf_cache_dir = args.hf_cache_dir.resolve()
+    effective_backend = args.backend
 
-    if args.pyinstaller_exe != "pyinstaller":
-        resolved_pyinstaller = _resolve_executable(args.pyinstaller_exe)
-        if resolved_pyinstaller is None:
+    if effective_backend == "pyinstaller" and args.pyinstaller_exe != "pyinstaller":
+        resolved_packager = _resolve_executable(args.pyinstaller_exe)
+        if resolved_packager is None:
             raise FileNotFoundError(f"PyInstaller executable does not exist: {args.pyinstaller_exe}")
-        pyinstaller_command = (resolved_pyinstaller,)
+        package_command = (resolved_packager,)
     else:
-        pyinstaller_command = _ensure_python_build_dependencies(
+        package_command = _resolve_packaging_command(
+            backend=effective_backend,
             bootstrap_missing=args.bootstrap_missing,
             bootstrap_dir=bootstrap_dir,
         )
@@ -1026,29 +1361,36 @@ def _resolve_or_bootstrap_build_inputs(args: argparse.Namespace) -> ResolvedBuil
             hf_cache_dir=hf_cache_dir,
         )
 
-    canary_model_dir = _resolve_manual_path(args.canary_model_dir, label="Canary ASR model directory")
-    if canary_model_dir is None:
-        if not args.bootstrap_missing:
-            raise FileNotFoundError("Missing Canary ASR model directory. Pass --canary-model-dir.")
-        canary_model_dir = _bootstrap_transcription_model(
-            model_id=args.canary_model_repo,
-            revision=args.canary_model_revision,
-            hf_cache_dir=hf_cache_dir,
-        )
+    canary_model_dir: Path | None = None
+    if args.include_canary_model:
+        canary_model_dir = _resolve_manual_path(args.canary_model_dir, label="Canary ASR model directory")
+        if canary_model_dir is None:
+            if not args.bootstrap_missing:
+                raise FileNotFoundError("Missing Canary ASR model directory. Pass --canary-model-dir.")
+            canary_model_dir = _bootstrap_transcription_model(
+                model_id=args.canary_model_repo,
+                revision=args.canary_model_revision,
+                hf_cache_dir=hf_cache_dir,
+            )
 
     return ResolvedBuildInputs(
-        pyinstaller_command=tuple(pyinstaller_command),
+        backend=effective_backend,
+        package_command=tuple(package_command),
         inno_setup_exe=inno_setup_exe,
         llama_runtime_dir=llama_runtime_dir.resolve(),
         notes_model_4b=notes_model_4b.resolve(),
         notes_model_2b=notes_model_2b.resolve(),
         parakeet_model_dir=parakeet_model_dir.resolve(),
-        canary_model_dir=canary_model_dir.resolve(),
+        canary_model_dir=canary_model_dir.resolve() if canary_model_dir is not None else None,
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build the Windows standalone transcribe package")
+    parser.add_argument("--backend", choices=BUILD_BACKEND_CHOICES, default=DEFAULT_BUILD_BACKEND)
+    parser.add_argument("--phase", choices=BUILD_PHASE_CHOICES, default=DEFAULT_BUILD_PHASE)
+    parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--report-path", type=Path, default=DEFAULT_BUILD_REPORT_PATH)
     parser.add_argument("--stage-dir", type=Path, default=DEFAULT_STAGE_DIR)
     parser.add_argument("--build-dir", type=Path, default=DEFAULT_BUILD_DIR)
     parser.add_argument("--installer-dir", type=Path, default=DEFAULT_INSTALLER_DIR)
@@ -1075,55 +1417,152 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--parakeet-model-dir", type=Path, default=None)
     parser.add_argument("--parakeet-model-repo", default=DEFAULT_PARAKEET_MODEL_REPO)
     parser.add_argument("--parakeet-model-revision", default=DEFAULT_PARAKEET_MODEL_REVISION)
+    parser.add_argument("--include-canary-model", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--canary-model-dir", type=Path, default=None)
     parser.add_argument("--canary-model-repo", default=DEFAULT_CANARY_MODEL_REPO)
     parser.add_argument("--canary-model-revision", default=DEFAULT_CANARY_MODEL_REVISION)
     return parser
 
 
+def _phase_selected(args: argparse.Namespace, name: str) -> bool:
+    return args.phase == "all" or args.phase == name
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    build_inputs = _resolve_or_bootstrap_build_inputs(args)
-
     stage_dir = args.stage_dir.resolve()
-    if not args.skip_pyinstaller:
-        _build_pyinstaller_bundle(
-            pyinstaller_command=build_inputs.pyinstaller_command,
-            stage_dir=stage_dir,
-            build_dir=args.build_dir.resolve(),
-        )
-    elif not stage_dir.exists():
-        raise FileNotFoundError(f"Stage directory does not exist for --skip-pyinstaller: {stage_dir}")
+    build_dir = args.build_dir.resolve()
+    bootstrap_dir = args.bootstrap_dir.resolve()
+    installer_dir = args.installer_dir.resolve()
+    report_path = args.report_path.resolve()
+    phase_results: list[PhaseResult] = []
+    build_inputs: ResolvedBuildInputs | None = None
+    installer_path: Path | None = None
 
-    _stage_runtime_assets(
+    def prepare_inputs() -> dict[str, Any]:
+        nonlocal build_inputs
+        build_inputs = _resolve_or_bootstrap_build_inputs(args)
+        return {
+            "requested_backend": args.backend,
+            "backend": build_inputs.backend,
+            "effective_backend": build_inputs.backend,
+            "backend_fallback_reason": None,
+            "package_command": list(build_inputs.package_command),
+            "llama_runtime_dir": str(build_inputs.llama_runtime_dir),
+            "include_canary_model": args.include_canary_model,
+        }
+
+    if _phase_selected(args, "prepare") or _phase_selected(args, "package") or _phase_selected(args, "stage-assets"):
+        _run_timed_phase(phase_results, "prepare", prepare_inputs)
+
+    if _phase_selected(args, "package"):
+        if build_inputs is None:
+            raise RuntimeError("Build inputs were not prepared before package phase.")
+        if args.skip_pyinstaller:
+            _run_timed_phase(
+                phase_results,
+                "package",
+                lambda: {},
+                skip=True,
+                skip_details={"reason": "skip-pyinstaller flag set"},
+            )
+        else:
+            _run_timed_phase(
+                phase_results,
+                "package",
+                lambda: {
+                    "stage_dir": str(
+                        _build_package_bundle(
+                            backend=build_inputs.backend,
+                            package_command=build_inputs.package_command,
+                            stage_dir=stage_dir,
+                            build_dir=build_dir,
+                            clean=args.clean,
+                            include_canary_model=args.include_canary_model,
+                        )
+                    )
+                },
+            )
+
+    if _phase_selected(args, "stage-assets"):
+        if build_inputs is None:
+            raise RuntimeError("Build inputs were not prepared before stage-assets phase.")
+        if not stage_dir.exists() and not _phase_selected(args, "package"):
+            raise FileNotFoundError(f"Stage directory does not exist for --phase stage-assets: {stage_dir}")
+        _run_timed_phase(
+            phase_results,
+            "stage-assets",
+            lambda: (
+                _stage_runtime_assets(
+                    stage_dir=stage_dir,
+                    llama_runtime_dir=build_inputs.llama_runtime_dir,
+                    notes_model_4b=build_inputs.notes_model_4b,
+                    notes_model_4b_repo=args.notes_model_4b_repo,
+                    notes_model_4b_revision=args.notes_model_4b_revision,
+                    notes_model_4b_file=args.notes_model_4b_file,
+                    notes_model_2b=build_inputs.notes_model_2b,
+                    notes_model_2b_repo=args.notes_model_2b_repo,
+                    notes_model_2b_revision=args.notes_model_2b_revision,
+                    notes_model_2b_file=args.notes_model_2b_file,
+                    parakeet_model_dir=build_inputs.parakeet_model_dir,
+                    parakeet_model_repo=args.parakeet_model_repo,
+                    parakeet_model_revision=args.parakeet_model_revision,
+                    canary_model_dir=build_inputs.canary_model_dir,
+                    canary_model_repo=args.canary_model_repo,
+                    canary_model_revision=args.canary_model_revision,
+                ),
+                {"stage_dir": str(stage_dir)},
+            )[1],
+        )
+
+    if _phase_selected(args, "installer"):
+        if args.skip_installer:
+            _run_timed_phase(
+                phase_results,
+                "installer",
+                lambda: {},
+                skip=True,
+                skip_details={"reason": "skip-installer flag set"},
+            )
+        else:
+            if build_inputs is None:
+                _run_timed_phase(phase_results, "prepare", prepare_inputs)
+            assert build_inputs is not None
+            if not stage_dir.exists():
+                raise FileNotFoundError(f"Stage directory does not exist for installer phase: {stage_dir}")
+            installer_result = _run_timed_phase(
+                phase_results,
+                "installer",
+                lambda: {
+                    "installer_path": str(
+                        _build_inno_installer(
+                            inno_setup_exe=build_inputs.inno_setup_exe or "",
+                            stage_dir=stage_dir,
+                            installer_dir=installer_dir,
+                        )
+                    )
+                },
+            )
+            if installer_result is not None:
+                installer_path = Path(installer_result["installer_path"]).resolve()
+
+    _write_build_report(
+        report_path,
+        backend=build_inputs.backend if build_inputs is not None else args.backend,
+        requested_backend=args.backend,
+        selected_phase=args.phase,
+        clean=args.clean,
+        phase_results=phase_results,
         stage_dir=stage_dir,
-        llama_runtime_dir=build_inputs.llama_runtime_dir,
-        notes_model_4b=build_inputs.notes_model_4b,
-        notes_model_4b_repo=args.notes_model_4b_repo,
-        notes_model_4b_revision=args.notes_model_4b_revision,
-        notes_model_4b_file=args.notes_model_4b_file,
-        notes_model_2b=build_inputs.notes_model_2b,
-        notes_model_2b_repo=args.notes_model_2b_repo,
-        notes_model_2b_revision=args.notes_model_2b_revision,
-        notes_model_2b_file=args.notes_model_2b_file,
-        parakeet_model_dir=build_inputs.parakeet_model_dir,
-        parakeet_model_repo=args.parakeet_model_repo,
-        parakeet_model_revision=args.parakeet_model_revision,
-        canary_model_dir=build_inputs.canary_model_dir,
-        canary_model_repo=args.canary_model_repo,
-        canary_model_revision=args.canary_model_revision,
+        build_dir=build_dir,
+        bootstrap_dir=bootstrap_dir,
+        installer_dir=installer_dir,
+        installer_path=installer_path,
     )
 
-    installer_path: Path | None = None
-    if not args.skip_installer:
-        assert build_inputs.inno_setup_exe is not None
-        installer_path = _build_inno_installer(
-            inno_setup_exe=build_inputs.inno_setup_exe,
-            stage_dir=stage_dir,
-            installer_dir=args.installer_dir.resolve(),
-        )
-
-    print(f"Windows stage: {stage_dir}")
+    print(f"Build report: {report_path}")
+    if stage_dir.exists():
+        print(f"Windows stage: {stage_dir}")
     if installer_path is not None:
         print(f"Installer: {installer_path}")
     return 0
@@ -1131,18 +1570,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
