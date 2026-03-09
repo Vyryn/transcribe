@@ -255,8 +255,11 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_excludes_dev_modul
     assert "--include-module=sounddevice" in command
     assert "--noinclude-numba-mode=nofollow" in command
     assert "--module-parameter=numba-disable-jit=yes" in command
+    assert "--noinclude-setuptools-mode=nofollow" in command
     assert f"--user-package-configuration-file={build_script.NUITKA_PACKAGE_CONFIG_PATH}" in command
+    assert f"--report={build_script._default_nuitka_report_path(tmp_path / 'build')}" in command
     assert any(item.startswith("--nofollow-import-to=") and "transcribe.bench" in item for item in command)
+    assert any(item.startswith("--nofollow-import-to=") and "torch.utils.cpp_extension" in item for item in command)
     assert "--include-module=nemo.collections.asr" in command
     assert ("--include-module=nemo.collections.speechlm2.models" in command) is include_canary_model
 
@@ -378,18 +381,36 @@ def test_write_build_report_includes_phase_durations_and_inventory(tmp_path: Pat
     installer_path = installer_dir / "transcribe.exe"
     installer_path.write_bytes(b"installer")
 
+    compiler_cache_dir = bootstrap_dir / "clcache"
+    compiler_cache_dir.mkdir()
+    nuitka_report_path = build_dir / build_script.NUITKA_REPORT_FILENAME
+    nuitka_report_path.write_text("<report />\n", encoding="utf-8")
+
     build_script._write_build_report(
         report_path,
         backend="pyinstaller",
         requested_backend="pyinstaller",
         selected_phase="all",
         clean=False,
-        phase_results=[build_script.PhaseResult(name="prepare", status="completed", duration_sec=1.25, details={"backend": "pyinstaller"})],
+        phase_results=[
+            build_script.PhaseResult(
+                name="prepare",
+                status="completed",
+                duration_sec=1.25,
+                details={
+                    "backend": "pyinstaller",
+                    "clcache_stats_after": {"CacheHits": 2, "CacheMisses": 1},
+                    "nuitka_report_path": str(nuitka_report_path),
+                },
+            )
+        ],
         stage_dir=stage_dir,
         build_dir=build_dir,
         bootstrap_dir=bootstrap_dir,
         installer_dir=installer_dir,
         installer_path=installer_path,
+        compiler_cache_dir=compiler_cache_dir,
+        nuitka_report_path=nuitka_report_path,
     )
 
     payload = json.loads(report_path.read_text(encoding="utf-8"))
@@ -400,6 +421,21 @@ def test_write_build_report_includes_phase_durations_and_inventory(tmp_path: Pat
     assert payload["artifacts"]["stage"]["exists"] is True
     assert payload["artifacts"]["stage"]["internal_top_directories"][0]["path"].endswith("torch")
     assert payload["artifacts"]["installer_file"]["size_bytes"] == len(b"installer")
+    assert payload["artifacts"]["compiler_cache_dir"]["exists"] is True
+    assert payload["artifacts"]["nuitka_report_file"]["exists"] is True
+    assert payload["phases"][0]["details"]["clcache_stats_after"]["CacheHits"] == 2
+
+
+def test_publish_release_installer_copies_single_exe(tmp_path: Path) -> None:
+    installer_path = tmp_path / "installer" / "transcribe-windows-standalone.exe"
+    installer_path.parent.mkdir(parents=True, exist_ok=True)
+    installer_path.write_bytes(b"installer")
+    releases_dir = tmp_path / "releases"
+
+    published_path = build_script._publish_release_installer(installer_path, releases_dir=releases_dir)
+
+    assert published_path == (releases_dir / f"Transcribe-{build_script.TRANSCRIBE_VERSION}.exe").resolve()
+    assert published_path.read_bytes() == b"installer"
 
 
 @pytest.mark.parametrize("backend", ["pyinstaller", "nuitka"])
@@ -423,13 +459,15 @@ def test_main_smoke_acceptance_stages_packaged_output_and_report(
         lambda args: _make_build_inputs(tmp_path, backend=backend, include_canary_model=args.include_canary_model),
     )
 
-    def fake_build_package_bundle(*, backend: str, package_command, stage_dir: Path, build_dir: Path, clean: bool, include_canary_model: bool) -> Path:
-        _ = (backend, package_command, build_dir, clean, include_canary_model)
+    def fake_build_package_bundle(*, backend: str, package_command, stage_dir: Path, build_dir: Path, bootstrap_dir: Path, clean: bool, include_canary_model: bool) -> Path:
+        _ = (backend, package_command, build_dir, bootstrap_dir, clean, include_canary_model)
         stage_dir.mkdir(parents=True, exist_ok=True)
         (stage_dir / "transcribe.exe").write_bytes(b"exe")
         return stage_dir
 
     monkeypatch.setattr(build_script, "_build_package_bundle", fake_build_package_bundle)
+    releases_dir = tmp_path / "releases"
+    monkeypatch.setattr(build_script, "DEFAULT_RELEASES_DIR", releases_dir)
 
     rc = build_script.main(
         [
@@ -458,8 +496,10 @@ def test_main_smoke_acceptance_stages_packaged_output_and_report(
     assert payload["backend"] == backend
     assert payload["requested_backend"] == backend
     assert payload["selected_phase"] == "all"
+    assert payload["artifacts"]["compiler_cache_dir"]["path"].endswith("clcache")
     assert [phase["name"] for phase in payload["phases"]] == ["prepare", "package", "stage-assets", "installer"]
     assert payload["phases"][-1]["status"] == "skipped"
+    assert not (releases_dir / f"Transcribe-{build_script.TRANSCRIBE_VERSION}.exe").exists()
 
 
 def test_ensure_inno_setup_bootstraps_local_install_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -543,6 +583,7 @@ def test_ensure_windows_native_build_environment_captures_vcvars_env(tmp_path: P
     )
 
     assert observed["batch_path"] == vcvars_path
+    assert env["CLCACHE_DIR"].endswith("clcache")
     assert env["CMAKE_GENERATOR"] == "Visual Studio 17 2022"
     assert env["CMAKE_GENERATOR_INSTANCE"] == str(generator_root)
     assert str(scripts_dir) in env["PATH"]
@@ -552,3 +593,94 @@ def test_module_available_returns_false_when_parent_package_is_missing(monkeypat
     monkeypatch.setattr(build_script.importlib.util, "find_spec", lambda name: (_ for _ in ()).throw(ModuleNotFoundError(name)))
 
     assert build_script._module_available("nemo.collections.asr") is False
+
+
+def test_main_publishes_installer_to_releases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report_path = tmp_path / "build-report.json"
+    stage_dir = tmp_path / "stage"
+    build_dir = tmp_path / "build"
+    bootstrap_dir = tmp_path / "bootstrap"
+    installer_dir = tmp_path / "installer"
+    releases_dir = tmp_path / "releases"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("prompt body\n", encoding="utf-8")
+    monkeypatch.setattr(build_script, "PROMPT_SOURCE_PATH", prompt_path)
+    monkeypatch.setattr(build_script, "DEFAULT_RELEASES_DIR", releases_dir)
+    monkeypatch.setattr(
+        build_script,
+        "_resolve_or_bootstrap_build_inputs",
+        lambda args: _make_build_inputs(tmp_path, backend="nuitka", include_canary_model=args.include_canary_model),
+    )
+
+    def fake_build_package_bundle(*, backend: str, package_command, stage_dir: Path, build_dir: Path, bootstrap_dir: Path, clean: bool, include_canary_model: bool) -> Path:
+        _ = (backend, package_command, build_dir, bootstrap_dir, clean, include_canary_model)
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        (stage_dir / "transcribe.exe").write_bytes(b"exe")
+        return stage_dir
+
+    def fake_build_inno_installer(*, inno_setup_exe: str, stage_dir: Path, installer_dir: Path) -> Path:
+        _ = (inno_setup_exe, stage_dir)
+        installer_dir.mkdir(parents=True, exist_ok=True)
+        installer_path = installer_dir / "transcribe-windows-standalone.exe"
+        installer_path.write_bytes(b"installer")
+        return installer_path
+
+    monkeypatch.setattr(build_script, "_build_package_bundle", fake_build_package_bundle)
+    monkeypatch.setattr(build_script, "_build_inno_installer", fake_build_inno_installer)
+
+    rc = build_script.main(
+        [
+            "--backend",
+            "nuitka",
+            "--stage-dir",
+            str(stage_dir),
+            "--build-dir",
+            str(build_dir),
+            "--bootstrap-dir",
+            str(bootstrap_dir),
+            "--installer-dir",
+            str(installer_dir),
+            "--report-path",
+            str(report_path),
+        ]
+    )
+
+    assert rc == 0
+    assert (releases_dir / f"Transcribe-{build_script.TRANSCRIBE_VERSION}.exe").read_bytes() == b"installer"
+
+
+
+
+def test_package_phase_details_records_clcache_stats_and_nuitka_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    build_inputs = _make_build_inputs(tmp_path, backend="nuitka", include_canary_model=False)
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    stats_before_dir = build_dir / "nuitka" / "packaged_main.build"
+    stats_before_dir.mkdir(parents=True)
+    (stats_before_dir / "clcache-stats.0001.txt").write_text(json.dumps({"CacheHits": 1, "CacheMisses": 3}), encoding="utf-8")
+
+    def fake_build_package_bundle(*, backend: str, package_command, stage_dir: Path, build_dir: Path, bootstrap_dir: Path, clean: bool, include_canary_model: bool) -> Path:
+        _ = (backend, package_command, bootstrap_dir, clean, include_canary_model)
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        (stage_dir / "transcribe.exe").write_bytes(b"exe")
+        report_path = build_script._default_nuitka_report_path(build_dir)
+        report_path.write_text("<report />\n", encoding="utf-8")
+        stats_dir = build_dir / "nuitka" / "packaged_main.build"
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        (stats_dir / "clcache-stats.9999.txt").write_text(json.dumps({"CacheHits": 5, "CacheMisses": 4}), encoding="utf-8")
+        return stage_dir
+
+    monkeypatch.setattr(build_script, "_build_package_bundle", fake_build_package_bundle)
+
+    details = build_script._package_phase_details(
+        build_inputs=build_inputs,
+        stage_dir=tmp_path / "stage",
+        build_dir=build_dir,
+        bootstrap_dir=tmp_path / "bootstrap",
+        clean=False,
+        include_canary_model=False,
+    )
+
+    assert details["clcache_stats_before"]["CacheHits"] == 1
+    assert details["clcache_stats_after"]["CacheHits"] == 5
+    assert details["nuitka_report_path"].endswith(build_script.NUITKA_REPORT_FILENAME)

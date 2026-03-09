@@ -26,12 +26,15 @@ from transcribe.packaged_assets import (
     write_packaged_asset_manifest,
 )
 from transcribe.runtime_env import bundled_notes_model_specs, bundled_transcription_model_specs
+from transcribe import __version__ as TRANSCRIBE_VERSION
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STAGE_DIR = REPO_ROOT / "dist" / "windows" / "transcribe"
 DEFAULT_BUILD_DIR = REPO_ROOT / "dist" / "windows" / "build"
 DEFAULT_INSTALLER_DIR = REPO_ROOT / "dist" / "windows" / "installer"
+DEFAULT_RELEASES_DIR = REPO_ROOT / "releases"
 DEFAULT_BOOTSTRAP_DIR = REPO_ROOT / "dist" / "windows" / "_bootstrap"
+DEFAULT_CLCACHE_DIR = DEFAULT_BOOTSTRAP_DIR / "clcache"
 DEFAULT_TOOLS_DIR = DEFAULT_BOOTSTRAP_DIR / "tools"
 DEFAULT_ASSETS_DIR = DEFAULT_BOOTSTRAP_DIR / "assets"
 DEFAULT_HF_CACHE_DIR = DEFAULT_BOOTSTRAP_DIR / "hf-cache"
@@ -66,6 +69,7 @@ SUPPORTED_NUITKA_PYTHON = (3, 13)
 PROMPT_SOURCE_PATH = REPO_ROOT / "clinical note synthesis llm prompt.md"
 INNO_SCRIPT_PATH = REPO_ROOT / "packaging" / "windows" / "transcribe.iss"
 NUITKA_PACKAGE_CONFIG_PATH = REPO_ROOT / "packaging" / "windows" / "nuitka-librosa-workaround.yml"
+NUITKA_REPORT_FILENAME = "nuitka-report.xml"
 
 _LLAMA_CPP_WINDOWS_ASSET_PATTERNS = (
     re.compile(r"llama-b\d+-bin-win-cpu-x64\.zip$", re.IGNORECASE),
@@ -178,6 +182,42 @@ def _collect_directory_inventory(root: Path) -> dict[str, Any]:
     return inventory
 
 
+def _publish_release_installer(installer_path: Path, *, releases_dir: Path | None = None) -> Path:
+    resolved_releases_dir = (releases_dir or DEFAULT_RELEASES_DIR).resolve()
+    resolved_releases_dir.mkdir(parents=True, exist_ok=True)
+    destination = (resolved_releases_dir / f"Transcribe-{TRANSCRIBE_VERSION}.exe").resolve()
+    shutil.copy2(installer_path.resolve(), destination)
+    return destination
+
+
+def _default_nuitka_report_path(build_dir: Path) -> Path:
+    return build_dir.resolve() / NUITKA_REPORT_FILENAME
+
+
+def _read_latest_clcache_stats(build_dir: Path) -> dict[str, Any] | None:
+    candidates = sorted(
+        (build_dir / "nuitka").glob("*.build/clcache-stats*.txt"),
+        key=lambda candidate: candidate.stat().st_mtime,
+    )
+    if not candidates:
+        return None
+
+    stats_path = candidates[-1].resolve()
+    payload = json.loads(stats_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return None
+    payload["path"] = str(stats_path)
+    return payload
+
+
+def _ensure_clcache_directory(*, bootstrap_dir: Path, env: Mapping[str, str] | None = None) -> dict[str, str]:
+    resolved_dir = (bootstrap_dir / "clcache").resolve()
+    resolved_dir.mkdir(parents=True, exist_ok=True)
+    merged = _merged_environment(env)
+    merged["CLCACHE_DIR"] = str(resolved_dir)
+    return merged
+
+
 def _write_build_report(
     report_path: Path,
     *,
@@ -191,6 +231,8 @@ def _write_build_report(
     bootstrap_dir: Path,
     installer_dir: Path,
     installer_path: Path | None,
+    compiler_cache_dir: Path | None,
+    nuitka_report_path: Path | None,
 ) -> dict[str, Any]:
     payload = {
         "generated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
@@ -213,6 +255,8 @@ def _write_build_report(
             "bootstrap": _collect_directory_inventory(bootstrap_dir),
             "installer_dir": _collect_directory_inventory(installer_dir),
             "installer_file": _summarize_file(installer_path) if installer_path is not None else None,
+            "compiler_cache_dir": _collect_directory_inventory(compiler_cache_dir) if compiler_cache_dir is not None else None,
+            "nuitka_report_file": _summarize_file(nuitka_report_path) if nuitka_report_path is not None else None,
         },
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -559,6 +603,7 @@ def _install_visual_studio_build_tools(*, tools_dir: Path) -> Path:
 def _ensure_windows_native_build_environment(*, bootstrap_missing: bool, bootstrap_dir: Path) -> dict[str, str]:
     tools_dir = (bootstrap_dir / "tools").resolve()
     env = _prepend_path(os.environ.copy(), _python_scripts_dir())
+    env = _ensure_clcache_directory(bootstrap_dir=bootstrap_dir, env=env)
     env = _ensure_windows_python_build_helpers(
         bootstrap_missing=bootstrap_missing,
         bootstrap_dir=bootstrap_dir,
@@ -576,6 +621,7 @@ def _ensure_windows_native_build_environment(*, bootstrap_missing: bool, bootstr
     if vcvars_path is not None:
         env = _capture_batch_environment(vcvars_path, env=env)
         env = _prepend_path(env, _python_scripts_dir())
+        env = _ensure_clcache_directory(bootstrap_dir=bootstrap_dir, env=env)
 
     cmake_exe = _resolve_executable_in_environment("cmake", env)
     if cmake_exe is None:
@@ -618,6 +664,8 @@ def _ensure_python_build_dependencies(*, bootstrap_missing: bool, bootstrap_dir:
         )
 
     dependency_env = _prepend_path(os.environ.copy(), _python_scripts_dir())
+    if os.name == "nt":
+        dependency_env = _ensure_clcache_directory(bootstrap_dir=bootstrap_dir, env=dependency_env)
     if os.name == "nt" and not nemo_ready:
         dependency_env = _ensure_windows_native_build_environment(
             bootstrap_missing=bootstrap_missing,
@@ -630,7 +678,7 @@ def _ensure_python_build_dependencies(*, bootstrap_missing: bool, bootstrap_dir:
         if os.name == "nt":
             uv_cache_dir = _short_windows_work_root() / "uv"
         uv_cache_dir.mkdir(parents=True, exist_ok=True)
-        env = _merged_environment(dependency_env)
+        env = _ensure_clcache_directory(bootstrap_dir=bootstrap_dir, env=dependency_env)
         env["UV_CACHE_DIR"] = str(uv_cache_dir)
         if os.name == "nt":
             temp_dir = _short_windows_work_root() / "tmp"
@@ -686,6 +734,8 @@ def _ensure_nuitka_build_dependencies(*, bootstrap_missing: bool, bootstrap_dir:
         )
 
     dependency_env = _prepend_path(os.environ.copy(), _python_scripts_dir())
+    if os.name == "nt":
+        dependency_env = _ensure_clcache_directory(bootstrap_dir=bootstrap_dir, env=dependency_env)
     if os.name == "nt" and not nemo_ready:
         dependency_env = _ensure_windows_native_build_environment(
             bootstrap_missing=bootstrap_missing,
@@ -698,7 +748,7 @@ def _ensure_nuitka_build_dependencies(*, bootstrap_missing: bool, bootstrap_dir:
         if os.name == "nt":
             uv_cache_dir = _short_windows_work_root() / "uv"
         uv_cache_dir.mkdir(parents=True, exist_ok=True)
-        env = _merged_environment(dependency_env)
+        env = _ensure_clcache_directory(bootstrap_dir=bootstrap_dir, env=dependency_env)
         env["UV_CACHE_DIR"] = str(uv_cache_dir)
         if os.name == "nt":
             temp_dir = _short_windows_work_root() / "tmp"
@@ -819,8 +869,11 @@ def _build_nuitka_command(
     include_canary_model: bool,
 ) -> list[str]:
     output_dir = build_dir / "nuitka"
+    report_path = _default_nuitka_report_path(build_dir)
     if clean and output_dir.exists():
         shutil.rmtree(output_dir)
+    if clean and report_path.exists():
+        report_path.unlink()
     command = [
         *package_command,
         "--standalone",
@@ -843,8 +896,10 @@ def _build_nuitka_command(
         "--include-module=sounddevice",
         "--noinclude-numba-mode=nofollow",
         "--module-parameter=numba-disable-jit=yes",
+        "--noinclude-setuptools-mode=nofollow",
         f"--user-package-configuration-file={NUITKA_PACKAGE_CONFIG_PATH}",
-        "--nofollow-import-to=datasets,pyarrow,matplotlib,_pytest,coverage,mypy,IPython,pytest,transcribe.bench,transcribe.test_cov",
+        f"--report={report_path}",
+        "--nofollow-import-to=datasets,pyarrow,matplotlib,_pytest,coverage,mypy,IPython,pytest,transcribe.bench,transcribe.test_cov,torch.utils.cpp_extension,setuptools",
     ]
     if _module_available("nemo.collections.asr"):
         command.extend(
@@ -872,6 +927,7 @@ def _build_package_bundle(
     package_command: Sequence[str],
     stage_dir: Path,
     build_dir: Path,
+    bootstrap_dir: Path,
     clean: bool,
     include_canary_model: bool,
 ) -> Path:
@@ -904,6 +960,7 @@ def _build_package_bundle(
                 include_canary_model=include_canary_model,
             ),
             cwd=REPO_ROOT,
+            env=_ensure_clcache_directory(bootstrap_dir=bootstrap_dir),
         )
         bundle_dir = _resolve_nuitka_bundle_dir(build_dir / "nuitka")
         if stage_dir.exists():
@@ -1385,11 +1442,47 @@ def _resolve_or_bootstrap_build_inputs(args: argparse.Namespace) -> ResolvedBuil
     )
 
 
+def _package_phase_details(
+    *,
+    build_inputs: ResolvedBuildInputs,
+    stage_dir: Path,
+    build_dir: Path,
+    bootstrap_dir: Path,
+    clean: bool,
+    include_canary_model: bool,
+) -> dict[str, Any]:
+    clcache_stats_before = _read_latest_clcache_stats(build_dir) if build_inputs.backend == "nuitka" else None
+    bundle_dir = _build_package_bundle(
+        backend=build_inputs.backend,
+        package_command=build_inputs.package_command,
+        stage_dir=stage_dir,
+        build_dir=build_dir,
+        bootstrap_dir=bootstrap_dir,
+        clean=clean,
+        include_canary_model=include_canary_model,
+    )
+    details: dict[str, Any] = {"stage_dir": str(bundle_dir)}
+    if build_inputs.backend == "nuitka":
+        details["clcache_stats_before"] = clcache_stats_before
+        details["clcache_stats_after"] = _read_latest_clcache_stats(build_dir)
+        details["nuitka_report_path"] = str(_default_nuitka_report_path(build_dir))
+    return details
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build the Windows standalone transcribe package")
     parser.add_argument("--backend", choices=BUILD_BACKEND_CHOICES, default=DEFAULT_BUILD_BACKEND)
-    parser.add_argument("--phase", choices=BUILD_PHASE_CHOICES, default=DEFAULT_BUILD_PHASE)
-    parser.add_argument("--clean", action="store_true")
+    parser.add_argument(
+        "--phase",
+        choices=BUILD_PHASE_CHOICES,
+        default=DEFAULT_BUILD_PHASE,
+        help="Reuse completed work by running only one phase; use installer for installer-only changes and stage-assets for packaged asset updates.",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Clear package build outputs before packaging. Use only for broken caches or dependency-shape changes.",
+    )
     parser.add_argument("--report-path", type=Path, default=DEFAULT_BUILD_REPORT_PATH)
     parser.add_argument("--stage-dir", type=Path, default=DEFAULT_STAGE_DIR)
     parser.add_argument("--build-dir", type=Path, default=DEFAULT_BUILD_DIR)
@@ -1438,6 +1531,9 @@ def main(argv: list[str] | None = None) -> int:
     phase_results: list[PhaseResult] = []
     build_inputs: ResolvedBuildInputs | None = None
     installer_path: Path | None = None
+    published_release_path: Path | None = None
+    compiler_cache_dir = (bootstrap_dir / "clcache").resolve()
+    nuitka_report_path = _default_nuitka_report_path(build_dir)
 
     def prepare_inputs() -> dict[str, Any]:
         nonlocal build_inputs
@@ -1450,6 +1546,7 @@ def main(argv: list[str] | None = None) -> int:
             "package_command": list(build_inputs.package_command),
             "llama_runtime_dir": str(build_inputs.llama_runtime_dir),
             "include_canary_model": args.include_canary_model,
+            "compiler_cache_dir": str(compiler_cache_dir),
         }
 
     if _phase_selected(args, "prepare") or _phase_selected(args, "package") or _phase_selected(args, "stage-assets"):
@@ -1470,18 +1567,14 @@ def main(argv: list[str] | None = None) -> int:
             _run_timed_phase(
                 phase_results,
                 "package",
-                lambda: {
-                    "stage_dir": str(
-                        _build_package_bundle(
-                            backend=build_inputs.backend,
-                            package_command=build_inputs.package_command,
-                            stage_dir=stage_dir,
-                            build_dir=build_dir,
-                            clean=args.clean,
-                            include_canary_model=args.include_canary_model,
-                        )
-                    )
-                },
+                lambda: _package_phase_details(
+                    build_inputs=build_inputs,
+                    stage_dir=stage_dir,
+                    build_dir=build_dir,
+                    bootstrap_dir=bootstrap_dir,
+                    clean=args.clean,
+                    include_canary_model=args.include_canary_model,
+                ),
             )
 
     if _phase_selected(args, "stage-assets"):
@@ -1545,6 +1638,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if installer_result is not None:
                 installer_path = Path(installer_result["installer_path"]).resolve()
+                published_release_path = _publish_release_installer(installer_path)
 
     _write_build_report(
         report_path,
@@ -1558,6 +1652,8 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap_dir=bootstrap_dir,
         installer_dir=installer_dir,
         installer_path=installer_path,
+        compiler_cache_dir=compiler_cache_dir,
+        nuitka_report_path=nuitka_report_path if nuitka_report_path.exists() else None,
     )
 
     print(f"Build report: {report_path}")
@@ -1565,6 +1661,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Windows stage: {stage_dir}")
     if installer_path is not None:
         print(f"Installer: {installer_path}")
+    if published_release_path is not None:
+        print(f"Release: {published_release_path}")
+    print("Reuse tips: use --phase installer for installer-script changes, --phase stage-assets for prompt/runtime asset changes, and rerun package only for Python dependency or inclusion changes.")
     return 0
 
 
