@@ -25,8 +25,7 @@ SolidCompression=yes
 WizardStyle=modern
 OutputDir={#OutputDir}
 OutputBaseFilename=transcribe-windows-standalone
-DiskSpanning=yes
-DiskSliceSize=max
+DiskSpanning=no
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
@@ -69,3 +68,4 @@ begin
     FailBootstrap(Format('Packaged-model bootstrap failed with exit code %d.', [ResultCode]));
   end;
 end;
+
