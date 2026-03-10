@@ -1,9 +1,8 @@
-`uv run python -m transcribe.cli ...` appeared to hang indefinitely because `transcribe.cli` imported audio modules at import time, and `transcribe.audio.linux_capture` imported `sounddevice` at module load; in this sandboxed `.venv`, `import sounddevice` blocks.
+When you encounter a new problem that required significant searching to resolve or a developer intervention, add a brief summary and the solution to the end of this file.
 
-Remedy implemented:
-- Moved audio-heavy imports in `transcribe/cli.py` into command handlers (`_run_capture`, `_run_devices`, `_run_benchmark`) so compliance commands do not import audio code.
-- Changed `transcribe/audio/linux_capture.py` to lazy-load `sounddevice` via `_load_sounddevice()` only when real audio capture/listing is needed.
+This project uses uv; `uv run transcribe`
+Use python 3.13 best practices and numpy style docstrings. 
+Before adding a new dependency, explain the need and ask the developer.
 
-Guidance:
+Guidance from past stumbling blocks:
 - Keep non-audio commands free of eager audio/backend imports.
-- If a command seems hung, test `.venv/bin/python3 -c "import transcribe.cli"` and isolate import-time side effects before suspecting infinite loops.
