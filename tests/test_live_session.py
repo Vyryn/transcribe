@@ -10,7 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from transcribe.live.session import LiveSessionConfig, _stitch_text_overlap, run_live_transcription_session
+from transcribe.live.session import (
+    LiveSessionConfig,
+    _prepare_pcm16_for_asr,
+    _should_skip_asr_for_chunk,
+    _stitch_text_overlap,
+    run_live_transcription_session,
+)
 from transcribe.models import AudioSourceMode
 
 
@@ -781,7 +787,7 @@ def test_run_session_prints_crisp_feedback_by_default(monkeypatch, tmp_path, cap
     assert "Loading model: nvidia/parakeet-tdt-0.6b-v3" in captured.out
     assert "Model ready." in captured.out
     assert "Capture ready: mic, speakers" in captured.out
-    assert "Sample rate: 48000 Hz capture (requested 16000 Hz), 16000 Hz ASR" in captured.out
+    assert "Sample rate: 16000 Hz capture, 16000 Hz ASR" in captured.out
     assert "Transcribing. Press Ctrl+C to stop." in captured.out
     assert "clean transcript line" in captured.out
     assert "Session saved:" in captured.out
@@ -884,3 +890,30 @@ def test_run_session_returns_code_2_on_runtime_error(monkeypatch, tmp_path, caps
 
     assert rc == 2
     assert "Session failed:" in captured.out
+
+
+
+def test_prepare_pcm16_for_asr_boosts_quiet_speech_before_trimming() -> None:
+    quiet_pcm16 = struct.pack("<3200h", *([90] * 3200))
+
+    prepared = _prepare_pcm16_for_asr(
+        quiet_pcm16,
+        capture_sample_rate_hz=16_000,
+        target_sample_rate_hz=16_000,
+        channels=1,
+    )
+
+    assert prepared
+    assert max(abs(sample) for (sample,) in struct.iter_unpack("<h", prepared)) > 700
+
+
+def test_should_skip_asr_for_chunk_keeps_quiet_speech_after_normalization() -> None:
+    quiet_pcm16 = struct.pack("<3200h", *([100] * 3200))
+
+    assert _should_skip_asr_for_chunk(quiet_pcm16, clarity_score=0.8) is False
+
+
+def test_should_skip_asr_for_chunk_still_skips_true_silence() -> None:
+    silent_pcm16 = struct.pack("<3200h", *([0] * 3200))
+
+    assert _should_skip_asr_for_chunk(silent_pcm16, clarity_score=0.8) is True

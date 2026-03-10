@@ -212,7 +212,7 @@ def test_build_pyinstaller_command_targets_packaged_entrypoint_and_excludes_dev_
     assert "transcribe.bench" in command
     assert "nemo.collections.asr" in command
     assert "--collect-all" in command
-    assert "sounddevice" in command
+    assert "soundcard" in command
     assert "--clean" not in command
     assert ("nemo.collections.speechlm2.models" in command) is include_canary_model
 
@@ -252,7 +252,7 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_excludes_dev_modul
     assert "--standalone" in command
     assert "--output-filename=transcribe.exe" in command
     assert "--include-package=transcribe" in command
-    assert "--include-module=sounddevice" in command
+    assert "--include-package=soundcard" in command
     assert "--noinclude-numba-mode=nofollow" in command
     assert "--module-parameter=numba-disable-jit=yes" in command
     assert "--noinclude-setuptools-mode=nofollow" in command
@@ -684,3 +684,4 @@ def test_package_phase_details_records_clcache_stats_and_nuitka_report(tmp_path:
     assert details["clcache_stats_before"]["CacheHits"] == 1
     assert details["clcache_stats_after"]["CacheHits"] == 5
     assert details["nuitka_report_path"].endswith(build_script.NUITKA_REPORT_FILENAME)
+
