@@ -202,7 +202,7 @@ uv run bench --model nvidia/parakeet-tdt-0.6b-v3
 
 ## Live Session Test Rig (Stage 1)
 
-Use the Stage 1 live session runner for open-mic streaming transcription on Linux.
+Use the Stage 1 live session runner for open-mic streaming transcription on Linux and Windows.
 
 `session run` now captures all available input devices in the selected mode and
 automatically routes each frame from the clearest source (for example, best mic
@@ -260,6 +260,7 @@ Quality tuning tips:
 
 - If logs show `No speaker monitor/loopback device found`, you are effectively
   transcribing microphone audio only. Use `--mode mic` for that workflow.
+- On Windows, if microphone startup fails with `0x80070005`, enable `Settings > Privacy & security > Microphone > Let desktop apps access your microphone` before retrying.
 - Use `--chunk-sec 3` or `--chunk-sec 4` for better phrase boundaries with
   conversational speech.
 - Keep `--partial-interval-sec 0` on larger models to preserve final accuracy.
@@ -270,7 +271,7 @@ Outputs are written under `data/live_sessions/<session-id>/`:
 - `transcript.json` (session metadata + finalized segments)
 - `transcript.txt` (plain finalized transcript)
 
-The Linux and Windows capture backends now auto-negotiate a supported input sample rate per selected device, normalize mixed-rate capture behind the scenes, and report requested/effective values at session end.
+The Linux and Windows capture backends now auto-negotiate a supported input sample rate per selected device, normalize mixed-rate capture behind the scenes, and report requested/effective values at session end. On Windows, `capture devices` now lists native WASAPI microphone and loopback endpoints from `soundcard`, so loopback device indices are Windows-backend specific rather than PortAudio/MME duplicates.
 
 If you want the larger quality-focused model instead, use:
 `uv run transcribe session run --model nvidia/canary-qwen-2.5b --duration-sec 0`.
@@ -484,3 +485,5 @@ Exit criteria:
 3. Add audit event schema, data classification fields, and PHI-safe logging guardrails.
 4. Continue benchmark regressions and validate `nvidia/canary-qwen-2.5b` + `nvidia/parakeet-tdt-0.6b-v3` on target hardware tiers.
 5. Implement local auth/session lock and encrypted persistence before any clinical pilot.
+
+
