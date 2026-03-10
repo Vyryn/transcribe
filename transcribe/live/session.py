@@ -6,6 +6,7 @@ import json
 import math
 import re
 import struct
+import threading
 import time
 import wave
 from collections.abc import Callable, Iterator
@@ -321,6 +322,16 @@ def _build_default_chunk_transcriber(transcription_model: str, max_model_ram_gb:
     return _transcribe
 
 
+def _preload_default_transcription_model(transcription_model: str, max_model_ram_gb: float) -> None:
+    """Preload the default runtime transcription model into cache."""
+    from transcribe.transcription_runtime import preload_transcription_model
+
+    preload_transcription_model(
+        transcription_model,
+        max_model_ram_gb=max_model_ram_gb,
+    )
+
+
 def _emit_progress(
     progress_callback: SessionProgressCallback | None,
     event: str,
@@ -567,16 +578,8 @@ def run_live_transcription_session(
     if config.frame_ms <= 0:
         raise ValueError("frame_ms must be > 0")
 
-    chunk_transcriber: ChunkTranscriber
-    uses_lazy_default_transcriber = transcriber is None
-    model_ready_reported = not uses_lazy_default_transcriber
-    if transcriber is None:
-        chunk_transcriber = _build_default_chunk_transcriber(
-            config.transcription_model,
-            config.max_model_ram_gb,
-        )
-    else:
-        chunk_transcriber = transcriber
+    chunk_transcriber: ChunkTranscriber | None = transcriber
+    uses_default_runtime_transcriber = transcriber is None
 
     session_dir = config.output_dir
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -608,6 +611,33 @@ def run_live_transcription_session(
     device_sample_rates_hz = dict(getattr(backend, "device_sample_rates_hz", {}))
     device_channels = dict(getattr(backend, "device_channels", {}))
 
+    bytes_per_second = float(capture_sample_rate_hz * config.channels * 2)
+    effective_chunk_overlap_sec = min(
+        config.chunk_overlap_sec,
+        max(config.chunk_sec - (config.frame_ms / 1000.0), 0.0),
+    )
+    sample_frame_bytes = max(2, config.channels * 2)
+    chunk_overlap_bytes = int(round(bytes_per_second * effective_chunk_overlap_sec))
+    chunk_overlap_bytes -= chunk_overlap_bytes % sample_frame_bytes
+    chunk_index = 1
+    chunk_pcm16_by_source: dict[str, bytearray] = {}
+    startup_buffered_audio_sec = 0.0
+    chunk_started = 0.0
+    started = 0.0
+    last_partial_at = 0.0
+    last_partial_text = ""
+    last_selected_source: str | None = None
+    final_segments: list[dict[str, object]] = []
+    partial_event_count = 0
+    total_audio_bytes = 0
+    total_inference_ms = 0.0
+    skipped_silence_chunks = 0
+    dropped_empty_chunk_count = 0
+    empty_output_streak = 0
+    source_selection_counts: dict[str, int] = {}
+    interrupted = False
+    previous_final_text = ""
+
     _emit_progress(
         progress_callback,
         "capture_ready",
@@ -622,48 +652,79 @@ def run_live_transcription_session(
         device_sample_rates_hz={key: int(value) for key, value in device_sample_rates_hz.items()},
         device_channels={key: int(value) for key, value in device_channels.items()},
     )
+    if uses_default_runtime_transcriber:
+        _emit_progress(
+            progress_callback,
+            "loading_model",
+            transcription_model=config.transcription_model,
+            capture_active=True,
+        )
+        preload_completed = threading.Event()
+        preload_error: list[BaseException] = []
+
+        def _preload_model_worker() -> None:
+            try:
+                with _suppress_backend_output(not debug):
+                    _preload_default_transcription_model(
+                        config.transcription_model,
+                        config.max_model_ram_gb,
+                    )
+            except BaseException as exc:  # noqa: BLE001
+                preload_error.append(exc)
+            finally:
+                preload_completed.set()
+
+        preload_thread = threading.Thread(target=_preload_model_worker, name="live-session-preload", daemon=True)
+        preload_thread.start()
+
+        while not preload_completed.is_set():
+            try:
+                frames = backend.read_frames(timeout_ms=config.frame_ms * 3)
+            except TimeoutError:
+                continue
+            for source_name, frame in frames.items():
+                source_buffer = chunk_pcm16_by_source.setdefault(source_name, bytearray())
+                source_buffer.extend(frame.mono_pcm16)
+
+        preload_thread.join(timeout=0.0)
+        if preload_error:
+            backend.close()
+            raise _build_live_transcription_runtime_error(
+                config.transcription_model,
+                preload_error[0],
+            ) from preload_error[0]
+
+        chunk_transcriber = _build_default_chunk_transcriber(
+            config.transcription_model,
+            config.max_model_ram_gb,
+        )
+        startup_buffered_audio_sec = _max_buffered_audio_sec(
+            chunk_pcm16_by_source,
+            bytes_per_second=bytes_per_second,
+        )
+        _emit_progress(
+            progress_callback,
+            "model_ready",
+            transcription_model=config.transcription_model,
+            buffered_audio_sec=startup_buffered_audio_sec,
+        )
+
+    assert chunk_transcriber is not None
+
+    chunk_started = time.monotonic()
+    started = chunk_started
+    last_partial_at = chunk_started
+
     _emit_progress(
         progress_callback,
         "transcribing_started",
         chunk_sec=config.chunk_sec,
         partial_interval_sec=config.partial_interval_sec,
         duration_sec=config.duration_sec,
+        buffered_audio_sec=startup_buffered_audio_sec,
     )
-
-    bytes_per_second = float(capture_sample_rate_hz * config.channels * 2)
-    effective_chunk_overlap_sec = min(
-        config.chunk_overlap_sec,
-        max(config.chunk_sec - (config.frame_ms / 1000.0), 0.0),
-    )
-    sample_frame_bytes = max(2, config.channels * 2)
-    chunk_overlap_bytes = int(round(bytes_per_second * effective_chunk_overlap_sec))
-    chunk_overlap_bytes -= chunk_overlap_bytes % sample_frame_bytes
-    chunk_index = 1
-    chunk_started = time.monotonic()
-    started = chunk_started
-    last_partial_at = chunk_started
-    chunk_pcm16_by_source: dict[str, bytearray] = {}
-    last_partial_text = ""
-    last_selected_source: str | None = None
-    final_segments: list[dict[str, object]] = []
-    partial_event_count = 0
-    total_audio_bytes = 0
-    total_inference_ms = 0.0
-    skipped_silence_chunks = 0
-    dropped_empty_chunk_count = 0
-    empty_output_streak = 0
-    source_selection_counts: dict[str, int] = {}
-    interrupted = False
-    previous_final_text = ""
 
     def _transcribe_chunk_with_progress(chunk_pcm16: bytes) -> tuple[str, float]:
-        nonlocal model_ready_reported
-        if not model_ready_reported and uses_lazy_default_transcriber:
-            _emit_progress(
-                progress_callback,
-                "loading_model",
-                transcription_model=config.transcription_model,
-            )
         text, latency_ms = _transcribe_chunk_or_raise(
             bytearray(chunk_pcm16),
             capture_sample_rate_hz=capture_sample_rate_hz,
@@ -673,13 +734,6 @@ def run_live_transcription_session(
             transcriber=chunk_transcriber,
             suppress_backend_output=not debug,
         )
-        if not model_ready_reported and uses_lazy_default_transcriber:
-            _emit_progress(
-                progress_callback,
-                "model_ready",
-                transcription_model=config.transcription_model,
-            )
-            model_ready_reported = True
         return text, latency_ms
 
     def _write_event(event: dict[str, object], handle: object) -> None:

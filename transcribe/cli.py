@@ -106,6 +106,9 @@ def add_common_config_flags(parser: argparse.ArgumentParser) -> None:
 def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str, object]], None]:
     """Create CLI printer for structured live-session progress events."""
 
+    def _format_buffered_audio_sec(seconds: float) -> str:
+        return f"{seconds:.1f}s"
+
     def _format_sources(raw_devices: object) -> str:
         if not isinstance(raw_devices, dict):
             return "none"
@@ -121,9 +124,15 @@ def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str,
     def _report(event: str, fields: dict[str, object]) -> None:
         if event == "loading_model":
             print(f"Loading model: {fields['transcription_model']}")
+            if bool(fields.get("capture_active")):
+                print("Recording now. Buffering audio until the model is ready.")
             return
         if event == "model_ready":
-            print("Model ready.")
+            buffered_audio_sec = float(fields.get("buffered_audio_sec", 0.0))
+            if buffered_audio_sec >= 0.5:
+                print(f"Model ready. Catching up on {_format_buffered_audio_sec(buffered_audio_sec)} of buffered audio.")
+            else:
+                print("Model ready.")
             return
         if event == "capture_ready":
             requested_rate_hz = int(fields.get("requested_sample_rate_hz", 0))
@@ -144,10 +153,18 @@ def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str,
                     print(f"Device channels: {device_channels}")
             return
         if event == "transcribing_started":
+            buffered_audio_sec = float(fields.get("buffered_audio_sec", 0.0))
+            is_catching_up = buffered_audio_sec >= 0.5
             if float(fields.get("duration_sec", 0.0)) > 0:
-                print("Transcribing.")
+                if is_catching_up:
+                    print("Listening and catching up.")
+                else:
+                    print("Listening and transcribing.")
             else:
-                print("Transcribing. Press Ctrl+C to stop.")
+                if is_catching_up:
+                    print("Listening and catching up. Press Ctrl+C to stop.")
+                else:
+                    print("Listening. Press Ctrl+C to stop.")
             return
         if event == "partial":
             if debug:
