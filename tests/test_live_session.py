@@ -721,6 +721,87 @@ def test_run_live_transcription_session_reports_progress_events(tmp_path) -> Non
     assert "final" in event_names
 
 
+def test_run_live_transcription_session_buffers_audio_while_model_loads(monkeypatch, tmp_path) -> None:
+    from transcribe.audio.interfaces import RawFrame
+    import transcribe.live.session as live_session_module
+
+    progress_events: list[tuple[str, dict[str, object]]] = []
+    preload_calls = {"count": 0}
+    transcribe_calls = {"count": 0}
+
+    class FakeBackend:
+        def __init__(self, *, use_fixture: bool = False) -> None:
+            _ = use_fixture
+            self.sample_rate_hz = 16_000
+            self.active_devices = {"mic": ["fixture"]}
+
+        def open(self, config) -> None:
+            _ = config
+
+        def read_frames(self, timeout_ms: int = 500) -> dict[str, RawFrame]:
+            _ = timeout_ms
+            time.sleep(0.02)
+            frame_samples = int((self.sample_rate_hz * 20) / 1000)
+            voiced_frame = struct.pack("<h", 1_200) * frame_samples
+            return {
+                "mic": RawFrame(
+                    stream="mic",
+                    mono_pcm16=voiced_frame,
+                    captured_at_monotonic_ns=time.monotonic_ns(),
+                    sample_rate_hz=self.sample_rate_hz,
+                )
+            }
+
+        def close(self) -> None:
+            return None
+
+    def fake_preload(transcription_model: str, max_model_ram_gb: float) -> None:
+        _ = (transcription_model, max_model_ram_gb)
+        preload_calls["count"] += 1
+        time.sleep(0.12)
+
+    def fake_builder(transcription_model: str, max_model_ram_gb: float):
+        _ = (transcription_model, max_model_ram_gb)
+
+        def _fake_transcriber(wav_bytes: bytes, model_id: str) -> tuple[str, float]:
+            _ = (wav_bytes, model_id)
+            transcribe_calls["count"] += 1
+            return "buffered startup line", 4.0
+
+        return _fake_transcriber
+
+    monkeypatch.setattr(
+        live_session_module,
+        "open_audio_backend",
+        lambda *, use_fixture=False: FakeBackend(use_fixture=use_fixture),
+    )
+    monkeypatch.setattr(live_session_module, "_preload_default_transcription_model", fake_preload)
+    monkeypatch.setattr(live_session_module, "_build_default_chunk_transcriber", fake_builder)
+
+    config = LiveSessionConfig(
+        transcription_model="unit-test-model",
+        duration_sec=0.12,
+        chunk_sec=0.06,
+        partial_interval_sec=0.0,
+        output_dir=tmp_path / "live-preload-buffer",
+        session_id="live-preload-buffer",
+    )
+    result = run_live_transcription_session(
+        config,
+        use_fixture=False,
+        progress_callback=lambda event, fields: progress_events.append((event, fields)),
+    )
+
+    event_names = [event for event, _ in progress_events]
+    assert event_names[:4] == ["capture_ready", "loading_model", "model_ready", "transcribing_started"]
+    model_ready_fields = next(fields for event, fields in progress_events if event == "model_ready")
+    assert preload_calls["count"] == 1
+    assert float(model_ready_fields["buffered_audio_sec"]) > 0.0
+    assert transcribe_calls["count"] >= 1
+    assert result.final_segment_count >= 1
+    assert "final" in event_names
+
+
 def test_run_session_prints_crisp_feedback_by_default(monkeypatch, tmp_path, capsys) -> None:
     import transcribe.cli as cli_module
     import transcribe.live.session as live_session_module
@@ -730,8 +811,6 @@ def test_run_session_prints_crisp_feedback_by_default(monkeypatch, tmp_path, cap
     def fake_runner(config, *, use_fixture: bool = False, debug: bool = False, progress_callback=None):
         _ = (use_fixture, debug)
         assert progress_callback is not None
-        progress_callback("loading_model", {"transcription_model": config.transcription_model})
-        progress_callback("model_ready", {"transcription_model": config.transcription_model})
         progress_callback(
             "capture_ready",
             {
@@ -742,7 +821,27 @@ def test_run_session_prints_crisp_feedback_by_default(monkeypatch, tmp_path, cap
                 "device_sample_rates_hz": {"mic:2": 16_000, "speakers:5": 48_000},
             },
         )
-        progress_callback("transcribing_started", {"duration_sec": 0.0})
+        progress_callback(
+            "loading_model",
+            {
+                "transcription_model": config.transcription_model,
+                "capture_active": True,
+            },
+        )
+        progress_callback(
+            "model_ready",
+            {
+                "transcription_model": config.transcription_model,
+                "buffered_audio_sec": 6.2,
+            },
+        )
+        progress_callback(
+            "transcribing_started",
+            {
+                "duration_sec": 0.0,
+                "buffered_audio_sec": 6.2,
+            },
+        )
         progress_callback("final", {"chunk_index": 1, "text": "clean transcript line"})
         return live_session_module.LiveSessionResult(
             session_dir=Path(tmp_path) / "live-test",
@@ -784,11 +883,12 @@ def test_run_session_prints_crisp_feedback_by_default(monkeypatch, tmp_path, cap
     captured = capsys.readouterr()
 
     assert rc == 0
-    assert "Loading model: nvidia/parakeet-tdt-0.6b-v3" in captured.out
-    assert "Model ready." in captured.out
     assert "Capture ready: mic, speakers" in captured.out
     assert "Sample rate: 16000 Hz capture, 16000 Hz ASR" in captured.out
-    assert "Transcribing. Press Ctrl+C to stop." in captured.out
+    assert "Loading model: nvidia/parakeet-tdt-0.6b-v3" in captured.out
+    assert "Recording now. Buffering audio until the model is ready." in captured.out
+    assert "Model ready. Catching up on 6.2s of buffered audio." in captured.out
+    assert "Listening and catching up. Press Ctrl+C to stop." in captured.out
     assert "clean transcript line" in captured.out
     assert "Session saved:" in captured.out
     assert "Events JSONL:" not in captured.out
@@ -805,7 +905,37 @@ def test_run_session_prints_debug_feedback_when_enabled(monkeypatch, tmp_path, c
         _ = use_fixture
         assert debug is True
         assert progress_callback is not None
-        progress_callback("loading_model", {"transcription_model": config.transcription_model})
+        progress_callback(
+            "capture_ready",
+            {
+                "requested_sample_rate_hz": 16_000,
+                "capture_sample_rate_hz": 16_000,
+                "transcription_sample_rate_hz": 16_000,
+                "resolved_capture_devices": {"mic": ["2"]},
+                "device_channels": {"mic:2": 2},
+            },
+        )
+        progress_callback(
+            "loading_model",
+            {
+                "transcription_model": config.transcription_model,
+                "capture_active": True,
+            },
+        )
+        progress_callback(
+            "model_ready",
+            {
+                "transcription_model": config.transcription_model,
+                "buffered_audio_sec": 0.0,
+            },
+        )
+        progress_callback(
+            "transcribing_started",
+            {
+                "duration_sec": 12.0,
+                "buffered_audio_sec": 0.0,
+            },
+        )
         progress_callback("partial", {"chunk_index": 1, "text": "partial line"})
         progress_callback("final", {"chunk_index": 1, "text": "final line"})
         return live_session_module.LiveSessionResult(
@@ -830,7 +960,7 @@ def test_run_session_prints_debug_feedback_when_enabled(monkeypatch, tmp_path, c
         log_level=None,
         debug=True,
         transcription_model="nvidia/parakeet-tdt-0.6b-v3",
-        duration_sec=0.0,
+        duration_sec=12.0,
         chunk_overlap_sec=0.75,
         chunk_sec=4.0,
         partial_interval_sec=0.0,
@@ -848,6 +978,12 @@ def test_run_session_prints_debug_feedback_when_enabled(monkeypatch, tmp_path, c
     captured = capsys.readouterr()
 
     assert rc == 0
+    assert "Capture ready: mic" in captured.out
+    assert "Device channels: {'mic:2': 2}" in captured.out
+    assert "Loading model: nvidia/parakeet-tdt-0.6b-v3" in captured.out
+    assert "Recording now. Buffering audio until the model is ready." in captured.out
+    assert "Model ready." in captured.out
+    assert "Listening and transcribing." in captured.out
     assert "[partial 1] partial line" in captured.out
     assert "[final 1] final line" in captured.out
     assert "Events JSONL:" in captured.out
