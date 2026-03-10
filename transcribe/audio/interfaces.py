@@ -15,6 +15,7 @@ class RawFrame:
     stream: StreamName
     mono_pcm16: bytes
     captured_at_monotonic_ns: int
+    sample_rate_hz: int
 
 
 class AudioBackend(Protocol):
@@ -27,3 +28,4 @@ class AudioBackend(Protocol):
     def read_frames(self, timeout_ms: int = 500) -> dict[StreamName, RawFrame]: ...
 
     def close(self) -> None: ...
+

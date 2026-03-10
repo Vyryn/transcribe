@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 from transcribe.audio.interfaces import RawFrame
+from transcribe.audio.resample import resample_pcm16_mono_linear
 from transcribe.models import AudioSourceMode, CaptureConfig
 
 _SOUNDDEVICE: Any | None = None
@@ -137,6 +138,8 @@ class LinuxAudioCaptureBackend:
         self._active_stream_names: tuple[str, ...] = ()
         self._group_stream_keys: dict[str, tuple[str, ...]] = {}
         self._resolved_devices: dict[str, tuple[str | int, ...]] = {}
+        self._device_sample_rates_hz: dict[str, int] = {}
+        self._device_frame_samples: dict[str, int] = {}
         self._stream_quality_ema: dict[str, float] = {}
         self._preferred_stream_key: dict[str, str] = {}
         self._sample_rate_hz = 0
@@ -167,6 +170,11 @@ class LinuxAudioCaptureBackend:
     def active_devices(self) -> dict[str, tuple[str | int, ...]]:
         """Return resolved capture devices by stream group."""
         return dict(self._resolved_devices)
+
+    @property
+    def device_sample_rates_hz(self) -> dict[str, int]:
+        """Return negotiated hardware sample rates keyed by stream key."""
+        return dict(self._device_sample_rates_hz)
 
     def list_devices(self) -> list[dict[str, object]]:
         """List available Linux audio input devices.
@@ -208,15 +216,21 @@ class LinuxAudioCaptureBackend:
         self._queues.clear()
         self._group_stream_keys = {name: () for name in self._active_stream_names}
         self._resolved_devices = {name: () for name in self._active_stream_names}
+        self._device_sample_rates_hz = {}
+        self._device_frame_samples = {}
         self._stream_quality_ema = {}
         self._preferred_stream_key = {}
         self._streams.clear()
         self._consecutive_timeouts = 0
 
+        if self._sample_rate_hz <= 0:
+            raise ValueError("sample_rate_hz must be > 0")
+
+        self.frame_samples = int((self._sample_rate_hz * config.frame_ms) / 1000)
+        if self.frame_samples <= 0:
+            raise ValueError("frame_ms and sample_rate_hz produced 0 samples per frame")
+
         if self.use_fixture:
-            self.frame_samples = int((self._sample_rate_hz * config.frame_ms) / 1000)
-            if self.frame_samples <= 0:
-                raise ValueError("frame_ms and sample_rate_hz produced 0 samples per frame")
             return
 
         sd = load_sounddevice()
@@ -247,37 +261,31 @@ class LinuxAudioCaptureBackend:
         if not self._active_stream_names:
             raise RuntimeError("No capture devices resolved for active source mode.")
 
-        all_devices: tuple[str | int, ...] = tuple(
-            device for stream_name in self._active_stream_names for device in resolved_devices[stream_name]
-        )
         self._resolved_devices = {name: tuple(resolved_devices[name]) for name in self._active_stream_names}
-
-        self._sample_rate_hz = self.negotiate_sample_rate(
-            sd,
-            devices=all_devices,
-            channels=config.channels,
-            requested_sample_rate_hz=config.sample_rate_hz,
-        )
-        if self._sample_rate_hz != int(config.sample_rate_hz):
-            LOGGER.warning(
-                "Requested sample rate %s Hz is unsupported for selected device(s); using %s Hz instead.",
-                int(config.sample_rate_hz),
-                self._sample_rate_hz,
-            )
-        self.frame_samples = int((self._sample_rate_hz * config.frame_ms) / 1000)
-        if self.frame_samples <= 0:
-            raise ValueError("frame_ms and sample_rate_hz produced 0 samples per frame")
 
         for stream_name in self._active_stream_names:
             stream_keys: list[str] = []
             for device in resolved_devices[stream_name]:
                 stream_key = f"{stream_name}:{device}"
+                device_sample_rate_hz = self.negotiate_sample_rate(
+                    sd,
+                    device=device,
+                    channels=config.channels,
+                    requested_sample_rate_hz=config.sample_rate_hz,
+                )
+                frame_samples = int((device_sample_rate_hz * config.frame_ms) / 1000)
+                if frame_samples <= 0:
+                    raise ValueError("frame_ms and sample_rate_hz produced 0 samples per frame")
+                self._device_sample_rates_hz[stream_key] = device_sample_rate_hz
+                self._device_frame_samples[stream_key] = frame_samples
                 self._queues[stream_key] = queue.Queue(maxsize=self._queue_max_frames)
                 self._streams[stream_key] = self.build_stream(
                     sd,
                     stream_key=stream_key,
                     stream_group=stream_name,
                     device=device,
+                    sample_rate_hz=device_sample_rate_hz,
+                    frame_samples=frame_samples,
                 )
                 stream_keys.append(stream_key)
             self._group_stream_keys[stream_name] = tuple(stream_keys)
@@ -289,17 +297,16 @@ class LinuxAudioCaptureBackend:
         self,
         sd: Any,
         *,
-        devices: tuple[str | int, ...],
+        device: str | int,
         channels: int,
         requested_sample_rate_hz: int,
     ) -> int:
-        """Choose a supported input sample rate for all active capture devices."""
+        """Choose a supported input sample rate for one device."""
         candidate_rates: list[int] = [int(requested_sample_rate_hz)]
-        for device in devices:
-            device_info = sd.query_devices(device=device)
-            default_rate = int(round(float(device_info.get("default_samplerate", 0.0))))
-            if default_rate > 0:
-                candidate_rates.append(default_rate)
+        device_info = sd.query_devices(device=device)
+        default_rate = int(round(float(device_info.get("default_samplerate", 0.0))))
+        if default_rate > 0:
+            candidate_rates.append(default_rate)
         candidate_rates.extend([48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 8_000])
 
         deduped_candidates: list[int] = []
@@ -311,7 +318,7 @@ class LinuxAudioCaptureBackend:
             deduped_candidates.append(rate)
 
         for rate in deduped_candidates:
-            if self._sample_rate_supported_for_devices(sd, devices=devices, channels=channels, sample_rate_hz=rate):
+            if self._sample_rate_supported(sd, device=device, channels=channels, sample_rate_hz=rate):
                 return rate
 
         raise RuntimeError(
@@ -319,25 +326,24 @@ class LinuxAudioCaptureBackend:
             "Try specifying a different --mic-device (or --speaker-device for both-mode capture)."
         )
 
-    def _sample_rate_supported_for_devices(
+    def _sample_rate_supported(
         self,
         sd: Any,
         *,
-        devices: tuple[str | int, ...],
+        device: str | int,
         channels: int,
         sample_rate_hz: int,
     ) -> bool:
-        """Check whether an input sample rate is valid across all selected devices."""
-        for device in devices:
-            try:
-                sd.check_input_settings(
-                    device=device,
-                    channels=channels,
-                    dtype="int16",
-                    samplerate=float(sample_rate_hz),
-                )
-            except Exception:  # pragma: no cover - relies on backend-specific validation
-                return False
+        """Check whether an input sample rate is valid for one device."""
+        try:
+            sd.check_input_settings(
+                device=device,
+                channels=channels,
+                dtype="int16",
+                samplerate=float(sample_rate_hz),
+            )
+        except Exception:  # pragma: no cover - relies on backend-specific validation
+            return False
         return True
 
     def _resolve_active_stream_names(self, source_mode: AudioSourceMode) -> tuple[str, ...]:
@@ -488,15 +494,34 @@ class LinuxAudioCaptureBackend:
             )
         raise RuntimeError("No microphone input device found. Provide --mic-device explicitly.")
 
-    def build_stream(self, sd: Any, *, stream_key: str, stream_group: str, device: str | int) -> Any:
+    def build_stream(
+        self,
+        sd: Any,
+        *,
+        stream_key: str,
+        stream_group: str,
+        device: str | int,
+        sample_rate_hz: int,
+        frame_samples: int,
+    ) -> Any:
         """Build a ``sounddevice.RawInputStream`` for one source stream."""
 
         def callback(indata: bytes, frames: int, time_info: Any, status: Any) -> None:
             del frames, time_info, status
+            pcm16 = bytes(indata)
+            frame_sample_rate_hz = sample_rate_hz
+            if sample_rate_hz != self._sample_rate_hz and self.config is not None and self.config.channels == 1:
+                pcm16 = resample_pcm16_mono_linear(
+                    pcm16,
+                    source_rate_hz=sample_rate_hz,
+                    target_rate_hz=self._sample_rate_hz,
+                )
+                frame_sample_rate_hz = self._sample_rate_hz
             raw_frame = RawFrame(
                 stream=stream_group,  # type: ignore[arg-type]
-                mono_pcm16=bytes(indata),
+                mono_pcm16=pcm16,
                 captured_at_monotonic_ns=time.monotonic_ns(),
+                sample_rate_hz=frame_sample_rate_hz,
             )
             try:
                 self._queues[stream_key].put_nowait(raw_frame)
@@ -504,8 +529,8 @@ class LinuxAudioCaptureBackend:
                 self._dropped_callback_frames += 1
 
         return sd.RawInputStream(
-            samplerate=self._sample_rate_hz,
-            blocksize=self.frame_samples,
+            samplerate=sample_rate_hz,
+            blocksize=frame_samples,
             channels=self.config.channels,
             dtype="int16",
             device=device,
@@ -528,6 +553,7 @@ class LinuxAudioCaptureBackend:
             stream=stream,  # type: ignore[arg-type]
             mono_pcm16=pcm,
             captured_at_monotonic_ns=time.monotonic_ns() + drift_ns,
+            sample_rate_hz=self._sample_rate_hz,
         )
 
     @staticmethod
@@ -721,5 +747,7 @@ class LinuxAudioCaptureBackend:
         self._queues.clear()
         self._group_stream_keys.clear()
         self._resolved_devices.clear()
+        self._device_sample_rates_hz.clear()
+        self._device_frame_samples.clear()
         self._stream_quality_ema.clear()
         self._preferred_stream_key.clear()

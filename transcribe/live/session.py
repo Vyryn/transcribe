@@ -15,6 +15,7 @@ from io import BytesIO
 from pathlib import Path
 
 from transcribe.audio.backend_loader import open_audio_backend
+from transcribe.audio.resample import resample_pcm16_mono_linear
 from transcribe.models import AudioSourceMode, CaptureConfig
 from transcribe.runtime_defaults import DEFAULT_LIVE_TRANSCRIPTION_MODEL
 from transcribe.runtime_env import validate_transcription_model_for_runtime
@@ -156,48 +157,6 @@ def _trim_chunk_silence_pcm16(
     return pcm16[start_byte:end_byte]
 
 
-def _resample_pcm16_mono_linear(
-    pcm16: bytes,
-    *,
-    source_rate_hz: int,
-    target_rate_hz: int,
-) -> bytes:
-    """Resample mono PCM16 bytes to target sample rate via linear interpolation."""
-    if not pcm16 or source_rate_hz <= 0 or target_rate_hz <= 0 or source_rate_hz == target_rate_hz:
-        return pcm16
-
-    input_samples = [sample for (sample,) in struct.iter_unpack("<h", pcm16)]
-    input_count = len(input_samples)
-    if input_count <= 1:
-        return pcm16
-
-    # Fast-path integer downsample ratios (for example 48k -> 16k).
-    if source_rate_hz % target_rate_hz == 0:
-        step = source_rate_hz // target_rate_hz
-        if step > 1:
-            reduced = input_samples[::step]
-            return struct.pack(f"<{len(reduced)}h", *reduced)
-
-    output_count = max(1, int(round(input_count * (target_rate_hz / source_rate_hz))))
-    if output_count == input_count:
-        return pcm16
-
-    output = bytearray(output_count * 2)
-    position_scale = (input_count - 1) / max(1, output_count - 1)
-    for output_index in range(output_count):
-        source_position = output_index * position_scale
-        left_index = int(source_position)
-        right_index = min(left_index + 1, input_count - 1)
-        interpolation = source_position - left_index
-        sample_value = ((1.0 - interpolation) * input_samples[left_index]) + (interpolation * input_samples[right_index])
-        sample_int = int(round(sample_value))
-        if sample_int > 32_767:
-            sample_int = 32_767
-        elif sample_int < -32_768:
-            sample_int = -32_768
-        struct.pack_into("<h", output, output_index * 2, sample_int)
-    return bytes(output)
-
 
 def _prepare_pcm16_for_asr(
     pcm16: bytes,
@@ -220,7 +179,7 @@ def _prepare_pcm16_for_asr(
     if channels != 1:
         return prepared
 
-    return _resample_pcm16_mono_linear(
+    return resample_pcm16_mono_linear(
         prepared,
         source_rate_hz=capture_sample_rate_hz,
         target_rate_hz=target_sample_rate_hz,
@@ -614,6 +573,7 @@ def run_live_transcription_session(
     if transcription_sample_rate_hz <= 0:
         transcription_sample_rate_hz = int(capture_sample_rate_hz)
     resolved_capture_devices = dict(getattr(backend, "active_devices", {}))
+    device_sample_rates_hz = dict(getattr(backend, "device_sample_rates_hz", {}))
 
     _emit_progress(
         progress_callback,
@@ -626,6 +586,7 @@ def run_live_transcription_session(
             key: [str(device) for device in devices]
             for key, devices in resolved_capture_devices.items()
         },
+        device_sample_rates_hz={key: int(value) for key, value in device_sample_rates_hz.items()},
     )
     _emit_progress(
         progress_callback,
@@ -977,6 +938,7 @@ def run_live_transcription_session(
             key: [str(device) for device in devices]
             for key, devices in resolved_capture_devices.items()
         },
+        "device_sample_rates_hz": {key: int(value) for key, value in device_sample_rates_hz.items()},
         "source_selection_strategy": "chunk_clarity_v5_silence_catchup",
         "duration_sec_requested": config.duration_sec,
         "duration_sec_actual": session_elapsed_sec,
@@ -1013,4 +975,5 @@ def run_live_transcription_session(
         source_selection_counts=source_selection_counts,
         interrupted=interrupted,
     )
+
 
