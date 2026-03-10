@@ -252,7 +252,7 @@ Silent chunks are automatically detected and skipped (no ASR call) so the sessio
 can catch up during quiet periods.
 Chunks are trimmed for leading/trailing silence and resampled to the requested
 ASR rate (default `16 kHz`) before inference, even when capture hardware runs
-at `44.1/48 kHz`.
+at `44.1/48 kHz` or mixed rates across simultaneously selected devices.
 Final chunks now carry a short audio overlap into the next chunk by default
 (`--chunk-overlap-sec 0.75`) to reduce clipped words at phrase boundaries.
 
@@ -270,8 +270,7 @@ Outputs are written under `data/live_sessions/<session-id>/`:
 - `transcript.json` (session metadata + finalized segments)
 - `transcript.txt` (plain finalized transcript)
 
-The Linux capture backend now auto-negotiates a supported input sample rate and reports
-requested/effective values at session end.
+The Linux and Windows capture backends now auto-negotiate a supported input sample rate per selected device, normalize mixed-rate capture behind the scenes, and report requested/effective values at session end.
 
 If you want the larger quality-focused model instead, use:
 `uv run transcribe session run --model nvidia/canary-qwen-2.5b --duration-sec 0`.
@@ -485,6 +484,3 @@ Exit criteria:
 3. Add audit event schema, data classification fields, and PHI-safe logging guardrails.
 4. Continue benchmark regressions and validate `nvidia/canary-qwen-2.5b` + `nvidia/parakeet-tdt-0.6b-v3` on target hardware tiers.
 5. Implement local auth/session lock and encrypted persistence before any clinical pilot.
-
-
-
