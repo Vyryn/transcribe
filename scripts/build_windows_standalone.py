@@ -827,9 +827,9 @@ def _build_pyinstaller_command(
         "--hidden-import",
         "huggingface_hub.file_download",
         "--hidden-import",
-        "sounddevice",
+        "soundcard",
         "--collect-all",
-        "sounddevice",
+        "soundcard",
     ]
     if clean:
         command.append("--clean")
@@ -893,7 +893,7 @@ def _build_nuitka_command(
         "--include-module=transcribe.transcription_runtime",
         "--include-module=huggingface_hub",
         "--include-module=huggingface_hub.file_download",
-        "--include-module=sounddevice",
+        "--include-package=soundcard",
         "--noinclude-numba-mode=nofollow",
         "--module-parameter=numba-disable-jit=yes",
         "--noinclude-setuptools-mode=nofollow",
@@ -1669,3 +1669,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

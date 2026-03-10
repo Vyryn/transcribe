@@ -34,8 +34,8 @@ class _FakeSoundDevice:
             "default_samplerate": float(self._default_rates[int(device)]),
         }
 
-    def check_input_settings(self, *, device: int, channels: int, dtype: str, samplerate: float) -> None:
-        _ = (channels, dtype)
+    def check_input_settings(self, *, device: int, channels: int, dtype: str, samplerate: float, extra_settings=None) -> None:
+        _ = (channels, dtype, extra_settings)
         if int(round(samplerate)) not in self._supported_rates[int(device)]:
             raise ValueError("unsupported sample rate")
 
@@ -370,11 +370,173 @@ def test_build_stream_normalizes_frames_to_requested_rate() -> None:
         device=1,
         sample_rate_hz=48_000,
         frame_samples=960,
+        device_channels=2,
     )
-    pcm48 = struct.pack("<h", 1_200) * 960
+    interleaved_samples = []
+    for _ in range(960):
+        interleaved_samples.extend((1_000, -1_000))
+    pcm48 = struct.pack(f"<{len(interleaved_samples)}h", *interleaved_samples)
     stream.callback(pcm48, 960, None, None)
     frame = backend._queues["speakers:1"].get_nowait()
 
     assert frame.stream == "speakers"
     assert frame.sample_rate_hz == 16_000
     assert len(frame.mono_pcm16) == 320 * 2
+
+
+def test_build_stream_selects_loudest_mic_channel_when_downmixing() -> None:
+    class _FakeStream:
+        def __init__(self, **kwargs) -> None:
+            self.callback = kwargs["callback"]
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class _SoundDevice:
+        @staticmethod
+        def RawInputStream(**kwargs):
+            return _FakeStream(**kwargs)
+
+    backend = LinuxAudioCaptureBackend(use_fixture=False)
+    backend.config = CaptureConfig(sample_rate_hz=16_000, frame_ms=20, channels=1)
+    backend._sample_rate_hz = 16_000
+    backend.frame_samples = 320
+    backend._queues = {"mic:1": queue.Queue(maxsize=4)}
+
+    stream = backend.build_stream(
+        _SoundDevice(),
+        stream_key="mic:1",
+        stream_group="mic",
+        device=1,
+        sample_rate_hz=16_000,
+        frame_samples=320,
+        device_channels=2,
+    )
+    interleaved_samples = []
+    for _ in range(320):
+        interleaved_samples.extend((200, 4000))
+    stream.callback(struct.pack(f"<{len(interleaved_samples)}h", *interleaved_samples), 320, None, None)
+    frame = backend._queues["mic:1"].get_nowait()
+    mono_samples = [sample for (sample,) in struct.iter_unpack("<h", frame.mono_pcm16)]
+
+    assert frame.sample_rate_hz == 16_000
+    assert mono_samples
+    assert max(abs(sample) for sample in mono_samples) == 4_000
+
+
+
+def test_open_continues_when_one_candidate_device_fails_to_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    import transcribe.audio.linux_capture as linux_capture_module
+
+    class _FakeStream:
+        def __init__(self, **kwargs) -> None:
+            self.callback = kwargs["callback"]
+            self.active = True
+            self.stopped = False
+            self.closed = False
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _FailingOpenSoundDevice(_FakeSoundDevice):
+        def __init__(self) -> None:
+            super().__init__(default_rates={0: 16_000, 1: 16_000}, supported_rates={0: {16_000}, 1: {16_000}})
+
+        def query_devices(self, device: int | None = None):
+            if device is None:
+                return [
+                    {"name": "Microphone 0", "max_input_channels": 1, "default_samplerate": 16_000.0},
+                    {"name": "Microphone 1", "max_input_channels": 1, "default_samplerate": 16_000.0},
+                ]
+            return super().query_devices(device=device)
+
+        def RawInputStream(self, **kwargs):
+            if kwargs.get("device") == 0:
+                raise RuntimeError("device busy")
+            return _FakeStream(**kwargs)
+
+    sd = _FailingOpenSoundDevice()
+    monkeypatch.setattr(linux_capture_module, 'load_sounddevice', lambda: sd)
+
+    backend = LinuxAudioCaptureBackend(use_fixture=False)
+    backend.open(
+        CaptureConfig(
+            sample_rate_hz=16_000,
+            frame_ms=20,
+            channels=1,
+            source_mode=AudioSourceMode.MIC,
+            capture_all_mic_devices=True,
+            allow_missing_sources=True,
+        )
+    )
+
+    assert backend.active_devices == {"mic": (1,)}
+    assert backend.device_sample_rates_hz == {"mic:1": 16_000}
+
+
+
+def test_open_continues_when_candidate_stream_start_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    import transcribe.audio.linux_capture as linux_capture_module
+
+    class _FakeStream:
+        def __init__(self, *, device: int, **kwargs) -> None:
+            _ = kwargs
+            self.device = device
+            self.active = True
+            self.stopped = False
+            self.closed = False
+
+        def start(self) -> None:
+            if self.device == 0:
+                raise RuntimeError("wdm-ks start failed")
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _StartFailSoundDevice(_FakeSoundDevice):
+        def __init__(self) -> None:
+            super().__init__(default_rates={0: 16_000, 1: 16_000}, supported_rates={0: {16_000}, 1: {16_000}})
+
+        def query_devices(self, device: int | None = None):
+            if device is None:
+                return [
+                    {"name": "Microphone 0", "max_input_channels": 1, "default_samplerate": 16_000.0},
+                    {"name": "Microphone 1", "max_input_channels": 1, "default_samplerate": 16_000.0},
+                ]
+            return super().query_devices(device=device)
+
+        def RawInputStream(self, **kwargs):
+            return _FakeStream(**kwargs)
+
+    sd = _StartFailSoundDevice()
+    monkeypatch.setattr(linux_capture_module, 'load_sounddevice', lambda: sd)
+
+    backend = LinuxAudioCaptureBackend(use_fixture=False)
+    backend.open(
+        CaptureConfig(
+            sample_rate_hz=16_000,
+            frame_ms=20,
+            channels=1,
+            source_mode=AudioSourceMode.MIC,
+            capture_all_mic_devices=True,
+            allow_missing_sources=True,
+        )
+    )
+
+    assert backend.active_devices == {"mic": (1,)}
+    assert backend.device_sample_rates_hz == {"mic:1": 16_000}
