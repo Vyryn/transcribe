@@ -228,7 +228,8 @@ def test_live_session_uses_requested_sample_rate_for_asr_payload(monkeypatch, tm
     class FakeBackend:
         def __init__(self, *, use_fixture: bool = False) -> None:
             _ = use_fixture
-            self.sample_rate_hz = 48_000
+            self.sample_rate_hz = 16_000
+            self.device_sample_rates_hz = {"mic:fixture": 48_000}
             self._closed = False
 
         def open(self, config) -> None:
@@ -244,6 +245,7 @@ def test_live_session_uses_requested_sample_rate_for_asr_payload(monkeypatch, tm
                     stream="mic",
                     mono_pcm16=voiced_frame,
                     captured_at_monotonic_ns=time.monotonic_ns(),
+                    sample_rate_hz=self.sample_rate_hz,
                 )
             }
 
@@ -274,8 +276,9 @@ def test_live_session_uses_requested_sample_rate_for_asr_payload(monkeypatch, tm
     payload = json.loads(result.transcript_json_path.read_text(encoding="utf-8"))
 
     assert result.sample_rate_hz_requested == 16_000
-    assert result.sample_rate_hz == 48_000
+    assert result.sample_rate_hz == 16_000
     assert payload["transcription_sample_rate_hz"] == 16_000
+    assert payload["device_sample_rates_hz"] == {"mic:fixture": 48_000}
     assert observed_rates
     assert all(rate == 16_000 for rate in observed_rates)
 
@@ -306,11 +309,13 @@ def test_live_session_selects_best_source_and_tracks_source_usage(monkeypatch, t
                     stream="mic",
                     mono_pcm16=quiet_frame,
                     captured_at_monotonic_ns=time.monotonic_ns(),
+                    sample_rate_hz=self.sample_rate_hz,
                 ),
                 "speakers": RawFrame(
                     stream="speakers",
                     mono_pcm16=loud_frame,
                     captured_at_monotonic_ns=time.monotonic_ns(),
+                    sample_rate_hz=self.sample_rate_hz,
                 ),
             }
 
@@ -373,11 +378,13 @@ def test_live_session_capture_coverage_ratio_stays_reasonable(monkeypatch, tmp_p
                     stream="mic",
                     mono_pcm16=frame_pcm,
                     captured_at_monotonic_ns=now_ns,
+                    sample_rate_hz=self.sample_rate_hz,
                 ),
                 "speakers": RawFrame(
                     stream="speakers",
                     mono_pcm16=frame_pcm,
                     captured_at_monotonic_ns=now_ns,
+                    sample_rate_hz=self.sample_rate_hz,
                 ),
             }
 
@@ -461,6 +468,7 @@ def test_live_session_skips_asr_for_silent_chunks(monkeypatch, tmp_path) -> None
                     stream="mic",
                     mono_pcm16=silent_pcm,
                     captured_at_monotonic_ns=time.monotonic_ns(),
+                    sample_rate_hz=self.sample_rate_hz,
                 )
             }
 
@@ -637,6 +645,7 @@ def test_run_live_transcription_session_can_disable_stitching(monkeypatch, tmp_p
                     stream="mic",
                     mono_pcm16=voiced_frame,
                     captured_at_monotonic_ns=time.monotonic_ns(),
+                    sample_rate_hz=self.sample_rate_hz,
                 )
             }
 
@@ -721,9 +730,10 @@ def test_run_session_prints_crisp_feedback_by_default(monkeypatch, tmp_path, cap
             "capture_ready",
             {
                 "requested_sample_rate_hz": 16_000,
-                "capture_sample_rate_hz": 48_000,
+                "capture_sample_rate_hz": 16_000,
                 "transcription_sample_rate_hz": 16_000,
                 "resolved_capture_devices": {"mic": ["2"], "speakers": ["5"]},
+                "device_sample_rates_hz": {"mic:2": 16_000, "speakers:5": 48_000},
             },
         )
         progress_callback("transcribing_started", {"duration_sec": 0.0})
@@ -735,7 +745,7 @@ def test_run_session_prints_crisp_feedback_by_default(monkeypatch, tmp_path, cap
             transcript_txt_path=Path(tmp_path) / "live-test" / "transcript.txt",
             final_segment_count=1,
             partial_event_count=0,
-            sample_rate_hz=48_000,
+            sample_rate_hz=16_000,
             sample_rate_hz_requested=16_000,
             total_audio_sec=4.0,
             total_inference_sec=0.2,

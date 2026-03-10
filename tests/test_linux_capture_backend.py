@@ -46,7 +46,7 @@ def test_negotiate_sample_rate_prefers_requested_rate() -> None:
 
     resolved = backend.negotiate_sample_rate(
         sd,
-        devices=(0,),
+        device=0,
         channels=1,
         requested_sample_rate_hz=16_000,
     )
@@ -60,7 +60,7 @@ def test_negotiate_sample_rate_falls_back_to_device_default() -> None:
 
     resolved = backend.negotiate_sample_rate(
         sd,
-        devices=(0,),
+        device=0,
         channels=1,
         requested_sample_rate_hz=16_000,
     )
@@ -75,7 +75,7 @@ def test_negotiate_sample_rate_raises_when_no_candidate_supported() -> None:
     with pytest.raises(RuntimeError, match="No supported sample rate found"):
         backend.negotiate_sample_rate(
             sd,
-            devices=(0,),
+            device=0,
             channels=1,
             requested_sample_rate_hz=16_000,
         )
@@ -207,10 +207,10 @@ def test_read_frames_selects_clearest_frame_per_group() -> None:
     quiet = struct.pack("<h", 500) * 320
     loud = struct.pack("<h", 5_000) * 320
     backend._queues["mic:0"].put(
-        RawFrame(stream="mic", mono_pcm16=quiet, captured_at_monotonic_ns=time.monotonic_ns())
+        RawFrame(stream="mic", mono_pcm16=quiet, captured_at_monotonic_ns=time.monotonic_ns(), sample_rate_hz=16_000)
     )
     backend._queues["mic:1"].put(
-        RawFrame(stream="mic", mono_pcm16=loud, captured_at_monotonic_ns=time.monotonic_ns())
+        RawFrame(stream="mic", mono_pcm16=loud, captured_at_monotonic_ns=time.monotonic_ns(), sample_rate_hz=16_000)
     )
 
     frames = backend.read_frames(timeout_ms=20)
@@ -231,7 +231,7 @@ def test_read_frames_falls_back_when_preferred_stream_stalls() -> None:
 
     loud = struct.pack("<h", 5_000) * 320
     backend._queues["mic:1"].put(
-        RawFrame(stream="mic", mono_pcm16=loud, captured_at_monotonic_ns=time.monotonic_ns())
+        RawFrame(stream="mic", mono_pcm16=loud, captured_at_monotonic_ns=time.monotonic_ns(), sample_rate_hz=16_000)
     )
 
     frames = backend.read_frames(timeout_ms=20)
@@ -263,6 +263,7 @@ def test_read_frames_recovers_after_repeated_timeout(monkeypatch: pytest.MonkeyP
         stream="mic",
         mono_pcm16=struct.pack("<h", 4_000) * 320,
         captured_at_monotonic_ns=time.monotonic_ns(),
+        sample_rate_hz=16_000,
     )
     reopened = {"count": 0}
 
@@ -285,3 +286,95 @@ def test_read_frames_recovers_after_repeated_timeout(monkeypatch: pytest.MonkeyP
 
     assert reopened["count"] == 1
     assert frames["mic"] == recovered_frame
+
+
+
+def test_open_supports_mixed_device_sample_rates(monkeypatch: pytest.MonkeyPatch) -> None:
+    import transcribe.audio.linux_capture as linux_capture_module
+
+    class _FakeStream:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.callback = kwargs["callback"]
+            self.active = True
+            self.stopped = False
+            self.closed = False
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _OpenSoundDevice(_FakeSoundDevice):
+        def __init__(self) -> None:
+            super().__init__(default_rates={0: 16_000, 1: 48_000}, supported_rates={0: {16_000}, 1: {48_000}})
+            self.streams: list[_FakeStream] = []
+
+        def RawInputStream(self, **kwargs):
+            stream = _FakeStream(**kwargs)
+            self.streams.append(stream)
+            return stream
+
+    sd = _OpenSoundDevice()
+    monkeypatch.setattr(linux_capture_module, 'load_sounddevice', lambda: sd)
+
+    backend = LinuxAudioCaptureBackend(use_fixture=False)
+    backend.open(
+        CaptureConfig(
+            sample_rate_hz=16_000,
+            frame_ms=20,
+            channels=1,
+            source_mode=AudioSourceMode.BOTH,
+            mic_device=0,
+            speaker_device=1,
+        )
+    )
+
+    assert backend.sample_rate_hz == 16_000
+    assert backend.device_sample_rates_hz == {"mic:0": 16_000, "speakers:1": 48_000}
+
+
+def test_build_stream_normalizes_frames_to_requested_rate() -> None:
+    class _FakeStream:
+        def __init__(self, **kwargs) -> None:
+            self.callback = kwargs["callback"]
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class _SoundDevice:
+        @staticmethod
+        def RawInputStream(**kwargs):
+            return _FakeStream(**kwargs)
+
+    backend = LinuxAudioCaptureBackend(use_fixture=False)
+    backend.config = CaptureConfig(sample_rate_hz=16_000, frame_ms=20, channels=1)
+    backend._sample_rate_hz = 16_000
+    backend.frame_samples = 320
+    backend._queues = {"speakers:1": queue.Queue(maxsize=4)}
+
+    stream = backend.build_stream(
+        _SoundDevice(),
+        stream_key="speakers:1",
+        stream_group="speakers",
+        device=1,
+        sample_rate_hz=48_000,
+        frame_samples=960,
+    )
+    pcm48 = struct.pack("<h", 1_200) * 960
+    stream.callback(pcm48, 960, None, None)
+    frame = backend._queues["speakers:1"].get_nowait()
+
+    assert frame.stream == "speakers"
+    assert frame.sample_rate_hz == 16_000
+    assert len(frame.mono_pcm16) == 320 * 2

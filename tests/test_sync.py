@@ -6,8 +6,8 @@ from transcribe.audio.sync import SyncAccumulator, build_captured_pair, record_p
 
 def test_build_captured_pair_and_stats() -> None:
     raw = {
-        "mic": RawFrame(stream="mic", mono_pcm16=b"\\x00\\x00", captured_at_monotonic_ns=10),
-        "speakers": RawFrame(stream="speakers", mono_pcm16=b"\\x00\\x00", captured_at_monotonic_ns=30),
+        "mic": RawFrame(stream="mic", mono_pcm16=b"\\x00\\x00", captured_at_monotonic_ns=10, sample_rate_hz=16_000),
+        "speakers": RawFrame(stream="speakers", mono_pcm16=b"\\x00\\x00", captured_at_monotonic_ns=30, sample_rate_hz=16_000),
     }
     mic_frame, speakers_frame, drift_ns = build_captured_pair(raw, frame_index=2)
 
@@ -21,3 +21,4 @@ def test_build_captured_pair_and_stats() -> None:
     assert summary["pair_count"] == 1
     assert summary["drift_ns_max"] == 20
     assert summary["callback_to_write_latency_ms_p50"] == 2.0
+
