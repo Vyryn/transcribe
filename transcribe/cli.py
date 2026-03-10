@@ -138,6 +138,10 @@ def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str,
                     f"{capture_rate_hz} Hz capture (requested {requested_rate_hz} Hz), "
                     f"{asr_rate_hz} Hz ASR"
                 )
+            if debug:
+                device_channels = fields.get("device_channels")
+                if isinstance(device_channels, dict) and device_channels:
+                    print(f"Device channels: {device_channels}")
             return
         if event == "transcribing_started":
             if float(fields.get("duration_sec", 0.0)) > 0:
@@ -517,9 +521,18 @@ def run_devices(args: argparse.Namespace) -> int:
         return 0
 
     for device in devices:
+        suffix = ""
+        hostapi_name = str(device.get("hostapi_name", "")).strip() if isinstance(device, dict) else ""
+        if hostapi_name:
+            suffix = f" hostapi={hostapi_name}"
+        default_sr_value = device.get("default_samplerate", 0.0) if isinstance(device, dict) else 0.0
+        default_sr = "unknown"
+        if isinstance(default_sr_value, (int, float)) and float(default_sr_value) > 0:
+            default_sr = str(default_sr_value)
         print(
             f"[{device['index']}] {device['name']} "
-            f"inputs={device['max_input_channels']} default_sr={device['default_samplerate']}"
+            f"inputs={device['max_input_channels']} default_sr={default_sr}"
+            f"{suffix}"
         )
     return 0
 
@@ -849,5 +862,6 @@ def main(argv: list[str] | None = None, *, packaged_runtime: bool = False) -> in
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 

@@ -122,6 +122,36 @@ def _pcm16_to_wav_bytes(*, pcm16_bytes: bytes, sample_rate_hz: int, channels: in
         return buffer.getvalue()
 
 
+def _normalize_pcm16_mono_level(
+    pcm16: bytes,
+    *,
+    min_peak_abs: int = 32,
+    target_peak_abs: int = 9_000,
+    max_gain: float = 24.0,
+) -> bytes:
+    """Apply a bounded gain boost so quiet speech still reaches ASR."""
+    if not pcm16:
+        return b""
+
+    samples = [sample for (sample,) in struct.iter_unpack("<h", pcm16)]
+    if not samples:
+        return b""
+
+    peak_abs = max(abs(sample) for sample in samples)
+    if peak_abs < min_peak_abs or peak_abs >= target_peak_abs:
+        return pcm16
+
+    gain = min(max_gain, target_peak_abs / max(peak_abs, 1))
+    if gain <= 1.0:
+        return pcm16
+
+    normalized = [
+        max(-32_768, min(32_767, int(round(sample * gain))))
+        for sample in samples
+    ]
+    return struct.pack(f"<{len(normalized)}h", *normalized)
+
+
 def _trim_chunk_silence_pcm16(
     pcm16: bytes,
     *,
@@ -169,8 +199,9 @@ def _prepare_pcm16_for_asr(
     if not pcm16:
         return b""
 
+    normalized = _normalize_pcm16_mono_level(pcm16)
     prepared = _trim_chunk_silence_pcm16(
-        pcm16,
+        normalized,
         sample_rate_hz=capture_sample_rate_hz,
     )
     if not prepared:
@@ -480,13 +511,14 @@ def _should_skip_asr_for_chunk(
     recent_empty_streak: int = 0,
 ) -> bool:
     """Decide whether a chunk is silence/noise-only and safe to skip for catch-up."""
-    sample_count = len(selected_pcm16) // 2
+    normalized_pcm16 = _normalize_pcm16_mono_level(selected_pcm16)
+    sample_count = len(normalized_pcm16) // 2
     if sample_count <= 0:
         return True
 
     sum_sq = 0.0
     active_count = 0
-    for (sample,) in struct.iter_unpack("<h", selected_pcm16):
+    for (sample,) in struct.iter_unpack("<h", normalized_pcm16):
         sum_sq += float(sample * sample)
         if abs(sample) >= 700:
             active_count += 1
@@ -574,6 +606,7 @@ def run_live_transcription_session(
         transcription_sample_rate_hz = int(capture_sample_rate_hz)
     resolved_capture_devices = dict(getattr(backend, "active_devices", {}))
     device_sample_rates_hz = dict(getattr(backend, "device_sample_rates_hz", {}))
+    device_channels = dict(getattr(backend, "device_channels", {}))
 
     _emit_progress(
         progress_callback,
@@ -587,6 +620,7 @@ def run_live_transcription_session(
             for key, devices in resolved_capture_devices.items()
         },
         device_sample_rates_hz={key: int(value) for key, value in device_sample_rates_hz.items()},
+        device_channels={key: int(value) for key, value in device_channels.items()},
     )
     _emit_progress(
         progress_callback,
@@ -939,6 +973,7 @@ def run_live_transcription_session(
             for key, devices in resolved_capture_devices.items()
         },
         "device_sample_rates_hz": {key: int(value) for key, value in device_sample_rates_hz.items()},
+        "device_channels": {key: int(value) for key, value in device_channels.items()},
         "source_selection_strategy": "chunk_clarity_v5_silence_catchup",
         "duration_sec_requested": config.duration_sec,
         "duration_sec_actual": session_elapsed_sec,

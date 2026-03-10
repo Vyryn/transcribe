@@ -140,6 +140,7 @@ class LinuxAudioCaptureBackend:
         self._resolved_devices: dict[str, tuple[str | int, ...]] = {}
         self._device_sample_rates_hz: dict[str, int] = {}
         self._device_frame_samples: dict[str, int] = {}
+        self._device_channels: dict[str, int] = {}
         self._stream_quality_ema: dict[str, float] = {}
         self._preferred_stream_key: dict[str, str] = {}
         self._sample_rate_hz = 0
@@ -175,6 +176,11 @@ class LinuxAudioCaptureBackend:
     def device_sample_rates_hz(self) -> dict[str, int]:
         """Return negotiated hardware sample rates keyed by stream key."""
         return dict(self._device_sample_rates_hz)
+
+    @property
+    def device_channels(self) -> dict[str, int]:
+        """Return opened device channel counts keyed by stream key."""
+        return dict(self._device_channels)
 
     def list_devices(self) -> list[dict[str, object]]:
         """List available Linux audio input devices.
@@ -218,6 +224,7 @@ class LinuxAudioCaptureBackend:
         self._resolved_devices = {name: () for name in self._active_stream_names}
         self._device_sample_rates_hz = {}
         self._device_frame_samples = {}
+        self._device_channels = {}
         self._stream_quality_ema = {}
         self._preferred_stream_key = {}
         self._streams.clear()
@@ -261,37 +268,64 @@ class LinuxAudioCaptureBackend:
         if not self._active_stream_names:
             raise RuntimeError("No capture devices resolved for active source mode.")
 
-        self._resolved_devices = {name: tuple(resolved_devices[name]) for name in self._active_stream_names}
-
+        opened_devices: dict[str, list[str | int]] = {}
+        surviving_stream_names: list[str] = []
         for stream_name in self._active_stream_names:
             stream_keys: list[str] = []
+            opened_stream_devices: list[str | int] = []
+            last_open_error: Exception | None = None
             for device in resolved_devices[stream_name]:
                 stream_key = f"{stream_name}:{device}"
-                device_sample_rate_hz = self.negotiate_sample_rate(
-                    sd,
-                    device=device,
-                    channels=config.channels,
-                    requested_sample_rate_hz=config.sample_rate_hz,
-                )
-                frame_samples = int((device_sample_rate_hz * config.frame_ms) / 1000)
-                if frame_samples <= 0:
-                    raise ValueError("frame_ms and sample_rate_hz produced 0 samples per frame")
+                self._queues[stream_key] = queue.Queue(maxsize=self._queue_max_frames)
+                try:
+                    stream, device_sample_rate_hz, frame_samples, device_channels = self._open_stream_with_fallback(
+                        sd,
+                        stream_key=stream_key,
+                        stream_group=stream_name,
+                        device=device,
+                        channels=config.channels,
+                        requested_sample_rate_hz=config.sample_rate_hz,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._queues.pop(stream_key, None)
+                    last_open_error = exc if isinstance(exc, Exception) else Exception(str(exc))
+                    LOGGER.warning(
+                        "Skipping %s capture device %r because it could not be opened: %s",
+                        stream_name,
+                        device,
+                        exc,
+                    )
+                    continue
                 self._device_sample_rates_hz[stream_key] = device_sample_rate_hz
                 self._device_frame_samples[stream_key] = frame_samples
-                self._queues[stream_key] = queue.Queue(maxsize=self._queue_max_frames)
-                self._streams[stream_key] = self.build_stream(
-                    sd,
-                    stream_key=stream_key,
-                    stream_group=stream_name,
-                    device=device,
-                    sample_rate_hz=device_sample_rate_hz,
-                    frame_samples=frame_samples,
-                )
+                self._device_channels[stream_key] = device_channels
+                self._streams[stream_key] = stream
                 stream_keys.append(stream_key)
-            self._group_stream_keys[stream_name] = tuple(stream_keys)
+                opened_stream_devices.append(device)
+            if stream_keys:
+                self._group_stream_keys[stream_name] = tuple(stream_keys)
+                opened_devices[stream_name] = opened_stream_devices
+                surviving_stream_names.append(stream_name)
+                continue
 
-        for stream in self._streams.values():
-            stream.start()
+            configured_device = config.mic_device if stream_name == "mic" else config.speaker_device
+            if configured_device is not None or not config.allow_missing_sources:
+                if last_open_error is not None:
+                    raise RuntimeError(
+                        f"Failed to open {stream_name} capture device(s): {last_open_error}"
+                    ) from last_open_error
+                if stream_name == "speakers":
+                    raise RuntimeError("No speaker playback/loopback input device found. Provide --speaker-device explicitly.")
+                raise RuntimeError("No microphone input device found. Provide --mic-device explicitly.")
+
+            LOGGER.warning("No %s capture streams could be opened; continuing without that source.", stream_name)
+
+        self._active_stream_names = tuple(surviving_stream_names)
+        if not self._active_stream_names:
+            raise RuntimeError("No capture devices could be opened for active source mode.")
+
+        self._resolved_devices = {name: tuple(opened_devices[name]) for name in self._active_stream_names}
+
 
     def negotiate_sample_rate(
         self,
@@ -326,6 +360,97 @@ class LinuxAudioCaptureBackend:
             "Try specifying a different --mic-device (or --speaker-device for both-mode capture)."
         )
 
+    def _candidate_sample_rates(
+        self,
+        sd: Any,
+        *,
+        device: str | int,
+        requested_sample_rate_hz: int,
+    ) -> list[int]:
+        """Return candidate sample rates for one device in preference order."""
+        candidate_rates: list[int] = [int(requested_sample_rate_hz)]
+        device_info = sd.query_devices(device=device)
+        default_rate = int(round(float(device_info.get("default_samplerate", 0.0))))
+        if default_rate > 0:
+            candidate_rates.append(default_rate)
+        candidate_rates.extend([48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 8_000])
+
+        deduped_candidates: list[int] = []
+        seen: set[int] = set()
+        for rate in candidate_rates:
+            if rate <= 0 or rate in seen:
+                continue
+            seen.add(rate)
+            deduped_candidates.append(rate)
+        return deduped_candidates
+
+    def _open_stream_with_fallback(
+        self,
+        sd: Any,
+        *,
+        stream_key: str,
+        stream_group: str,
+        device: str | int,
+        channels: int,
+        requested_sample_rate_hz: int,
+    ) -> tuple[Any, int, int, int]:
+        """Open one stream, retrying alternative channel/rate combinations when needed."""
+        last_error: Exception | None = None
+        for candidate_channels in self._candidate_channel_counts(
+            sd,
+            device=device,
+            requested_channels=channels,
+            stream_group=stream_group,
+        ):
+            for candidate_rate_hz in self._candidate_sample_rates(
+                sd,
+                device=device,
+                requested_sample_rate_hz=requested_sample_rate_hz,
+            ):
+                if not self._sample_rate_supported(
+                    sd,
+                    device=device,
+                    channels=candidate_channels,
+                    sample_rate_hz=candidate_rate_hz,
+                    stream_group=stream_group,
+                ):
+                    continue
+                frame_samples = int((candidate_rate_hz * self.config.frame_ms) / 1000) if self.config is not None else 0
+                if frame_samples <= 0:
+                    continue
+                stream = None
+                try:
+                    stream = self.build_stream(
+                        sd,
+                        stream_key=stream_key,
+                        stream_group=stream_group,
+                        device=device,
+                        sample_rate_hz=candidate_rate_hz,
+                        frame_samples=frame_samples,
+                        device_channels=candidate_channels,
+                    )
+                    stream.start()
+                except Exception as exc:  # noqa: BLE001
+                    if stream is not None:
+                        try:
+                            stream.stop()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        try:
+                            stream.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    last_error = exc if isinstance(exc, Exception) else Exception(str(exc))
+                    continue
+                return stream, candidate_rate_hz, frame_samples, candidate_channels
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(
+            "No supported sample rate found for selected input device(s). "
+            "Try specifying a different --mic-device (or --speaker-device for both-mode capture)."
+        )
+
     def _sample_rate_supported(
         self,
         sd: Any,
@@ -333,6 +458,7 @@ class LinuxAudioCaptureBackend:
         device: str | int,
         channels: int,
         sample_rate_hz: int,
+        stream_group: str | None = None,
     ) -> bool:
         """Check whether an input sample rate is valid for one device."""
         try:
@@ -341,10 +467,69 @@ class LinuxAudioCaptureBackend:
                 channels=channels,
                 dtype="int16",
                 samplerate=float(sample_rate_hz),
+                extra_settings=self._stream_extra_settings(sd, stream_group=stream_group, device=device),
             )
         except Exception:  # pragma: no cover - relies on backend-specific validation
             return False
         return True
+
+    def _stream_extra_settings(
+        self,
+        sd: Any,
+        *,
+        stream_group: str | None,
+        device: str | int,
+    ) -> Any | None:
+        """Return backend-specific extra stream settings, if any."""
+        _ = (sd, stream_group, device)
+        return None
+
+    def _candidate_channel_counts(
+        self,
+        sd: Any,
+        *,
+        device: str | int,
+        requested_channels: int,
+        stream_group: str | None,
+    ) -> list[int]:
+        """Return candidate input channel counts for one device."""
+        _ = (sd, device, stream_group)
+        return [max(1, int(requested_channels))]
+
+    @staticmethod
+    def _pcm16_frames_by_channel(pcm16: bytes, *, channels: int) -> list[tuple[int, ...]]:
+        """Decode interleaved PCM16 bytes into per-frame channel tuples."""
+        if channels <= 1:
+            return [(sample,) for (sample,) in struct.iter_unpack("<h", pcm16)]
+        return list(struct.iter_unpack(f"<{channels}h", pcm16))
+
+    @classmethod
+    def _convert_interleaved_pcm16_to_mono(
+        cls,
+        pcm16: bytes,
+        *,
+        channels: int,
+        stream_group: str,
+    ) -> bytes:
+        """Convert interleaved PCM16 into mono for downstream processing."""
+        if channels <= 1 or not pcm16:
+            return pcm16
+
+        frames = cls._pcm16_frames_by_channel(pcm16, channels=channels)
+        if not frames:
+            return b""
+
+        if stream_group == "mic":
+            energy_by_channel = [0.0] * channels
+            for frame in frames:
+                for channel_index, sample in enumerate(frame):
+                    energy_by_channel[channel_index] += float(sample * sample)
+            selected_channel = max(range(channels), key=lambda index: energy_by_channel[index])
+            mono_samples = [frame[selected_channel] for frame in frames]
+        else:
+            mono_samples = [int(round(sum(frame) / channels)) for frame in frames]
+
+        return struct.pack(f"<{len(mono_samples)}h", *mono_samples)
 
     def _resolve_active_stream_names(self, source_mode: AudioSourceMode) -> tuple[str, ...]:
         """Resolve active stream list for the selected capture mode."""
@@ -503,6 +688,7 @@ class LinuxAudioCaptureBackend:
         device: str | int,
         sample_rate_hz: int,
         frame_samples: int,
+        device_channels: int,
     ) -> Any:
         """Build a ``sounddevice.RawInputStream`` for one source stream."""
 
@@ -510,6 +696,12 @@ class LinuxAudioCaptureBackend:
             del frames, time_info, status
             pcm16 = bytes(indata)
             frame_sample_rate_hz = sample_rate_hz
+            if device_channels > 1:
+                pcm16 = self._convert_interleaved_pcm16_to_mono(
+                    pcm16,
+                    channels=device_channels,
+                    stream_group=stream_group,
+                )
             if sample_rate_hz != self._sample_rate_hz and self.config is not None and self.config.channels == 1:
                 pcm16 = resample_pcm16_mono_linear(
                     pcm16,
@@ -531,10 +723,11 @@ class LinuxAudioCaptureBackend:
         return sd.RawInputStream(
             samplerate=sample_rate_hz,
             blocksize=frame_samples,
-            channels=self.config.channels,
+            channels=device_channels,
             dtype="int16",
             device=device,
             callback=callback,
+            extra_settings=self._stream_extra_settings(sd, stream_group=stream_group, device=device),
         )
 
     def fixture_frame(self, *, stream: str, frequency_hz: float, drift_ns: int = 0) -> RawFrame:
@@ -749,5 +942,6 @@ class LinuxAudioCaptureBackend:
         self._resolved_devices.clear()
         self._device_sample_rates_hz.clear()
         self._device_frame_samples.clear()
+        self._device_channels.clear()
         self._stream_quality_ema.clear()
         self._preferred_stream_key.clear()
