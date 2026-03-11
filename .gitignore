@@ -11,4 +11,6 @@ wheels/
 .venv
 
 # Project files
-#data/benchmarks/
+data/benchmarks/
+data/live_sessions/
+data/ui-preferences.json
