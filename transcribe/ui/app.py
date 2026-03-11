@@ -39,6 +39,7 @@ from transcribe.ui.types import (
 
 MAX_LOG_LINES = 2_000
 POLL_INTERVAL_MS = 75
+LOG_LEVEL_OPTIONS = ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')
 
 
 @dataclass(slots=True)
@@ -67,6 +68,8 @@ class BasePage(ttk.Frame):
     def set_devices(self, devices: tuple[DeviceInfo, ...]) -> None:
         """Update audio-device widgets when the device list changes."""
 
+    def set_advanced_mode(self, advanced: bool) -> None:
+        """Show or hide advanced controls for this page."""
 
 class LogsPage(BasePage):
     """Global application log viewer."""
@@ -104,19 +107,19 @@ class SessionPage(BasePage):
 
         self.transcription_model_var = tk.StringVar(value=services.DEFAULT_LIVE_TRANSCRIPTION_MODEL)
         self.duration_var = tk.StringVar(value="0")
-        self.chunk_overlap_var = tk.StringVar(value="0.75")
-        self.stitch_overlap_var = tk.BooleanVar(value=True)
-        self.mode_var = tk.StringVar(value=AudioSourceMode.BOTH.value)
         self.chunk_var = tk.StringVar(value="4.0")
-        self.partial_interval_var = tk.StringVar(value="0.0")
+        self.mode_var = tk.StringVar(value=AudioSourceMode.BOTH.value)
         self.output_root_var = tk.StringVar(value=str(default_data_subdir("live_sessions")))
         self.session_id_var = tk.StringVar(value="")
         self.mic_device_var = tk.StringVar(value="Auto")
         self.speaker_device_var = tk.StringVar(value="Auto")
+        self.partial_interval_var = tk.StringVar(value="0.0")
+        self.chunk_overlap_var = tk.StringVar(value="0.75")
+        self.max_model_ram_var = tk.StringVar(value="8.0")
+        self.stitch_overlap_var = tk.BooleanVar(value=True)
         self.single_device_var = tk.BooleanVar(value=False)
         self.strict_sources_var = tk.BooleanVar(value=False)
         self.fixture_var = tk.BooleanVar(value=False)
-        self.max_model_ram_var = tk.StringVar(value="8.0")
         self.notes_enabled_var = tk.BooleanVar(value=True)
         self.notes_model_var = tk.StringVar(value=services.DEFAULT_SESSION_NOTES_MODEL)
         self.notes_runtime_var = tk.StringVar(value=services.DEFAULT_NOTES_RUNTIME)
@@ -126,81 +129,121 @@ class SessionPage(BasePage):
         self.transcript_path_var = tk.StringVar(value="")
         self.notes_path_var = tk.StringVar(value="")
         self.device_labels: tuple[str, ...] = ("Auto",)
+        self.advanced_visible = False
 
         controls = ttk.LabelFrame(self, text="Live Session")
         controls.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
-        for index in range(6):
+        for index in range(4):
             controls.columnconfigure(index, weight=1)
 
-        self._entry(controls, 0, 0, "Model", self.transcription_model_var)
-        self._entry(controls, 0, 1, "Duration (sec)", self.duration_var)
-        self._entry(controls, 0, 2, "Chunk (sec)", self.chunk_var)
-        self._entry(controls, 0, 3, "Partial Interval", self.partial_interval_var)
-        self._entry(controls, 0, 4, "Chunk Overlap", self.chunk_overlap_var)
-        self._entry(controls, 0, 5, "Max Model RAM", self.max_model_ram_var)
-        self._entry(controls, 1, 0, "Output Root", self.output_root_var, width=36)
-        self._button(controls, 1, 1, "Browse", lambda: self.app.choose_directory(self.output_root_var))
-        self._entry(controls, 1, 2, "Session Id", self.session_id_var)
-        self._combobox(controls, 1, 3, "Mode", self.mode_var, [mode.value for mode in AudioSourceMode])
-        self.mic_combo = self._combobox(controls, 1, 4, "Mic Device", self.mic_device_var, self.device_labels)
-        self.speaker_combo = self._combobox(controls, 1, 5, "Speaker Device", self.speaker_device_var, self.device_labels)
-        ttk.Checkbutton(controls, text="Fixture", variable=self.fixture_var).grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(controls, text="Single Device/Source", variable=self.single_device_var).grid(row=2, column=1, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(controls, text="Strict Sources", variable=self.strict_sources_var).grid(row=2, column=2, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(controls, text="Stitch Overlap", variable=self.stitch_overlap_var).grid(row=2, column=3, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(controls, text="Run Notes", variable=self.notes_enabled_var).grid(row=2, column=4, sticky="w", pady=(8, 0))
-        self._combobox(controls, 3, 0, "Notes Runtime", self.notes_runtime_var, ["auto", "ollama", "llama_cpp"])
-        self._entry(controls, 3, 1, "Notes Model", self.notes_model_var, width=30)
-        self.refresh_button = self._button(controls, 3, 4, "Refresh Devices", self.refresh_devices)
-        self.start_button = self._button(controls, 3, 5, "Start Session", self.start)
-        self.stop_button = self._button(controls, 4, 5, "Stop", self.stop, state="disabled")
+        ttk.Label(controls, text="Model").grid(row=0, column=0, sticky="w")
+        ttk.Entry(controls, textvariable=self.transcription_model_var).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Label(controls, text="Duration (sec)").grid(row=0, column=1, sticky="w")
+        ttk.Entry(controls, textvariable=self.duration_var).grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Label(controls, text="Mode").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(
+            controls,
+            textvariable=self.mode_var,
+            values=[mode.value for mode in AudioSourceMode],
+            state="readonly",
+        ).grid(row=1, column=2, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Label(controls, text="Chunk (sec)").grid(row=0, column=3, sticky="w")
+        ttk.Entry(controls, textvariable=self.chunk_var).grid(row=1, column=3, sticky="ew", pady=(0, 6))
+
+        ttk.Label(controls, text="Mic Device").grid(row=2, column=0, sticky="w")
+        self.mic_combo = ttk.Combobox(controls, textvariable=self.mic_device_var, values=self.device_labels, state="readonly")
+        self.mic_combo.grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Label(controls, text="Speaker Device").grid(row=2, column=1, sticky="w")
+        self.speaker_combo = ttk.Combobox(controls, textvariable=self.speaker_device_var, values=self.device_labels, state="readonly")
+        self.speaker_combo.grid(row=3, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
+
+        actions = ttk.Frame(controls)
+        actions.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Checkbutton(actions, text="Run Notes", variable=self.notes_enabled_var).pack(side="left")
+        self.refresh_button = ttk.Button(actions, text="Refresh Devices", command=self.refresh_devices)
+        self.refresh_button.pack(side="right")
+        self.start_button = ttk.Button(actions, text="Start Session", command=self.start)
+        self.start_button.pack(side="right", padx=(6, 0))
+        self.stop_button = ttk.Button(actions, text="Stop", command=self.stop, state="disabled")
+        self.stop_button.pack(side="right", padx=(6, 0))
+
+        self.advanced_frame = ttk.LabelFrame(self, text="Advanced Session Options")
+        self.advanced_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        for index in range(4):
+            self.advanced_frame.columnconfigure(index, weight=1)
+
+        ttk.Label(self.advanced_frame, text="Output Root").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self.advanced_frame, textvariable=self.output_root_var).grid(row=1, column=0, columnspan=3, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Button(self.advanced_frame, text="Browse", command=lambda: self.app.choose_directory(self.output_root_var)).grid(row=1, column=3, sticky="ew", pady=(0, 6))
+        ttk.Label(self.advanced_frame, text="Session Id").grid(row=2, column=0, sticky="w")
+        ttk.Entry(self.advanced_frame, textvariable=self.session_id_var).grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Label(self.advanced_frame, text="Notes Runtime").grid(row=2, column=1, sticky="w")
+        ttk.Combobox(
+            self.advanced_frame,
+            textvariable=self.notes_runtime_var,
+            values=["auto", "ollama", "llama_cpp"],
+            state="readonly",
+        ).grid(row=3, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Label(self.advanced_frame, text="Partial Interval").grid(row=2, column=2, sticky="w")
+        ttk.Entry(self.advanced_frame, textvariable=self.partial_interval_var).grid(row=3, column=2, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Label(self.advanced_frame, text="Chunk Overlap").grid(row=2, column=3, sticky="w")
+        ttk.Entry(self.advanced_frame, textvariable=self.chunk_overlap_var).grid(row=3, column=3, sticky="ew", pady=(0, 6))
+        ttk.Label(self.advanced_frame, text="Notes Model").grid(row=4, column=0, sticky="w")
+        ttk.Entry(self.advanced_frame, textvariable=self.notes_model_var).grid(row=5, column=0, columnspan=2, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Label(self.advanced_frame, text="Max Model RAM").grid(row=4, column=2, sticky="w")
+        ttk.Entry(self.advanced_frame, textvariable=self.max_model_ram_var).grid(row=5, column=2, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Checkbutton(self.advanced_frame, text="Fixture", variable=self.fixture_var).grid(row=6, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(self.advanced_frame, text="Single Device/Source", variable=self.single_device_var).grid(row=6, column=1, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(self.advanced_frame, text="Strict Sources", variable=self.strict_sources_var).grid(row=6, column=2, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(self.advanced_frame, text="Stitch Overlap", variable=self.stitch_overlap_var).grid(row=6, column=3, sticky="w", pady=(4, 0))
 
         devices = ttk.LabelFrame(self, text="Available Devices")
-        devices.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
+        devices.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
         devices.columnconfigure(0, weight=1)
         devices.rowconfigure(0, weight=1)
         self.device_list = tk.Listbox(devices, height=8)
         self.device_list.grid(row=0, column=0, sticky="nsew")
 
         outputs = ttk.LabelFrame(self, text="Outputs")
-        outputs.grid(row=1, column=1, sticky="nsew", pady=(0, 12))
+        outputs.grid(row=2, column=1, sticky="nsew", pady=(0, 12))
         outputs.columnconfigure(1, weight=1)
         ttk.Label(outputs, text="Status").grid(row=0, column=0, sticky="w")
         ttk.Label(outputs, textvariable=self.status_var).grid(row=0, column=1, sticky="w")
         ttk.Label(outputs, text="Session Dir").grid(row=1, column=0, sticky="w")
         ttk.Entry(outputs, textvariable=self.session_dir_var).grid(row=1, column=1, sticky="ew", padx=(6, 6))
-        self._button(outputs, 1, 2, "Open", lambda: self.app.open_path_var(self.session_dir_var))
+        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.session_dir_var)).grid(row=1, column=2, sticky="ew")
         ttk.Label(outputs, text="Transcript").grid(row=2, column=0, sticky="w")
         ttk.Entry(outputs, textvariable=self.transcript_path_var).grid(row=2, column=1, sticky="ew", padx=(6, 6))
-        self._button(outputs, 2, 2, "Open", lambda: self.app.open_path_var(self.transcript_path_var))
+        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.transcript_path_var)).grid(row=2, column=2, sticky="ew")
         ttk.Label(outputs, text="Notes").grid(row=3, column=0, sticky="w")
         ttk.Entry(outputs, textvariable=self.notes_path_var).grid(row=3, column=1, sticky="ew", padx=(6, 6))
-        self._button(outputs, 3, 2, "Open", lambda: self.app.open_path_var(self.notes_path_var))
+        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.notes_path_var)).grid(row=3, column=2, sticky="ew")
         ttk.Label(outputs, text="Current Partial").grid(row=4, column=0, sticky="nw")
         ttk.Label(outputs, textvariable=self.partial_text_var, wraplength=420, justify="left").grid(row=4, column=1, columnspan=2, sticky="w")
 
         transcript = ttk.LabelFrame(self, text="Final Transcript")
-        transcript.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        transcript.grid(row=3, column=0, columnspan=2, sticky="nsew")
         transcript.columnconfigure(0, weight=1)
         transcript.rowconfigure(0, weight=1)
         self.transcript_text = ScrolledText(transcript, wrap="word", height=16)
         self.transcript_text.grid(row=0, column=0, sticky="nsew")
         self.transcript_text.configure(state="disabled")
+        self.set_advanced_mode(False)
 
-    def _entry(self, parent: ttk.Frame, row: int, column: int, label: str, var: tk.StringVar, *, width: int = 18) -> None:
-        ttk.Label(parent, text=label).grid(row=row * 2, column=column, sticky="w")
-        ttk.Entry(parent, textvariable=var, width=width).grid(row=row * 2 + 1, column=column, sticky="ew", padx=(0, 6), pady=(0, 6))
-
-    def _combobox(self, parent: ttk.Frame, row: int, column: int, label: str, var: tk.StringVar, values: list[str] | tuple[str, ...]):
-        ttk.Label(parent, text=label).grid(row=row * 2, column=column, sticky="w")
-        combo = ttk.Combobox(parent, textvariable=var, values=list(values), state="readonly")
-        combo.grid(row=row * 2 + 1, column=column, sticky="ew", padx=(0, 6), pady=(0, 6))
-        return combo
-
-    def _button(self, parent: ttk.Frame, row: int, column: int, label: str, command, *, state: str = "normal"):
-        button = ttk.Button(parent, text=label, command=command, state=state)
-        button.grid(row=row, column=column, sticky="ew", padx=(0, 6), pady=(6, 0))
-        return button
+    def _prepare_launch_paths(self) -> tuple[Path, str, Path]:
+        output_root_text = self.output_root_var.get().strip()
+        output_root = Path(output_root_text) if output_root_text else default_data_subdir("live_sessions")
+        session_id = self.session_id_var.get().strip() or services.default_session_id("live")
+        session_dir = output_root / session_id
+        self.output_root_var.set(str(output_root))
+        self.session_id_var.set(session_id)
+        self.session_dir_var.set(str(session_dir))
+        self.transcript_path_var.set(str(session_dir / "transcript.txt"))
+        if self.notes_enabled_var.get():
+            self.notes_path_var.set(str(session_dir / "client_notes.txt"))
+        else:
+            self.notes_path_var.set("")
+        return output_root, session_id, session_dir
 
     def set_devices(self, devices: tuple[DeviceInfo, ...]) -> None:
         self.device_labels = ("Auto", *[device.label for device in devices])
@@ -209,6 +252,13 @@ class SessionPage(BasePage):
         self.device_list.delete(0, tk.END)
         for device in devices:
             self.device_list.insert(tk.END, device.label)
+
+    def set_advanced_mode(self, advanced: bool) -> None:
+        self.advanced_visible = advanced
+        if advanced:
+            self.advanced_frame.grid()
+        else:
+            self.advanced_frame.grid_remove()
 
     def refresh_devices(self) -> None:
         self.app.start_task(
@@ -227,6 +277,7 @@ class SessionPage(BasePage):
         self.transcript_text.delete("1.0", tk.END)
         self.transcript_text.configure(state="disabled")
         self.partial_text_var.set("")
+        output_root, session_id, _ = self._prepare_launch_paths()
         self.status_var.set("Starting session...")
         request = SessionRequest(
             common=self.app.common_options(),
@@ -237,8 +288,8 @@ class SessionPage(BasePage):
             mode=AudioSourceMode(self.mode_var.get()),
             chunk_sec=float(self.chunk_var.get() or 4.0),
             partial_interval_sec=float(self.partial_interval_var.get() or 0.0),
-            output_root=Path(self.output_root_var.get().strip()),
-            session_id=self.session_id_var.get().strip() or None,
+            output_root=output_root,
+            session_id=session_id,
             mic_device=self.mic_device_var.get(),
             speaker_device=self.speaker_device_var.get(),
             single_device_per_source=self.single_device_var.get(),
@@ -295,6 +346,8 @@ class SessionPage(BasePage):
         self.transcript_path_var.set(str(result.transcript_txt_path))
         if result.notes_summary is not None:
             self.notes_path_var.set(str(result.notes_summary.client_notes_path))
+        elif not self.notes_enabled_var.get():
+            self.notes_path_var.set("")
         self.status_var.set(
             "Session stopped" if result.interrupted else f"Saved {result.final_segment_count} final segments"
         )
@@ -303,7 +356,6 @@ class SessionPage(BasePage):
         self.start_button.configure(state="disabled" if busy else "normal")
         self.refresh_button.configure(state="disabled" if busy else "normal")
         self.stop_button.configure(state="normal" if busy and cancelable else "disabled")
-
 
 class CapturePage(BasePage):
     """Audio capture workflow page."""
@@ -316,14 +368,16 @@ class CapturePage(BasePage):
         self.columnconfigure(1, weight=1)
         self.duration_var = tk.StringVar(value="30")
         self.mode_var = tk.StringVar(value=AudioSourceMode.BOTH.value)
-        self.output_root_var = tk.StringVar(value=str(default_data_subdir("captures")))
+        self.output_root_var = tk.StringVar(value=str(default_data_subdir("live_sessions")))
         self.session_id_var = tk.StringVar(value="")
         self.mic_device_var = tk.StringVar(value="Auto")
         self.speaker_device_var = tk.StringVar(value="Auto")
         self.fixture_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Idle")
+        self.session_dir_var = tk.StringVar(value="")
         self.manifest_path_var = tk.StringVar(value="")
         self.device_labels: tuple[str, ...] = ("Auto",)
+        self.advanced_visible = False
 
         controls = ttk.LabelFrame(self, text="Capture")
         controls.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
@@ -332,41 +386,69 @@ class CapturePage(BasePage):
         ttk.Label(controls, text="Duration (sec)").grid(row=0, column=0, sticky="w")
         ttk.Entry(controls, textvariable=self.duration_var).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
         ttk.Label(controls, text="Mode").grid(row=0, column=1, sticky="w")
-        ttk.Combobox(controls, textvariable=self.mode_var, values=[mode.value for mode in AudioSourceMode], state="readonly").grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
-        ttk.Label(controls, text="Output Root").grid(row=0, column=2, sticky="w")
-        ttk.Entry(controls, textvariable=self.output_root_var).grid(row=1, column=2, sticky="ew", padx=(0, 6), pady=(0, 6))
-        ttk.Button(controls, text="Browse", command=lambda: self.app.choose_directory(self.output_root_var)).grid(row=1, column=3, sticky="ew", pady=(0, 6))
-        ttk.Label(controls, text="Session Id").grid(row=2, column=0, sticky="w")
-        ttk.Entry(controls, textvariable=self.session_id_var).grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
-        ttk.Label(controls, text="Mic Device").grid(row=2, column=1, sticky="w")
+        ttk.Combobox(
+            controls,
+            textvariable=self.mode_var,
+            values=[mode.value for mode in AudioSourceMode],
+            state="readonly",
+        ).grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Label(controls, text="Mic Device").grid(row=0, column=2, sticky="w")
         self.mic_combo = ttk.Combobox(controls, textvariable=self.mic_device_var, values=self.device_labels, state="readonly")
-        self.mic_combo.grid(row=3, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
-        ttk.Label(controls, text="Speaker Device").grid(row=2, column=2, sticky="w")
+        self.mic_combo.grid(row=1, column=2, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Label(controls, text="Speaker Device").grid(row=0, column=3, sticky="w")
         self.speaker_combo = ttk.Combobox(controls, textvariable=self.speaker_device_var, values=self.device_labels, state="readonly")
-        self.speaker_combo.grid(row=3, column=2, sticky="ew", padx=(0, 6), pady=(0, 6))
-        ttk.Checkbutton(controls, text="Fixture", variable=self.fixture_var).grid(row=4, column=0, sticky="w")
-        self.refresh_button = ttk.Button(controls, text="Refresh Devices", command=self.refresh_devices)
-        self.refresh_button.grid(row=4, column=2, sticky="ew", pady=(6, 0), padx=(0, 6))
-        self.start_button = ttk.Button(controls, text="Start Capture", command=self.start)
-        self.start_button.grid(row=4, column=3, sticky="ew", pady=(6, 0))
-        self.stop_button = ttk.Button(controls, text="Stop", command=self.stop, state="disabled")
-        self.stop_button.grid(row=5, column=3, sticky="ew", pady=(6, 0))
+        self.speaker_combo.grid(row=1, column=3, sticky="ew", pady=(0, 6))
+
+        actions = ttk.Frame(controls)
+        actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.refresh_button = ttk.Button(actions, text="Refresh Devices", command=self.refresh_devices)
+        self.refresh_button.pack(side="right")
+        self.start_button = ttk.Button(actions, text="Start Capture", command=self.start)
+        self.start_button.pack(side="right", padx=(6, 0))
+        self.stop_button = ttk.Button(actions, text="Stop", command=self.stop, state="disabled")
+        self.stop_button.pack(side="right", padx=(6, 0))
+
+        self.advanced_frame = ttk.LabelFrame(self, text="Advanced Capture Options")
+        self.advanced_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        for index in range(4):
+            self.advanced_frame.columnconfigure(index, weight=1)
+        ttk.Label(self.advanced_frame, text="Output Root").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self.advanced_frame, textvariable=self.output_root_var).grid(row=1, column=0, columnspan=3, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Button(self.advanced_frame, text="Browse", command=lambda: self.app.choose_directory(self.output_root_var)).grid(row=1, column=3, sticky="ew", pady=(0, 6))
+        ttk.Label(self.advanced_frame, text="Session Id").grid(row=2, column=0, sticky="w")
+        ttk.Entry(self.advanced_frame, textvariable=self.session_id_var).grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Checkbutton(self.advanced_frame, text="Fixture", variable=self.fixture_var).grid(row=3, column=1, sticky="w", pady=(0, 6))
 
         devices = ttk.LabelFrame(self, text="Available Devices")
-        devices.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
+        devices.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
         devices.columnconfigure(0, weight=1)
         devices.rowconfigure(0, weight=1)
         self.device_list = tk.Listbox(devices, height=10)
         self.device_list.grid(row=0, column=0, sticky="nsew")
 
         outputs = ttk.LabelFrame(self, text="Outputs")
-        outputs.grid(row=1, column=1, sticky="nsew", pady=(0, 12))
+        outputs.grid(row=2, column=1, sticky="nsew", pady=(0, 12))
         outputs.columnconfigure(1, weight=1)
         ttk.Label(outputs, text="Status").grid(row=0, column=0, sticky="w")
         ttk.Label(outputs, textvariable=self.status_var).grid(row=0, column=1, sticky="w")
-        ttk.Label(outputs, text="Manifest").grid(row=1, column=0, sticky="w")
-        ttk.Entry(outputs, textvariable=self.manifest_path_var).grid(row=1, column=1, sticky="ew", padx=(6, 6))
-        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.manifest_path_var)).grid(row=1, column=2, sticky="ew")
+        ttk.Label(outputs, text="Session Dir").grid(row=1, column=0, sticky="w")
+        ttk.Entry(outputs, textvariable=self.session_dir_var).grid(row=1, column=1, sticky="ew", padx=(6, 6))
+        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.session_dir_var)).grid(row=1, column=2, sticky="ew")
+        ttk.Label(outputs, text="Manifest").grid(row=2, column=0, sticky="w")
+        ttk.Entry(outputs, textvariable=self.manifest_path_var).grid(row=2, column=1, sticky="ew", padx=(6, 6))
+        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.manifest_path_var)).grid(row=2, column=2, sticky="ew")
+        self.set_advanced_mode(False)
+
+    def _prepare_launch_paths(self) -> tuple[Path, str, Path]:
+        output_root_text = self.output_root_var.get().strip()
+        output_root = Path(output_root_text) if output_root_text else default_data_subdir("live_sessions")
+        session_id = self.session_id_var.get().strip() or services.default_session_id("capture")
+        session_dir = output_root / session_id
+        self.output_root_var.set(str(output_root))
+        self.session_id_var.set(session_id)
+        self.session_dir_var.set(str(session_dir))
+        self.manifest_path_var.set(str(session_dir / "session_manifest.json"))
+        return output_root, session_id, session_dir
 
     def refresh_devices(self) -> None:
         self.app.start_task(
@@ -388,13 +470,21 @@ class CapturePage(BasePage):
         for device in devices:
             self.device_list.insert(tk.END, device.label)
 
+    def set_advanced_mode(self, advanced: bool) -> None:
+        self.advanced_visible = advanced
+        if advanced:
+            self.advanced_frame.grid()
+        else:
+            self.advanced_frame.grid_remove()
+
     def start(self) -> None:
+        output_root, session_id, _ = self._prepare_launch_paths()
         request = CaptureRequest(
             common=self.app.common_options(),
             duration_sec=float(self.duration_var.get() or 30.0),
             mode=AudioSourceMode(self.mode_var.get()),
-            output_root=Path(self.output_root_var.get().strip()),
-            session_id=self.session_id_var.get().strip() or None,
+            output_root=output_root,
+            session_id=session_id,
             mic_device=self.mic_device_var.get(),
             speaker_device=self.speaker_device_var.get(),
             use_fixture=self.fixture_var.get(),
@@ -413,6 +503,7 @@ class CapturePage(BasePage):
 
     def handle_result(self, result: object) -> None:
         assert isinstance(result, CaptureResultSummary)
+        self.session_dir_var.set(str(result.session_dir))
         self.manifest_path_var.set(str(result.manifest_path))
         self.status_var.set("Capture stopped" if result.interrupted else f"Capture complete ({result.pair_count} pairs)")
 
@@ -825,12 +916,26 @@ class TranscribeUiApp:
         ttk.Entry(header, textvariable=self.config_path_var).grid(row=0, column=1, sticky="ew", padx=(8, 6))
         ttk.Button(header, text="Browse", command=lambda: self.choose_file(self.config_path_var)).grid(row=0, column=2, sticky="ew")
         ttk.Label(header, text="Log Level").grid(row=0, column=3, sticky="w", padx=(12, 0))
-        self.log_level_var = tk.StringVar(value="")
-        ttk.Entry(header, textvariable=self.log_level_var, width=12).grid(row=0, column=4, sticky="ew", padx=(6, 6))
+        self.log_level_var = tk.StringVar(value=services.DEFAULT_LOG_LEVEL)
+        self.log_level_combo = ttk.Combobox(
+            header,
+            textvariable=self.log_level_var,
+            values=LOG_LEVEL_OPTIONS,
+            state="readonly",
+            width=10,
+        )
+        self.log_level_combo.grid(row=0, column=4, sticky="ew", padx=(6, 6))
         self.debug_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(header, text="Debug", variable=self.debug_var).grid(row=0, column=5, sticky="w")
+        self.advanced_ui_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            header,
+            text="Advanced UI",
+            variable=self.advanced_ui_var,
+            command=self._apply_advanced_ui_state,
+        ).grid(row=0, column=6, sticky="w", padx=(6, 0))
         self.busy_var = tk.StringVar(value="Idle")
-        ttk.Label(header, textvariable=self.busy_var).grid(row=0, column=6, sticky="e", padx=(12, 0))
+        ttk.Label(header, textvariable=self.busy_var).grid(row=0, column=7, sticky="e", padx=(12, 0))
 
         self.page_container = ttk.Frame(self.content)
         self.page_container.grid(row=1, column=0, sticky="nsew")
@@ -862,6 +967,7 @@ class TranscribeUiApp:
         ttk.Separator(self.nav, orient="horizontal").grid(row=len(page_specs), column=0, sticky="ew", pady=(10, 10))
         self.cancel_button = ttk.Button(self.nav, text="Stop Active Task", command=self.cancel_active_task, state="disabled")
         self.cancel_button.grid(row=len(page_specs) + 1, column=0, sticky="ew")
+        self._apply_advanced_ui_state()
         self.show_page("session")
 
     def common_options(self) -> UiCommonOptions:
@@ -873,6 +979,12 @@ class TranscribeUiApp:
             log_level=log_level,
             debug=self.debug_var.get(),
         )
+
+    def _apply_advanced_ui_state(self) -> None:
+        """Toggle advanced controls across all workflow pages."""
+        advanced_enabled = self.advanced_ui_var.get() if hasattr(self, "advanced_ui_var") else False
+        for page in self.pages.values():
+            page.set_advanced_mode(bool(advanced_enabled))
 
     def show_page(self, page_id: str) -> None:
         """Raise one page into view."""
@@ -1048,3 +1160,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

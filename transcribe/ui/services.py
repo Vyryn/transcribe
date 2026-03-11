@@ -18,6 +18,7 @@ from transcribe.ui.types import (
     DEFAULT_BENCH_MODEL,
     DEFAULT_BENCH_SPLIT,
     DEFAULT_LIVE_TRANSCRIPTION_MODEL,
+    DEFAULT_LOG_LEVEL,
     DEFAULT_NOTES_RUNTIME,
     DEFAULT_SESSION_NOTES_MODEL,
     BenchmarkInitRequest,
@@ -455,3 +456,5 @@ def run_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResultSummary:
 def wrap_progress(event: str, fields: dict[str, object]) -> ServiceProgressEvent:
     """Build a typed progress wrapper for controller and UI consumers."""
     return ServiceProgressEvent(name=event, fields=dict(fields))
+
+

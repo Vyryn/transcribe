@@ -56,7 +56,7 @@ class CaptureRequest:
     common: UiCommonOptions
     duration_sec: float = 30.0
     mode: AudioSourceMode = AudioSourceMode.BOTH
-    output_root: Path = Path("data/captures")
+    output_root: Path = Path("data/live_sessions")
     session_id: str | None = None
     mic_device: str | int | None = None
     speaker_device: str | int | None = None
@@ -237,3 +237,4 @@ class ServiceProgressEvent:
 
     name: str
     fields: dict[str, object]
+

@@ -262,7 +262,16 @@ def test_ui_smoke_instantiates_when_tk_available() -> None:
     try:
         root.withdraw()
         app = app_module.TranscribeUiApp(root, packaged_runtime=False)
+        session_page = app.pages["session"]
+        capture_page = app.pages["capture"]
         assert "session" in app.pages
         assert "logs" in app.pages
+        assert app.log_level_combo.cget("values") == app_module.LOG_LEVEL_OPTIONS
+        assert session_page.advanced_visible is False
+        assert capture_page.advanced_visible is False
+        app.advanced_ui_var.set(True)
+        app._apply_advanced_ui_state()
+        assert session_page.advanced_visible is True
+        assert capture_page.advanced_visible is True
     finally:
         root.destroy()
