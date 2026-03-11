@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
@@ -63,6 +64,8 @@ DEFAULT_NINJA_PYTHON_PACKAGE = "ninja"
 DEFAULT_BUILD_REPORT_PATH = REPO_ROOT / "dist" / "windows" / "build-report.json"
 DEFAULT_BUILD_PHASE = "all"
 DEFAULT_BUILD_BACKEND = "nuitka"
+DEFAULT_PACKAGE_REUSE_METADATA_PATH = DEFAULT_BUILD_DIR / "package-reuse.json"
+DEFAULT_NUITKA_LTO_MODE = "auto"
 BUILD_PHASE_CHOICES = ("prepare", "package", "stage-assets", "installer", "all")
 BUILD_BACKEND_CHOICES = ("pyinstaller", "nuitka")
 SUPPORTED_NUITKA_PYTHON = (3, 13)
@@ -113,6 +116,14 @@ class PhaseResult:
     status: str
     duration_sec: float
     details: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class NuitkaBuildOptions:
+    """User-selected tuning flags passed through to Nuitka."""
+
+    jobs: int | None
+    lto: str
 
 
 def _summarize_file(path: Path) -> dict[str, Any]:
@@ -216,6 +227,124 @@ def _ensure_clcache_directory(*, bootstrap_dir: Path, env: Mapping[str, str] | N
     merged = _merged_environment(env)
     merged["CLCACHE_DIR"] = str(resolved_dir)
     return merged
+
+
+def _package_reuse_metadata_path(build_dir: Path) -> Path:
+    return build_dir.resolve() / DEFAULT_PACKAGE_REUSE_METADATA_PATH.name
+
+
+def _package_fingerprint_label(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def _hash_file_contents(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _iter_package_fingerprint_paths(*, backend: str) -> Iterator[Path]:
+    seen: set[Path] = set()
+    static_paths = (
+        REPO_ROOT / "main.py",
+        REPO_ROOT / "packaged_main.py",
+        REPO_ROOT / "packaged_ui_main.py",
+        REPO_ROOT / "pyproject.toml",
+        REPO_ROOT / "uv.lock",
+        Path(__file__).resolve(),
+    )
+    for path in static_paths:
+        resolved = path.resolve()
+        if resolved.exists() and resolved not in seen:
+            seen.add(resolved)
+            yield resolved
+
+    package_root = (REPO_ROOT / "transcribe").resolve()
+    if package_root.exists():
+        for path in sorted(package_root.rglob("*.py")):
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                yield resolved
+
+    if backend == "nuitka":
+        resolved = NUITKA_PACKAGE_CONFIG_PATH.resolve()
+        if resolved.exists() and resolved not in seen:
+            yield resolved
+
+
+def _compute_package_fingerprint(
+    *,
+    backend: str,
+    package_command: Sequence[str],
+    include_canary_model: bool,
+    nuitka_options: NuitkaBuildOptions | None,
+) -> tuple[str, dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    for path in _iter_package_fingerprint_paths(backend=backend):
+        files.append(
+            {
+                "path": _package_fingerprint_label(path),
+                "sha256": _hash_file_contents(path),
+                "size_bytes": path.stat().st_size,
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "backend": backend,
+        "package_command": list(package_command),
+        "include_canary_model": include_canary_model,
+        "python_executable": sys.executable,
+        "python_version": list(sys.version_info[:3]),
+        "source_files": files,
+    }
+    if nuitka_options is not None:
+        payload["nuitka_options"] = {
+            "jobs": nuitka_options.jobs,
+            "lto": nuitka_options.lto,
+        }
+
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), payload
+
+
+def _read_package_reuse_metadata(build_dir: Path) -> dict[str, Any] | None:
+    metadata_path = _package_reuse_metadata_path(build_dir)
+    if not metadata_path.exists():
+        return None
+
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_package_reuse_metadata(
+    *,
+    build_dir: Path,
+    backend: str,
+    fingerprint: str,
+    fingerprint_payload: Mapping[str, Any],
+    stage_dir: Path,
+) -> Path:
+    metadata_path = _package_reuse_metadata_path(build_dir)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "generated_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        "backend": backend,
+        "fingerprint": fingerprint,
+        "stage_dir": str(stage_dir.resolve()),
+        "fingerprint_payload": fingerprint_payload,
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2) + '\n', encoding="utf-8")
+    return metadata_path
 
 
 def _write_build_report(
@@ -869,6 +998,7 @@ def _build_nuitka_command(
     build_dir: Path,
     clean: bool,
     include_canary_model: bool,
+    nuitka_options: NuitkaBuildOptions,
 ) -> list[str]:
     output_dir = build_dir / "nuitka"
     report_path = _default_nuitka_report_path(build_dir)
@@ -904,6 +1034,10 @@ def _build_nuitka_command(
         f"--report={report_path}",
         "--nofollow-import-to=datasets,pyarrow,matplotlib,_pytest,coverage,mypy,IPython,pytest,transcribe.bench,transcribe.test_cov,torch.utils.cpp_extension,setuptools",
     ]
+    if nuitka_options.jobs is not None:
+        command.append(f"--jobs={nuitka_options.jobs}")
+    if nuitka_options.lto != DEFAULT_NUITKA_LTO_MODE:
+        command.append(f"--lto={nuitka_options.lto}")
     if _module_available("nemo.collections.asr"):
         command.extend(
             [
@@ -933,6 +1067,7 @@ def _build_package_bundle(
     bootstrap_dir: Path,
     clean: bool,
     include_canary_model: bool,
+    nuitka_options: NuitkaBuildOptions | None = None,
 ) -> Path:
     stage_dir.parent.mkdir(parents=True, exist_ok=True)
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -961,6 +1096,7 @@ def _build_package_bundle(
                 build_dir=build_dir,
                 clean=clean,
                 include_canary_model=include_canary_model,
+                nuitka_options=nuitka_options or NuitkaBuildOptions(jobs=None, lto=DEFAULT_NUITKA_LTO_MODE),
             ),
             cwd=REPO_ROOT,
             env=_ensure_clcache_directory(bootstrap_dir=bootstrap_dir),
@@ -1453,8 +1589,40 @@ def _package_phase_details(
     bootstrap_dir: Path,
     clean: bool,
     include_canary_model: bool,
+    reuse_package: bool,
+    nuitka_options: NuitkaBuildOptions | None,
 ) -> dict[str, Any]:
+    fingerprint, fingerprint_payload = _compute_package_fingerprint(
+        backend=build_inputs.backend,
+        package_command=build_inputs.package_command,
+        include_canary_model=include_canary_model,
+        nuitka_options=nuitka_options if build_inputs.backend == "nuitka" else None,
+    )
+    metadata_path = _package_reuse_metadata_path(build_dir)
     clcache_stats_before = _read_latest_clcache_stats(build_dir) if build_inputs.backend == "nuitka" else None
+    existing_metadata = _read_package_reuse_metadata(build_dir) if reuse_package and not clean else None
+    if (
+        reuse_package
+        and not clean
+        and stage_dir.exists()
+        and existing_metadata is not None
+        and existing_metadata.get("fingerprint") == fingerprint
+    ):
+        details = {
+            "stage_dir": str(stage_dir.resolve()),
+            "package_fingerprint": fingerprint,
+            "package_reuse_metadata_path": str(metadata_path),
+            "reused_existing_package": True,
+            "reuse_reason": "Package inputs unchanged; skipped re-running the packager and reused the existing stage directory.",
+        }
+        if build_inputs.backend == "nuitka":
+            details["clcache_stats_before"] = clcache_stats_before
+            details["clcache_stats_after"] = clcache_stats_before
+            report_path = _default_nuitka_report_path(build_dir)
+            if report_path.exists():
+                details["nuitka_report_path"] = str(report_path)
+        return details
+
     bundle_dir = _build_package_bundle(
         backend=build_inputs.backend,
         package_command=build_inputs.package_command,
@@ -1463,8 +1631,21 @@ def _package_phase_details(
         bootstrap_dir=bootstrap_dir,
         clean=clean,
         include_canary_model=include_canary_model,
+        nuitka_options=nuitka_options,
     )
-    details: dict[str, Any] = {"stage_dir": str(bundle_dir)}
+    metadata_path = _write_package_reuse_metadata(
+        build_dir=build_dir,
+        backend=build_inputs.backend,
+        fingerprint=fingerprint,
+        fingerprint_payload=fingerprint_payload,
+        stage_dir=bundle_dir,
+    )
+    details: dict[str, Any] = {
+        "stage_dir": str(bundle_dir),
+        "package_fingerprint": fingerprint,
+        "package_reuse_metadata_path": str(metadata_path),
+        "reused_existing_package": False,
+    }
     if build_inputs.backend == "nuitka":
         details["clcache_stats_before"] = clcache_stats_before
         details["clcache_stats_after"] = _read_latest_clcache_stats(build_dir)
@@ -1486,6 +1667,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Clear package build outputs before packaging. Use only for broken caches or dependency-shape changes.",
     )
+    parser.add_argument(
+        "--reuse-package",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse the existing packaged stage directory when the package inputs match the previous build fingerprint.",
+    )
     parser.add_argument("--report-path", type=Path, default=DEFAULT_BUILD_REPORT_PATH)
     parser.add_argument("--stage-dir", type=Path, default=DEFAULT_STAGE_DIR)
     parser.add_argument("--build-dir", type=Path, default=DEFAULT_BUILD_DIR)
@@ -1495,6 +1682,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--assets-dir", type=Path, default=DEFAULT_ASSETS_DIR)
     parser.add_argument("--hf-cache-dir", type=Path, default=DEFAULT_HF_CACHE_DIR)
     parser.add_argument("--pyinstaller-exe", default="pyinstaller")
+    parser.add_argument("--nuitka-jobs", type=int, default=None)
+    parser.add_argument("--nuitka-lto", choices=("auto", "no", "yes"), default=DEFAULT_NUITKA_LTO_MODE)
     parser.add_argument("--inno-setup-exe", default="iscc")
     parser.add_argument("--llama-cpp-release", default=DEFAULT_LLAMA_CPP_RELEASE)
     parser.add_argument("--bootstrap-missing", action=argparse.BooleanOptionalAction, default=True)
@@ -1524,6 +1713,10 @@ def _phase_selected(args: argparse.Namespace, name: str) -> bool:
     return args.phase == "all" or args.phase == name
 
 
+def _nuitka_build_options_from_args(args: argparse.Namespace) -> NuitkaBuildOptions:
+    return NuitkaBuildOptions(jobs=args.nuitka_jobs, lto=args.nuitka_lto)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     stage_dir = args.stage_dir.resolve()
@@ -1531,6 +1724,7 @@ def main(argv: list[str] | None = None) -> int:
     bootstrap_dir = args.bootstrap_dir.resolve()
     installer_dir = args.installer_dir.resolve()
     report_path = args.report_path.resolve()
+    nuitka_options = _nuitka_build_options_from_args(args)
     phase_results: list[PhaseResult] = []
     build_inputs: ResolvedBuildInputs | None = None
     installer_path: Path | None = None
@@ -1550,6 +1744,8 @@ def main(argv: list[str] | None = None) -> int:
             "llama_runtime_dir": str(build_inputs.llama_runtime_dir),
             "include_canary_model": args.include_canary_model,
             "compiler_cache_dir": str(compiler_cache_dir),
+            "reuse_package": args.reuse_package,
+            "nuitka_options": {"jobs": nuitka_options.jobs, "lto": nuitka_options.lto},
         }
 
     if _phase_selected(args, "prepare") or _phase_selected(args, "package") or _phase_selected(args, "stage-assets"):
@@ -1577,6 +1773,8 @@ def main(argv: list[str] | None = None) -> int:
                     bootstrap_dir=bootstrap_dir,
                     clean=args.clean,
                     include_canary_model=args.include_canary_model,
+                    reuse_package=args.reuse_package,
+                    nuitka_options=nuitka_options if build_inputs.backend == "nuitka" else None,
                 ),
             )
 
@@ -1666,7 +1864,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Installer: {installer_path}")
     if published_release_path is not None:
         print(f"Release: {published_release_path}")
-    print("Reuse tips: use --phase installer for installer-script changes, --phase stage-assets for prompt/runtime asset changes, and rerun package only for Python dependency or inclusion changes.")
+    print("Reuse tips: use --phase installer for installer-script changes, --phase stage-assets for prompt/runtime asset changes, keep --reuse-package enabled to skip unchanged package rebuilds, and use --no-reuse-package when you need to force a fresh packager run.")
     return 0
 
 
