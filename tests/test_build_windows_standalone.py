@@ -208,6 +208,7 @@ def test_build_pyinstaller_command_targets_packaged_entrypoint_and_excludes_dev_
     assert str(build_script.REPO_ROOT / "packaged_main.py") == command[-1]
     assert "huggingface_hub" in command
     assert "transcribe.packaged_assets" in command
+    assert "transcribe.packaged_ui" in command
     assert "datasets" in command
     assert "transcribe.bench" in command
     assert "nemo.collections.asr" in command
@@ -252,6 +253,7 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_excludes_dev_modul
     assert "--standalone" in command
     assert "--output-filename=transcribe.exe" in command
     assert "--include-package=transcribe" in command
+    assert "--include-module=transcribe.packaged_ui" in command
     assert "--include-package=soundcard" in command
     assert "--noinclude-numba-mode=nofollow" in command
     assert "--module-parameter=numba-disable-jit=yes" in command
