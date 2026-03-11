@@ -40,4 +40,5 @@ dev = [
 requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
-
+[tool.black]
+line-length = 120
