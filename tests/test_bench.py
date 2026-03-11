@@ -558,3 +558,16 @@ def test_load_nemo_model_from_snapshot_retries_on_cpu_after_cuda_oom(tmp_path: P
     assert model is sentinel_model
     assert observed[0] is None
     assert str(observed[1]) == "cpu"
+
+
+def test_enforce_hf_offline_mode_respects_network_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRANSCRIBE_ALLOW_NETWORK", "1")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    bench_harness._enforce_hf_offline_mode()
+
+    assert os.environ["HF_HUB_OFFLINE"] == "0"
+    assert os.environ["HF_DATASETS_OFFLINE"] == "0"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "0"

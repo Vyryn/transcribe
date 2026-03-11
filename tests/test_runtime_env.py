@@ -197,3 +197,20 @@ def test_resolve_bundled_notes_model_path_uses_packaged_data_root(monkeypatch: p
     model_path = runtime_env.resolve_bundled_notes_model_path(DEFAULT_SESSION_NOTES_MODEL)
 
     assert model_path == note_path.resolve()
+
+
+def test_network_access_allowed_defaults_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(runtime_env.ALLOW_NETWORK_ENV, raising=False)
+
+    assert runtime_env.network_access_allowed() is False
+
+
+
+def test_set_network_access_allowed_updates_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(runtime_env.ALLOW_NETWORK_ENV, raising=False)
+
+    runtime_env.set_network_access_allowed(True)
+    assert runtime_env.network_access_allowed() is True
+
+    runtime_env.set_network_access_allowed(False)
+    assert runtime_env.network_access_allowed() is False
