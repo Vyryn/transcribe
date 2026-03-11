@@ -10,7 +10,13 @@ from transcribe.config import load_app_config
 from transcribe.logging import configure_logging, security_log
 from transcribe.models import AudioSourceMode, CaptureConfig
 from transcribe.network_guard import install_outbound_network_guard, outbound_network_guard_installed
-from transcribe.runtime_env import RuntimeMode, resolve_app_runtime_paths, validate_transcription_model_for_runtime
+from transcribe.runtime_env import (
+    PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
+    RuntimeMode,
+    resolve_app_runtime_paths,
+    validate_transcription_model_for_runtime,
+)
+from transcribe.runtime_defaults import ALTERNATE_SESSION_NOTES_MODEL
 from transcribe.ui.types import (
     DEFAULT_BENCH_CONFIG,
     DEFAULT_BENCH_DATASET,
@@ -44,6 +50,33 @@ from transcribe.ui.types import (
 
 LOGGER = logging.getLogger("transcribe.ui")
 ProgressCallback = Callable[[str, dict[str, object]], None]
+
+
+def transcription_model_options() -> tuple[str, ...]:
+    """Return curated transcription model choices for UI dropdowns."""
+    runtime_paths = resolve_app_runtime_paths()
+    if runtime_paths.mode == RuntimeMode.PACKAGED:
+        return tuple(runtime_paths.transcription_models)
+    return tuple(
+        dict.fromkeys(
+            (
+                DEFAULT_LIVE_TRANSCRIPTION_MODEL,
+                PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
+                "faster-whisper-medium",
+                "whisper-small",
+                "whisper-large-v3",
+                "Qwen/Qwen3-ASR-1.7B",
+            )
+        )
+    )
+
+
+def notes_model_options() -> tuple[str, ...]:
+    """Return curated notes model choices for UI dropdowns."""
+    runtime_paths = resolve_app_runtime_paths()
+    if runtime_paths.mode == RuntimeMode.PACKAGED:
+        return tuple(runtime_paths.notes_models)
+    return tuple(dict.fromkeys((DEFAULT_SESSION_NOTES_MODEL, ALTERNATE_SESSION_NOTES_MODEL)))
 
 
 def default_data_subdir(name: str) -> Path:
