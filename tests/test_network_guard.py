@@ -25,6 +25,31 @@ def test_outbound_network_is_blocked() -> None:
 
 
 def test_loopback_remains_allowed() -> None:
+    install_outbound_network_guard()
     results = run_network_guard_self_test()
     assert results["outbound_blocked"] is True
     assert results["loopback_allowed"] is True
+
+
+def test_self_test_reflects_current_process_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class FakeConnection:
+        def close(self) -> None:
+            return None
+
+    def fake_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+        del timeout, source_address
+        host = address[0]
+        calls.append(host)
+        if host == "example.com":
+            raise OSError("network path is open but the probe host is unavailable")
+        return FakeConnection()
+
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+
+    results = run_network_guard_self_test()
+
+    assert results["outbound_blocked"] is False
+    assert results["loopback_allowed"] is True
+    assert calls[:2] == ["example.com", "127.0.0.1"]

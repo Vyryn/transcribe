@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,7 +15,7 @@ from transcribe.audio.runner import run_capture_session
 from transcribe.live.session import LiveSessionConfig, LiveSessionResult, run_live_transcription_session
 from transcribe.models import AudioSourceMode, CaptureConfig
 from transcribe.ui.controller import UiTaskController
-from transcribe.ui.types import SessionRequest, UiCommonOptions
+from transcribe.ui.types import ComplianceResultSummary, SessionRequest, UiCommonOptions
 
 
 def test_run_capture_session_can_cancel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -169,13 +170,50 @@ def test_ui_run_session_skips_notes_when_no_final_segments(monkeypatch: pytest.M
     assert ("notes_skipped", {"reason": "no_final_segments"}) in progress_events
 
 
+def test_ui_networked_tasks_require_network_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    import transcribe.ui.services as services_module
+
+    common = UiCommonOptions(allow_network=False)
+
+    with pytest.raises(RuntimeError, match="Allow Network Access"):
+        services_module.ensure_network_downloads_available("Benchmark cache initialization", common=common)
+
+
+
 def test_ui_networked_tasks_require_fresh_process_after_guard_install(monkeypatch: pytest.MonkeyPatch) -> None:
     import transcribe.ui.services as services_module
 
     monkeypatch.setattr(services_module, "outbound_network_guard_installed", lambda: True)
 
     with pytest.raises(RuntimeError, match="Restart transcribe-ui"):
-        services_module.ensure_network_downloads_available("Benchmark cache initialization")
+        services_module.ensure_network_downloads_available(
+            "Benchmark cache initialization",
+            common=UiCommonOptions(allow_network=True),
+        )
+
+
+def test_configure_runtime_skips_guard_when_network_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import transcribe.ui.services as services_module
+
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        services_module,
+        "load_app_config",
+        lambda config_path=None, overrides=None: SimpleNamespace(
+            log_level=(overrides or {}).get("log_level", "ERROR"),
+            redact_logs=False,
+            offline_only=True,
+        ),
+    )
+    monkeypatch.setattr(services_module, "configure_logging", lambda log_level, redact_logs=False: observed.setdefault("log_level", log_level))
+    monkeypatch.setattr(services_module, "set_network_access_allowed", lambda allowed: observed.setdefault("allow_network", allowed))
+    monkeypatch.setattr(services_module, "install_outbound_network_guard", lambda: observed.setdefault("guard_installed", True))
+
+    services_module.configure_runtime(UiCommonOptions(allow_network=True))
+
+    assert observed["allow_network"] is True
+    assert observed["log_level"] == "ERROR"
+    assert "guard_installed" not in observed
 
 
 def test_ui_task_controller_emits_progress_result_and_finished() -> None:
@@ -253,8 +291,108 @@ def test_ui_page_order_hides_bench_in_packaged_mode() -> None:
     assert "bench" not in app_module.page_order(packaged_runtime=True)
 
 
-def test_ui_smoke_instantiates_when_tk_available() -> None:
+def test_ui_preferences_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    preferences_module = importlib.import_module("transcribe.ui.preferences")
+    prefs_path = tmp_path / "ui-preferences.json"
+    monkeypatch.setattr(preferences_module, "preferences_path", lambda: prefs_path)
+
+    preferences_module.save_ui_preferences(
+        preferences_module.UiPreferences(advanced_ui=False, allow_network=True)
+    )
+    loaded = preferences_module.load_ui_preferences()
+
+    assert loaded.allow_network is True
+    assert loaded.advanced_ui is True
+
+
+def test_ui_loads_persisted_network_preference(monkeypatch: pytest.MonkeyPatch) -> None:
     app_module = importlib.import_module("transcribe.ui.app")
+    observed: list[bool] = []
+    monkeypatch.setattr(
+        app_module,
+        "load_ui_preferences",
+        lambda: app_module.UiPreferences(advanced_ui=True, allow_network=True),
+    )
+    monkeypatch.setattr(app_module, "set_network_access_allowed", lambda allowed: observed.append(allowed))
+    try:
+        root = app_module.tk.Tk()
+    except app_module.tk.TclError:
+        pytest.skip("Tk is unavailable in this environment")
+    try:
+        root.withdraw()
+        app = app_module.TranscribeUiApp(root, packaged_runtime=False)
+
+        assert app.advanced_ui_var.get() is True
+        assert app.allow_network_var.get() is True
+        assert observed[-1] is True
+    finally:
+        root.destroy()
+
+
+def test_ui_persists_network_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
+    app_module = importlib.import_module("transcribe.ui.app")
+    saved: list[object] = []
+    observed_network: list[bool] = []
+    monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
+    monkeypatch.setattr(app_module, "save_ui_preferences", lambda preferences: saved.append(preferences))
+    monkeypatch.setattr(app_module, "set_network_access_allowed", lambda allowed: observed_network.append(allowed))
+    try:
+        root = app_module.tk.Tk()
+    except app_module.tk.TclError:
+        pytest.skip("Tk is unavailable in this environment")
+    try:
+        root.withdraw()
+        app = app_module.TranscribeUiApp(root, packaged_runtime=False)
+        app.advanced_ui_var.set(True)
+        app._handle_advanced_ui_toggle()
+        app.allow_network_var.set(True)
+        app._handle_allow_network_toggle()
+
+        assert saved
+        assert saved[-1].advanced_ui is True
+        assert saved[-1].allow_network is True
+        assert observed_network[-1] is True
+    finally:
+        root.destroy()
+
+
+def test_compliance_page_shows_informative_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    app_module = importlib.import_module("transcribe.ui.app")
+    monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
+    try:
+        root = app_module.tk.Tk()
+    except app_module.tk.TclError:
+        pytest.skip("Tk is unavailable in this environment")
+    try:
+        root.withdraw()
+        app = app_module.TranscribeUiApp(root, packaged_runtime=False)
+        page = app.pages["compliance"]
+        assert isinstance(page, app_module.CompliancePage)
+
+        page.handle_result(
+            ComplianceResultSummary(
+                name="check-no-network",
+                exit_code=1,
+                passed=False,
+                summary="Outbound network is currently allowed in this process.",
+                details=(
+                    "Observed outbound_blocked=False, loopback_allowed=True.",
+                    "If you enabled network in the UI, disable 'Allow Network Access' and restart before rerunning this check.",
+                ),
+            )
+        )
+        rendered = page.text.get("1.0", "end-1c")
+
+        assert "Outbound network is currently allowed in this process." in rendered
+        assert "disable 'Allow Network Access' and restart" in rendered
+        assert page.status_var.get().endswith("Outbound network is currently allowed in this process.")
+    finally:
+        root.destroy()
+
+
+def test_ui_smoke_instantiates_when_tk_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    app_module = importlib.import_module("transcribe.ui.app")
+    monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
     try:
         root = app_module.tk.Tk()
     except app_module.tk.TclError:
@@ -268,6 +406,7 @@ def test_ui_smoke_instantiates_when_tk_available() -> None:
         assert "session" in app.pages
         assert "logs" in app.pages
         assert app.log_level_combo.cget("values") == app_module.LOG_LEVEL_OPTIONS
+        assert app.allow_network_var.get() is False
         assert not hasattr(app, "debug_var")
         assert session_page.start_button.cget("style") == "Primary.TButton"
         assert session_page.stop_button.cget("style") == "Danger.TButton"
@@ -281,8 +420,10 @@ def test_ui_smoke_instantiates_when_tk_available() -> None:
         assert session_page.advanced_visible is False
         assert capture_page.advanced_visible is False
         app.advanced_ui_var.set(True)
+        app.allow_network_var.set(True)
         app._apply_advanced_ui_state()
         assert session_page.advanced_visible is True
         assert capture_page.advanced_visible is True
+        assert app.common_options().allow_network is True
     finally:
         root.destroy()

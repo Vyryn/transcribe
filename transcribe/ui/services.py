@@ -415,16 +415,22 @@ def install_models(
 
 def run_compliance_check_no_network(*, common: UiCommonOptions) -> ComplianceResultSummary:
     """Run the outbound-network compliance check."""
-    from transcribe.compliance import run_network_compliance_check
+    from transcribe.compliance import evaluate_network_compliance
 
     configure_runtime(common)
-    exit_code = int(run_network_compliance_check())
-    return ComplianceResultSummary(name="check-no-network", exit_code=exit_code, passed=exit_code == 0)
+    report = evaluate_network_compliance()
+    return ComplianceResultSummary(
+        name="check-no-network",
+        exit_code=report.exit_code,
+        passed=report.passed,
+        summary=report.summary,
+        details=report.details,
+    )
 
 
 def run_compliance_check_no_urls(*, common: UiCommonOptions, target_path: Path | None = None) -> ComplianceResultSummary:
     """Run the no-URL-literals compliance check."""
-    from transcribe.compliance import enforce_no_url_literals
+    from transcribe.compliance import evaluate_url_literal_compliance
 
     configure_runtime(common)
     runtime_paths = resolve_app_runtime_paths()
@@ -434,11 +440,13 @@ def run_compliance_check_no_urls(*, common: UiCommonOptions, target_path: Path |
             resolved_target = runtime_paths.install_root
         else:
             resolved_target = Path.cwd()
-    exit_code = int(enforce_no_url_literals(resolved_target))
+    report = evaluate_url_literal_compliance(resolved_target)
     return ComplianceResultSummary(
         name="check-no-urls",
-        exit_code=exit_code,
-        passed=exit_code == 0,
+        exit_code=report.exit_code,
+        passed=report.passed,
+        summary=report.summary,
+        details=report.details,
         target_path=resolved_target,
     )
 

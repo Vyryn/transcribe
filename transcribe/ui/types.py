@@ -182,6 +182,8 @@ class ComplianceResultSummary:
     name: str
     exit_code: int
     passed: bool
+    summary: str
+    details: tuple[str, ...] = ()
     target_path: Path | None = None
 
 

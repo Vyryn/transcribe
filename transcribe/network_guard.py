@@ -136,20 +136,21 @@ def outbound_network_guard_installed() -> bool:
 
 
 def run_network_guard_self_test() -> dict[str, bool]:
-    """Run an in-process self-test for outbound network blocking.
+    """Run an in-process self-test for the current outbound-network policy.
 
     Returns
     -------
     dict[str, bool]
         Result flags for outbound blocking and loopback allowance.
     """
-    install_outbound_network_guard()
-
     outbound_blocked = False
     try:
         socket.create_connection(("example.com", 443), timeout=0.1)
     except OutboundNetworkBlocked:
         outbound_blocked = True
+    except OSError:
+        # The outbound probe host can be unreachable even when policy allows networking.
+        outbound_blocked = False
 
     loopback_allowed = False
     try:

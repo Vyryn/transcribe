@@ -12,9 +12,10 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
 from transcribe.models import AudioSourceMode
-from transcribe.runtime_env import RuntimeMode, detect_runtime_mode
+from transcribe.runtime_env import RuntimeMode, detect_runtime_mode, set_network_access_allowed
 from transcribe.ui.controller import ControllerMessage, UiTaskController
 from transcribe.ui import services
+from transcribe.ui.preferences import UiPreferences, load_ui_preferences, save_ui_preferences
 from transcribe.ui.services import default_data_subdir
 from transcribe.ui.types import (
     BenchmarkInitRequest,
@@ -965,10 +966,13 @@ class CompliancePage(BasePage):
     def handle_result(self, result: object) -> None:
         assert isinstance(result, ComplianceResultSummary)
         status = "PASS" if result.passed else f"FAIL ({result.exit_code})"
-        target = f" target={result.target_path}" if result.target_path else ""
-        line = f"{result.name}: {status}{target}"
+        line = f"{result.name}: {status} - {result.summary}"
+        detail_lines = [line]
+        if result.target_path is not None:
+            detail_lines.append(f"Target: {result.target_path}")
+        detail_lines.extend(result.details)
         self.text.configure(state="normal")
-        self.text.insert(tk.END, line + "\n")
+        self.text.insert(tk.END, "\n".join(detail_lines) + "\n\n")
         self.text.see(tk.END)
         self.text.configure(state="disabled")
         self.status_var.set(line)
@@ -987,9 +991,12 @@ class TranscribeUiApp:
         self._devices: tuple[DeviceInfo, ...] = ()
         runtime_mode = detect_runtime_mode() if packaged_runtime is None else (RuntimeMode.PACKAGED if packaged_runtime else RuntimeMode.DEVELOPMENT)
         self.packaged_runtime = runtime_mode == RuntimeMode.PACKAGED
+        self.preferences = load_ui_preferences()
+        set_network_access_allowed(self.preferences.allow_network)
 
         self._apply_theme()
         self._build_shell()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_messages()
 
     def _apply_theme(self) -> None:
@@ -1015,12 +1022,12 @@ class TranscribeUiApp:
         header = ttk.Frame(self.content)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         header.columnconfigure(1, weight=1)
-        self.advanced_ui_var = tk.BooleanVar(value=False)
+        self.advanced_ui_var = tk.BooleanVar(value=self.preferences.advanced_ui)
         ttk.Checkbutton(
             header,
             text="Expand Options",
             variable=self.advanced_ui_var,
-            command=self._apply_advanced_ui_state,
+            command=self._handle_advanced_ui_toggle,
         ).grid(row=0, column=0, sticky="w")
         self.busy_var = tk.StringVar(value="Idle")
         ttk.Label(header, textvariable=self.busy_var).grid(row=0, column=1, sticky="e", padx=(12, 0))
@@ -1042,11 +1049,12 @@ class TranscribeUiApp:
             width=10,
         )
         self.log_level_combo.grid(row=0, column=4, sticky="ew", padx=(6, 6))
-        self.allow_network_var = tk.BooleanVar(value=False)
+        self.allow_network_var = tk.BooleanVar(value=self.preferences.allow_network)
         ttk.Checkbutton(
             self.global_advanced_frame,
             text="Allow Network Access",
             variable=self.allow_network_var,
+            command=self._handle_allow_network_toggle,
         ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
         self.page_container = ttk.Frame(self.content)
@@ -1092,6 +1100,36 @@ class TranscribeUiApp:
             debug=(log_level or "").upper() == "DEBUG",
             allow_network=self.allow_network_var.get(),
         )
+
+    def _current_preferences(self) -> UiPreferences:
+        """Return the current persisted UI preference state."""
+        return UiPreferences(
+            advanced_ui=self.advanced_ui_var.get(),
+            allow_network=self.allow_network_var.get(),
+        )
+
+    def _persist_preferences(self, *, show_error: bool = True) -> None:
+        """Write the current UI preference state to disk."""
+        try:
+            save_ui_preferences(self._current_preferences())
+        except OSError as exc:
+            if show_error:
+                messagebox.showerror("Preferences save failed", str(exc))
+
+    def _handle_advanced_ui_toggle(self) -> None:
+        """Persist the expanded-options toggle and refresh the page layout."""
+        self._persist_preferences()
+        self._apply_advanced_ui_state()
+
+    def _handle_allow_network_toggle(self) -> None:
+        """Persist the network-access toggle for restart-sensitive workflows."""
+        set_network_access_allowed(self.allow_network_var.get())
+        self._persist_preferences()
+
+    def _on_close(self) -> None:
+        """Persist UI preferences before closing the application window."""
+        self._persist_preferences(show_error=False)
+        self.root.destroy()
 
     def _apply_advanced_ui_state(self) -> None:
         """Toggle advanced controls across all workflow pages."""

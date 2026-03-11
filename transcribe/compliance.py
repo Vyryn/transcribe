@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from transcribe.network_guard import run_network_guard_self_test
@@ -20,6 +21,16 @@ _EXCLUDED_FILENAMES = {
 }
 # Build without embedding literal URL tokens in source.
 _URL_LITERAL_PATTERN = re.compile(r"(?:http|https)" + r"://")
+
+@dataclass(frozen=True, slots=True)
+class ComplianceCheckReport:
+    """Structured compliance-check result for CLI and UI consumers."""
+
+    passed: bool
+    exit_code: int
+    summary: str
+    details: tuple[str, ...] = ()
+
 
 
 def tracked_files(repo_root: Path) -> list[Path]:
@@ -91,6 +102,28 @@ def run_url_literal_check(repo_root: Path) -> list[tuple[Path, int, str]]:
     return violations
 
 
+def evaluate_url_literal_compliance(repo_root: Path) -> ComplianceCheckReport:
+    """Evaluate URL-literal compliance and return a structured report."""
+    violations = run_url_literal_check(repo_root)
+    if not violations:
+        return ComplianceCheckReport(
+            passed=True,
+            exit_code=0,
+            summary="No URL literals found in runtime source files.",
+        )
+
+    details = tuple(
+        f"{path.relative_to(repo_root)}:{line_number}: {line}"
+        for path, line_number, line in violations
+    )
+    return ComplianceCheckReport(
+        passed=False,
+        exit_code=1,
+        summary=f"Found {len(violations)} URL literal violation(s) in runtime source files.",
+        details=details,
+    )
+
+
 def enforce_no_url_literals(repo_root: Path) -> int:
     """Run URL-literal check and print CLI-friendly output.
 
@@ -104,15 +137,48 @@ def enforce_no_url_literals(repo_root: Path) -> int:
     int
         Exit code where ``0`` means pass.
     """
-    violations = run_url_literal_check(repo_root)
-    if not violations:
-        print("PASS: no URL literals found in runtime source files")
-        return 0
+    report = evaluate_url_literal_compliance(repo_root)
+    if report.passed:
+        print(f"PASS: {report.summary}")
+        return report.exit_code
 
-    print("FAIL: URL literals found in runtime source files:")
-    for path, line_number, line in violations:
-        print(f"- {path.relative_to(repo_root)}:{line_number}: {line}")
-    return 1
+    print(f"FAIL: {report.summary}")
+    for detail in report.details:
+        print(f"- {detail}")
+    return report.exit_code
+
+
+def evaluate_network_compliance() -> ComplianceCheckReport:
+    """Evaluate outbound-network compliance for the current process."""
+    results = run_network_guard_self_test()
+    if results["outbound_blocked"] and results["loopback_allowed"]:
+        return ComplianceCheckReport(
+            passed=True,
+            exit_code=0,
+            summary="Outbound network is blocked and loopback is allowed.",
+        )
+
+    observed = (
+        f"Observed outbound_blocked={results['outbound_blocked']}, "
+        f"loopback_allowed={results['loopback_allowed']}."
+    )
+    if not results["outbound_blocked"]:
+        return ComplianceCheckReport(
+            passed=False,
+            exit_code=1,
+            summary="Outbound network is currently allowed in this process.",
+            details=(
+                observed,
+                "If you enabled network in the UI, disable 'Allow Network Access' and restart before rerunning this check.",
+            ),
+        )
+
+    return ComplianceCheckReport(
+        passed=False,
+        exit_code=1,
+        summary="Loopback connections are unexpectedly blocked in this process.",
+        details=(observed,),
+    )
 
 
 def run_network_compliance_check() -> int:
@@ -123,11 +189,12 @@ def run_network_compliance_check() -> int:
     int
         Exit code where ``0`` means pass.
     """
-    results = run_network_guard_self_test()
-    if results["outbound_blocked"] and results["loopback_allowed"]:
-        print("PASS: outbound network blocked and loopback allowed")
-        return 0
+    report = evaluate_network_compliance()
+    if report.passed:
+        print(f"PASS: {report.summary}")
+        return report.exit_code
 
-    print("FAIL: network guard self-test did not pass")
-    print(results)
-    return 1
+    print(f"FAIL: {report.summary}")
+    for detail in report.details:
+        print(detail)
+    return report.exit_code
