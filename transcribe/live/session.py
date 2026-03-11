@@ -562,6 +562,7 @@ def run_live_transcription_session(
     transcriber: ChunkTranscriber | None = None,
     debug: bool = False,
     progress_callback: SessionProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> LiveSessionResult:
     """Run a live multi-source transcription session with partial/final events."""
     config.transcription_model = validate_transcription_model_for_runtime(config.transcription_model)
@@ -637,6 +638,10 @@ def run_live_transcription_session(
     source_selection_counts: dict[str, int] = {}
     interrupted = False
     previous_final_text = ""
+    session_started_monotonic = time.monotonic()
+
+    def _cancel_requested() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
 
     _emit_progress(
         progress_callback,
@@ -678,53 +683,263 @@ def run_live_transcription_session(
         preload_thread.start()
 
         while not preload_completed.is_set():
+            if _cancel_requested():
+                interrupted = True
+                break
             try:
                 frames = backend.read_frames(timeout_ms=config.frame_ms * 3)
             except TimeoutError:
+                if _cancel_requested():
+                    interrupted = True
+                    break
                 continue
             for source_name, frame in frames.items():
                 source_buffer = chunk_pcm16_by_source.setdefault(source_name, bytearray())
                 source_buffer.extend(frame.mono_pcm16)
 
         preload_thread.join(timeout=0.0)
-        if preload_error:
+        if interrupted:
+            chunk_pcm16_by_source = {}
+        elif preload_error:
             backend.close()
             raise _build_live_transcription_runtime_error(
                 config.transcription_model,
                 preload_error[0],
             ) from preload_error[0]
+        else:
+            chunk_transcriber = _build_default_chunk_transcriber(
+                config.transcription_model,
+                config.max_model_ram_gb,
+            )
+            startup_buffered_audio_sec = _max_buffered_audio_sec(
+                chunk_pcm16_by_source,
+                bytes_per_second=bytes_per_second,
+            )
+            _emit_progress(
+                progress_callback,
+                "model_ready",
+                transcription_model=config.transcription_model,
+                buffered_audio_sec=startup_buffered_audio_sec,
+            )
 
-        chunk_transcriber = _build_default_chunk_transcriber(
-            config.transcription_model,
-            config.max_model_ram_gb,
-        )
-        startup_buffered_audio_sec = _max_buffered_audio_sec(
-            chunk_pcm16_by_source,
-            bytes_per_second=bytes_per_second,
-        )
+    def _write_event(event: dict[str, object], handle: object) -> None:
+        handle.write(json.dumps(event, ensure_ascii=True) + "\n")
+        handle.flush()
+
+    if not interrupted:
+        assert chunk_transcriber is not None
+
+        chunk_started = time.monotonic()
+        started = chunk_started
+        last_partial_at = chunk_started
+
         _emit_progress(
             progress_callback,
-            "model_ready",
-            transcription_model=config.transcription_model,
+            "transcribing_started",
+            chunk_sec=config.chunk_sec,
+            partial_interval_sec=config.partial_interval_sec,
+            duration_sec=config.duration_sec,
             buffered_audio_sec=startup_buffered_audio_sec,
         )
 
-    assert chunk_transcriber is not None
+        def _transcribe_chunk_with_progress(chunk_pcm16: bytes) -> tuple[str, float]:
+            text, latency_ms = _transcribe_chunk_or_raise(
+                bytearray(chunk_pcm16),
+                capture_sample_rate_hz=capture_sample_rate_hz,
+                transcription_sample_rate_hz=transcription_sample_rate_hz,
+                channels=config.channels,
+                transcription_model=config.transcription_model,
+                transcriber=chunk_transcriber,
+                suppress_backend_output=not debug,
+            )
+            return text, latency_ms
 
-    chunk_started = time.monotonic()
-    started = chunk_started
-    last_partial_at = chunk_started
+        try:
+            with events_path.open("w", encoding="utf-8") as events_file:
+                while True:
+                    if _cancel_requested():
+                        raise KeyboardInterrupt
+                    now = time.monotonic()
+                    if config.duration_sec > 0 and (now - started) >= config.duration_sec:
+                        break
 
-    _emit_progress(
-        progress_callback,
-        "transcribing_started",
-        chunk_sec=config.chunk_sec,
-        partial_interval_sec=config.partial_interval_sec,
-        duration_sec=config.duration_sec,
-        buffered_audio_sec=startup_buffered_audio_sec,
-    )
+                    try:
+                        frames = backend.read_frames(timeout_ms=config.frame_ms * 3)
+                    except TimeoutError:
+                        if _cancel_requested():
+                            raise KeyboardInterrupt
+                        continue
+
+                    for source_name, frame in frames.items():
+                        source_buffer = chunk_pcm16_by_source.setdefault(source_name, bytearray())
+                        source_buffer.extend(frame.mono_pcm16)
+                    now = time.monotonic()
+                    buffered_audio_sec = _max_buffered_audio_sec(
+                        chunk_pcm16_by_source,
+                        bytes_per_second=bytes_per_second,
+                    )
+
+                    if config.partial_interval_sec > 0 and (now - last_partial_at) >= config.partial_interval_sec:
+                        if buffered_audio_sec < 0.5:
+                            last_partial_at = now
+                            continue
+                        selected_chunk = _select_best_source_chunk(
+                            chunk_pcm16_by_source,
+                            sample_rate_hz=capture_sample_rate_hz,
+                            previous_source=last_selected_source,
+                        )
+                        if selected_chunk is None:
+                            last_partial_at = now
+                            continue
+                        selected_source, selected_pcm16, source_scores = selected_chunk
+                        if (len(selected_pcm16) / bytes_per_second) < 0.5:
+                            last_partial_at = now
+                            continue
+                        selected_score = source_scores.get(selected_source, float("-inf"))
+                        elapsed_sec = max(now - started, 1e-6)
+                        backlog_ratio = (total_inference_ms / 1000.0) / elapsed_sec
+                        if _should_skip_asr_for_chunk(
+                            selected_pcm16,
+                            clarity_score=selected_score,
+                            backlog_ratio=backlog_ratio,
+                            recent_empty_streak=empty_output_streak,
+                        ):
+                            last_partial_at = now
+                            continue
+                        last_selected_source = selected_source
+                        text, latency_ms = _transcribe_chunk_with_progress(selected_pcm16)
+                        total_inference_ms += latency_ms
+                        if text and text != last_partial_text:
+                            partial_event = {
+                                "event": "partial",
+                                "session_id": config.session_id,
+                                "chunk_index": chunk_index,
+                                "audio_sec": len(selected_pcm16) / bytes_per_second,
+                                "inference_latency_ms": latency_ms,
+                                "selected_source": selected_source,
+                                "source_scores": source_scores,
+                                "text": text,
+                                "emitted_at_utc": datetime.now(timezone.utc).isoformat(),
+                            }
+                            _write_event(partial_event, events_file)
+                            _emit_progress(
+                                progress_callback,
+                                "partial",
+                                chunk_index=chunk_index,
+                                text=text,
+                                selected_source=selected_source,
+                            )
+                            partial_event_count += 1
+                            last_partial_text = text
+                        last_partial_at = now
+
+                    if buffered_audio_sec < config.chunk_sec:
+                        continue
+
+                    selected_chunk = _select_best_source_chunk(
+                        chunk_pcm16_by_source,
+                        sample_rate_hz=capture_sample_rate_hz,
+                        previous_source=last_selected_source,
+                    )
+                    if selected_chunk is None:
+                        continue
+                    selected_source, selected_pcm16, source_scores = selected_chunk
+                    selected_audio_sec = len(selected_pcm16) / bytes_per_second
+                    if selected_audio_sec < config.chunk_sec:
+                        continue
+
+                    last_selected_source = selected_source
+                    selected_score = source_scores.get(selected_source, float("-inf"))
+                    elapsed_sec = max(now - started, 1e-6)
+                    backlog_ratio = (total_inference_ms / 1000.0) / elapsed_sec
+                    if _should_skip_asr_for_chunk(
+                        selected_pcm16,
+                        clarity_score=selected_score,
+                        backlog_ratio=backlog_ratio,
+                        recent_empty_streak=empty_output_streak,
+                    ):
+                        skipped_silence_chunks += 1
+                        source_selection_counts[selected_source] = source_selection_counts.get(selected_source, 0) + 1
+                        total_audio_bytes += len(selected_pcm16)
+                        empty_output_streak += 1
+                        chunk_index += 1
+                        chunk_started = now
+                        last_partial_at = now
+                        last_partial_text = ""
+                        chunk_pcm16_by_source = {}
+                        continue
+                    text, latency_ms = _transcribe_chunk_with_progress(selected_pcm16)
+                    total_inference_ms += latency_ms
+
+                    if not text:
+                        dropped_empty_chunk_count += 1
+                        source_selection_counts[selected_source] = source_selection_counts.get(selected_source, 0) + 1
+                        total_audio_bytes += len(selected_pcm16)
+                        empty_output_streak += 1
+                        chunk_index += 1
+                        chunk_started = now
+                        last_partial_at = now
+                        last_partial_text = ""
+                        chunk_pcm16_by_source = {}
+                        continue
+
+                    if config.stitch_overlap_text:
+                        stitched_text = _stitch_text_overlap(previous_final_text, text)
+                        if stitched_text:
+                            text = stitched_text
+
+                    empty_output_streak = 0
+                    total_audio_bytes += len(selected_pcm16)
+                    source_selection_counts[selected_source] = source_selection_counts.get(selected_source, 0) + 1
+                    segment_event = {
+                        "event": "final",
+                        "session_id": config.session_id,
+                        "chunk_index": chunk_index,
+                        "audio_sec": selected_audio_sec,
+                        "inference_latency_ms": latency_ms,
+                        "selected_source": selected_source,
+                        "source_scores": source_scores,
+                        "silence_skipped": False,
+                        "text": text,
+                        "emitted_at_utc": datetime.now(timezone.utc).isoformat(),
+                    }
+                    _write_event(segment_event, events_file)
+                    _emit_progress(
+                        progress_callback,
+                        "final",
+                        chunk_index=chunk_index,
+                        text=text,
+                        selected_source=selected_source,
+                    )
+                    final_segments.append(
+                        {
+                            "chunk_index": chunk_index,
+                            "text": text,
+                            "audio_sec": selected_audio_sec,
+                            "inference_latency_ms": latency_ms,
+                            "selected_source": selected_source,
+                            "source_scores": source_scores,
+                            "silence_skipped": bool(latency_ms == 0.0 and not text),
+                        }
+                    )
+                    previous_final_text = text
+                    chunk_index += 1
+                    chunk_started = now
+                    last_partial_at = now
+                    last_partial_text = ""
+                    chunk_pcm16_by_source = _retain_chunk_overlap(
+                        chunk_pcm16_by_source,
+                        overlap_bytes=chunk_overlap_bytes,
+                    )
+        except KeyboardInterrupt:
+            interrupted = True
+        finally:
+            backend.close()
+    else:
+        backend.close()
 
     def _transcribe_chunk_with_progress(chunk_pcm16: bytes) -> tuple[str, float]:
+        assert chunk_transcriber is not None
         text, latency_ms = _transcribe_chunk_or_raise(
             bytearray(chunk_pcm16),
             capture_sample_rate_hz=capture_sample_rate_hz,
@@ -735,191 +950,9 @@ def run_live_transcription_session(
             suppress_backend_output=not debug,
         )
         return text, latency_ms
+    events_path.touch(exist_ok=True)
 
-    def _write_event(event: dict[str, object], handle: object) -> None:
-        handle.write(json.dumps(event, ensure_ascii=True) + "\n")
-        handle.flush()
-
-    try:
-        with events_path.open("w", encoding="utf-8") as events_file:
-            while True:
-                now = time.monotonic()
-                if config.duration_sec > 0 and (now - started) >= config.duration_sec:
-                    break
-
-                try:
-                    frames = backend.read_frames(timeout_ms=config.frame_ms * 3)
-                except TimeoutError:
-                    continue
-
-                for source_name, frame in frames.items():
-                    source_buffer = chunk_pcm16_by_source.setdefault(source_name, bytearray())
-                    source_buffer.extend(frame.mono_pcm16)
-                now = time.monotonic()
-                buffered_audio_sec = _max_buffered_audio_sec(
-                    chunk_pcm16_by_source,
-                    bytes_per_second=bytes_per_second,
-                )
-
-                if config.partial_interval_sec > 0 and (now - last_partial_at) >= config.partial_interval_sec:
-                    if buffered_audio_sec < 0.5:
-                        last_partial_at = now
-                        continue
-                    selected_chunk = _select_best_source_chunk(
-                        chunk_pcm16_by_source,
-                        sample_rate_hz=capture_sample_rate_hz,
-                        previous_source=last_selected_source,
-                    )
-                    if selected_chunk is None:
-                        last_partial_at = now
-                        continue
-                    selected_source, selected_pcm16, source_scores = selected_chunk
-                    if (len(selected_pcm16) / bytes_per_second) < 0.5:
-                        last_partial_at = now
-                        continue
-                    selected_score = source_scores.get(selected_source, float("-inf"))
-                    elapsed_sec = max(now - started, 1e-6)
-                    backlog_ratio = (total_inference_ms / 1000.0) / elapsed_sec
-                    if _should_skip_asr_for_chunk(
-                        selected_pcm16,
-                        clarity_score=selected_score,
-                        backlog_ratio=backlog_ratio,
-                        recent_empty_streak=empty_output_streak,
-                    ):
-                        last_partial_at = now
-                        continue
-                    last_selected_source = selected_source
-                    text, latency_ms = _transcribe_chunk_with_progress(selected_pcm16)
-                    total_inference_ms += latency_ms
-                    if text and text != last_partial_text:
-                        partial_event = {
-                            "event": "partial",
-                            "session_id": config.session_id,
-                            "chunk_index": chunk_index,
-                            "audio_sec": len(selected_pcm16) / bytes_per_second,
-                            "inference_latency_ms": latency_ms,
-                            "selected_source": selected_source,
-                            "source_scores": source_scores,
-                            "text": text,
-                            "emitted_at_utc": datetime.now(timezone.utc).isoformat(),
-                        }
-                        _write_event(partial_event, events_file)
-                        _emit_progress(
-                            progress_callback,
-                            "partial",
-                            chunk_index=chunk_index,
-                            text=text,
-                            selected_source=selected_source,
-                        )
-                        partial_event_count += 1
-                        last_partial_text = text
-                    last_partial_at = now
-
-                if buffered_audio_sec < config.chunk_sec:
-                    continue
-
-                selected_chunk = _select_best_source_chunk(
-                    chunk_pcm16_by_source,
-                    sample_rate_hz=capture_sample_rate_hz,
-                    previous_source=last_selected_source,
-                )
-                if selected_chunk is None:
-                    continue
-                selected_source, selected_pcm16, source_scores = selected_chunk
-                selected_audio_sec = len(selected_pcm16) / bytes_per_second
-                if selected_audio_sec < config.chunk_sec:
-                    continue
-
-                last_selected_source = selected_source
-                selected_score = source_scores.get(selected_source, float("-inf"))
-                elapsed_sec = max(now - started, 1e-6)
-                backlog_ratio = (total_inference_ms / 1000.0) / elapsed_sec
-                if _should_skip_asr_for_chunk(
-                    selected_pcm16,
-                    clarity_score=selected_score,
-                    backlog_ratio=backlog_ratio,
-                    recent_empty_streak=empty_output_streak,
-                ):
-                    skipped_silence_chunks += 1
-                    source_selection_counts[selected_source] = source_selection_counts.get(selected_source, 0) + 1
-                    total_audio_bytes += len(selected_pcm16)
-                    empty_output_streak += 1
-                    chunk_index += 1
-                    chunk_started = now
-                    last_partial_at = now
-                    last_partial_text = ""
-                    chunk_pcm16_by_source = {}
-                    continue
-                else:
-                    text, latency_ms = _transcribe_chunk_with_progress(selected_pcm16)
-                    total_inference_ms += latency_ms
-
-                if not text:
-                    dropped_empty_chunk_count += 1
-                    source_selection_counts[selected_source] = source_selection_counts.get(selected_source, 0) + 1
-                    total_audio_bytes += len(selected_pcm16)
-                    empty_output_streak += 1
-                    chunk_index += 1
-                    chunk_started = now
-                    last_partial_at = now
-                    last_partial_text = ""
-                    chunk_pcm16_by_source = {}
-                    continue
-
-                if config.stitch_overlap_text:
-                    stitched_text = _stitch_text_overlap(previous_final_text, text)
-                    if stitched_text:
-                        text = stitched_text
-
-                empty_output_streak = 0
-                total_audio_bytes += len(selected_pcm16)
-                source_selection_counts[selected_source] = source_selection_counts.get(selected_source, 0) + 1
-                segment_event = {
-                    "event": "final",
-                    "session_id": config.session_id,
-                    "chunk_index": chunk_index,
-                    "audio_sec": selected_audio_sec,
-                    "inference_latency_ms": latency_ms,
-                    "selected_source": selected_source,
-                    "source_scores": source_scores,
-                    "silence_skipped": False,
-                    "text": text,
-                    "emitted_at_utc": datetime.now(timezone.utc).isoformat(),
-                }
-                _write_event(segment_event, events_file)
-                _emit_progress(
-                    progress_callback,
-                    "final",
-                    chunk_index=chunk_index,
-                    text=text,
-                    selected_source=selected_source,
-                )
-                final_segments.append(
-                    {
-                        "chunk_index": chunk_index,
-                        "text": text,
-                        "audio_sec": selected_audio_sec,
-                        "inference_latency_ms": latency_ms,
-                        "selected_source": selected_source,
-                        "source_scores": source_scores,
-                        "silence_skipped": bool(latency_ms == 0.0 and not text),
-                    }
-                )
-                previous_final_text = text
-                chunk_index += 1
-                chunk_started = now
-                last_partial_at = now
-                last_partial_text = ""
-                chunk_pcm16_by_source = _retain_chunk_overlap(
-                    chunk_pcm16_by_source,
-                    overlap_bytes=chunk_overlap_bytes,
-                )
-    except KeyboardInterrupt:
-        interrupted = True
-    finally:
-        backend.close()
-
-    if any(chunk_pcm16_by_source.values()):
+    if chunk_transcriber is not None and any(chunk_pcm16_by_source.values()):
         selected_chunk = _select_best_source_chunk(
             chunk_pcm16_by_source,
             sample_rate_hz=capture_sample_rate_hz,
@@ -1001,7 +1034,7 @@ def run_live_transcription_session(
                     empty_output_streak += 1
 
     total_audio_sec = total_audio_bytes / bytes_per_second
-    session_elapsed_sec = time.monotonic() - started
+    session_elapsed_sec = time.monotonic() - (started if started > 0 else session_started_monotonic)
     transcript_payload = {
         "schema_version": "phase1-live-session-v1",
         "session_id": config.session_id,
@@ -1064,5 +1097,7 @@ def run_live_transcription_session(
         source_selection_counts=source_selection_counts,
         interrupted=interrupted,
     )
+
+
 
 

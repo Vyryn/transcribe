@@ -4,6 +4,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
 
 from transcribe.audio.backend_loader import open_audio_backend
 from transcribe.audio.sync import SyncAccumulator, build_captured_pair, record_pair_stats, summarize_stats
@@ -15,7 +16,13 @@ from transcribe.models import CaptureConfig, SessionManifest
 class CaptureRunResult:
     """Container for capture-session outputs."""
 
-    def __init__(self, manifest: SessionManifest, manifest_path: Path) -> None:
+    def __init__(
+        self,
+        manifest: SessionManifest,
+        manifest_path: Path,
+        *,
+        interrupted: bool = False,
+    ) -> None:
         """Initialize result wrapper.
 
         Parameters
@@ -24,9 +31,12 @@ class CaptureRunResult:
             Session metadata.
         manifest_path : Path
             Persisted manifest path.
+        interrupted : bool, optional
+            True when capture ended early via cooperative cancellation.
         """
         self.manifest = manifest
         self.manifest_path = manifest_path
+        self.interrupted = interrupted
 
 
 def run_capture_session(
@@ -34,6 +44,7 @@ def run_capture_session(
     *,
     duration_sec: float,
     use_fixture: bool = False,
+    cancel_event: Event | None = None,
 ) -> CaptureRunResult:
     """Run a capture session and persist artifacts.
 
@@ -45,6 +56,8 @@ def run_capture_session(
         Capture duration in seconds.
     use_fixture : bool, optional
         If ``True``, uses synthetic frames.
+    cancel_event : Event | None, optional
+        Cooperative cancellation flag checked between backend reads.
 
     Returns
     -------
@@ -66,6 +79,7 @@ def run_capture_session(
     stats = SyncAccumulator()
     started_monotonic = time.monotonic()
     started_monotonic_ns = time.monotonic_ns()
+    interrupted = False
 
     try:
         with (
@@ -73,9 +87,15 @@ def run_capture_session(
             Pcm16MonoWavWriter(speakers_path, sample_rate_hz=capture_sample_rate_hz) as speakers_writer,
         ):
             while time.monotonic() - started_monotonic < duration_sec:
+                if cancel_event is not None and cancel_event.is_set():
+                    interrupted = True
+                    break
                 try:
                     raw = backend.read_frames(timeout_ms=config.frame_ms * 3)
                 except TimeoutError:
+                    if cancel_event is not None and cancel_event.is_set():
+                        interrupted = True
+                        break
                     stats.dropped_pairs += 1
                     continue
 
@@ -109,6 +129,7 @@ def run_capture_session(
             "elapsed_monotonic_ns": time.monotonic_ns() - started_monotonic_ns,
             "frames_written_mic": frame_index,
             "frames_written_speakers": frame_index,
+            "interrupted": interrupted,
         }
     )
 
@@ -128,7 +149,11 @@ def run_capture_session(
     )
 
     write_session_manifest(manifest, manifest_path)
-    return CaptureRunResult(manifest=manifest, manifest_path=manifest_path)
+    return CaptureRunResult(
+        manifest=manifest,
+        manifest_path=manifest_path,
+        interrupted=interrupted,
+    )
 
 
 def with_session_id(config: CaptureConfig, *, session_id: str, output_dir: Path) -> CaptureConfig:
