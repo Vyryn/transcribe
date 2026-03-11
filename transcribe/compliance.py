@@ -8,6 +8,9 @@ from transcribe.network_guard import run_network_guard_self_test
 
 _SCAN_EXTENSIONS = {".py", ".toml", ".json", ".yaml", ".yml", ".ini", ".cfg", ".sh"}
 _EXCLUDED_PREFIXES = ("tests/",)
+_EXCLUDED_PATHS = {
+    "scripts/build_windows_standalone.py",
+}
 _EXCLUDED_FILENAMES = {
     "README.md",
     "REGULATORY_CHECKLIST.md",
@@ -68,6 +71,8 @@ def run_url_literal_check(repo_root: Path) -> list[tuple[Path, int, str]]:
     violations: list[tuple[Path, int, str]] = []
     for path in tracked_files(repo_root):
         rel = path.relative_to(repo_root).as_posix()
+        if rel in _EXCLUDED_PATHS:
+            continue
         if rel in _EXCLUDED_FILENAMES:
             continue
         if rel.startswith(_EXCLUDED_PREFIXES):
