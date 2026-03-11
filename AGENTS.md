@@ -11,3 +11,4 @@ Guidance from past stumbling blocks:
 umpy.frombuffer during backend import so live capture keeps working without waiting on an upstream release.
 
 - Live sessions can begin recording before the ASR model finishes loading. Keep the startup progress order as `capture_ready -> loading_model(capture_active=True) -> model_ready(buffered_audio_sec=...) -> transcribing_started`, and have CLI messaging explain buffering/catch-up so non-debug output stays clear.
+- The Tkinter UI runs as one long-lived process. Any workflow that calls `configure_runtime()` permanently installs the outbound network guard for that process, so networked tasks like packaged model install or `init-bench` must run before offline workflows or after restarting `transcribe-ui`.
