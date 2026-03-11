@@ -875,6 +875,7 @@ class BenchPage(BasePage):
 
     def start_init(self) -> None:
         request = BenchmarkInitRequest(
+            common=self.app.common_options(),
             transcription_model=self.init_model_var.get().strip(),
             hf_dataset=self.init_dataset_var.get().strip(),
             hf_config=self.init_config_var.get().strip(),
@@ -1041,6 +1042,12 @@ class TranscribeUiApp:
             width=10,
         )
         self.log_level_combo.grid(row=0, column=4, sticky="ew", padx=(6, 6))
+        self.allow_network_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self.global_advanced_frame,
+            text="Allow Network Access",
+            variable=self.allow_network_var,
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
         self.page_container = ttk.Frame(self.content)
         self.page_container.grid(row=1, column=0, sticky="nsew")
@@ -1083,6 +1090,7 @@ class TranscribeUiApp:
             config_path=Path(config_value) if config_value else None,
             log_level=log_level,
             debug=(log_level or "").upper() == "DEBUG",
+            allow_network=self.allow_network_var.get(),
         )
 
     def _apply_advanced_ui_state(self) -> None:

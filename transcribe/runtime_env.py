@@ -20,6 +20,7 @@ from transcribe.runtime_defaults import (
 PACKAGED_RUNTIME_ENV = "TRANSCRIBE_PACKAGED"
 APP_ROOT_ENV = "TRANSCRIBE_APP_ROOT"
 DATA_ROOT_ENV = "TRANSCRIBE_DATA_DIR"
+ALLOW_NETWORK_ENV = "TRANSCRIBE_ALLOW_NETWORK"
 
 PACKAGED_ACCURACY_TRANSCRIPTION_MODEL = "nvidia/canary-qwen-2.5b"
 
@@ -78,6 +79,29 @@ def detect_runtime_mode() -> RuntimeMode:
     if is_frozen_app():
         return RuntimeMode.PACKAGED
     return RuntimeMode.DEVELOPMENT
+
+
+def network_access_allowed() -> bool:
+    """Return whether this process should permit outbound network access.
+
+    Returns
+    -------
+    bool
+        ``True`` when network-enabled UI flows should be allowed.
+    """
+    raw = os.environ.get(ALLOW_NETWORK_ENV, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def set_network_access_allowed(allowed: bool) -> None:
+    """Persist the process-level network-access preference.
+
+    Parameters
+    ----------
+    allowed : bool
+        Desired outbound-network preference for subsequent runtime helpers.
+    """
+    os.environ[ALLOW_NETWORK_ENV] = "1" if allowed else "0"
 
 
 def default_install_root() -> Path:

@@ -15,6 +15,7 @@ from typing import Any, Literal
 
 from transcribe.bench.report import build_benchmark_report, write_benchmark_report
 from transcribe.models import CaptureConfig
+from transcribe.runtime_env import network_access_allowed
 from transcribe.utils.stats import percentile
 
 LOGGER = logging.getLogger("transcribe.bench.harness")
@@ -129,9 +130,17 @@ def _allow_hf_network_access() -> None:
 
 def _enforce_hf_offline_mode() -> None:
     """Force offline mode for Hugging Face and Transformers clients."""
+    if network_access_allowed():
+        _allow_hf_network_access()
+        return
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["HF_DATASETS_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
+def _effective_local_files_only(local_files_only: bool) -> bool:
+    """Resolve whether one HF-backed benchmark call should stay strictly offline."""
+    return local_files_only and not network_access_allowed()
 
 
 def _canonical_transcription_model_id(transcription_model: str) -> str:
@@ -335,10 +344,11 @@ def _offline_model_error(model_id: str) -> RuntimeError:
 
 def _get_hf_repo_snapshot(repo_id: str, *, local_files_only: bool) -> str:
     """Resolve local snapshot path for a Hugging Face repo id."""
-    cache_key = f"{repo_id}|local_files_only={local_files_only}"
+    effective_local_files_only = _effective_local_files_only(local_files_only)
+    cache_key = f"{repo_id}|local_files_only={effective_local_files_only}"
     if cache_key in _HF_REPO_SNAPSHOT_CACHE:
         return _HF_REPO_SNAPSHOT_CACHE[cache_key]
-    if local_files_only and repo_id in _HF_REPO_SNAPSHOT_CACHE:
+    if effective_local_files_only and repo_id in _HF_REPO_SNAPSHOT_CACHE:
         return _HF_REPO_SNAPSHOT_CACHE[repo_id]
 
     try:
@@ -348,17 +358,17 @@ def _get_hf_repo_snapshot(repo_id: str, *, local_files_only: bool) -> str:
             "Transcription benchmarking model caching requires `huggingface_hub`."
         ) from exc
 
-    if local_files_only:
+    if effective_local_files_only:
         _enforce_hf_offline_mode()
     try:
-        snapshot_dir = snapshot_download(repo_id=repo_id, local_files_only=local_files_only)
+        snapshot_dir = snapshot_download(repo_id=repo_id, local_files_only=effective_local_files_only)
     except Exception as exc:  # noqa: BLE001
         if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
             raise _offline_model_error(repo_id) from exc
         raise
 
     _HF_REPO_SNAPSHOT_CACHE[cache_key] = snapshot_dir
-    if local_files_only:
+    if effective_local_files_only:
         _HF_REPO_SNAPSHOT_CACHE[repo_id] = snapshot_dir
     return snapshot_dir
 
@@ -1039,7 +1049,11 @@ def load_hf_diarized_rows(
     sample_limit: int | None,
 ) -> list[dict[str, object]]:
     """Load diarized transcription rows from Hugging Face datasets."""
-    _enforce_hf_offline_mode()
+    local_files_only = _effective_local_files_only(True)
+    if local_files_only:
+        _enforce_hf_offline_mode()
+    else:
+        _allow_hf_network_access()
 
     try:
         from datasets import Audio, DownloadConfig, load_dataset
@@ -1065,7 +1079,7 @@ def load_hf_diarized_rows(
                 split=split_expr,
                 streaming=False,
                 trust_remote_code=False,
-                download_config=DownloadConfig(local_files_only=True),
+                download_config=DownloadConfig(local_files_only=local_files_only),
             )
             break
         except ValueError:

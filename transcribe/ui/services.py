@@ -14,6 +14,7 @@ from transcribe.runtime_env import (
     PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
     RuntimeMode,
     resolve_app_runtime_paths,
+    set_network_access_allowed,
     validate_transcription_model_for_runtime,
 )
 from transcribe.runtime_defaults import ALTERNATE_SESSION_NOTES_MODEL
@@ -123,17 +124,31 @@ def configure_runtime(common: UiCommonOptions) -> None:
         overrides={"log_level": _runtime_log_level(common)},
     )
     configure_logging(app_config.log_level, redact_logs=app_config.redact_logs)
-    install_outbound_network_guard()
+    set_network_access_allowed(common.allow_network)
+    if not common.allow_network:
+        install_outbound_network_guard()
     if common.debug:
-        security_log(LOGGER, logging.INFO, "startup", offline_only=app_config.offline_only)
+        security_log(
+            LOGGER,
+            logging.INFO,
+            "startup",
+            offline_only=app_config.offline_only,
+            allow_network=common.allow_network,
+        )
 
 
-def ensure_network_downloads_available(task_name: str) -> None:
-    """Fail fast when a prior offline command permanently installed the socket guard."""
+def ensure_network_downloads_available(task_name: str, *, common: UiCommonOptions) -> None:
+    """Fail fast when a networked task is disabled or no longer possible in-process."""
+    set_network_access_allowed(common.allow_network)
+    if not common.allow_network:
+        raise RuntimeError(
+            f"{task_name} requires outbound network access. "
+            "Enable 'Allow Network Access' in Expand Options and retry."
+        )
     if outbound_network_guard_installed():
         raise RuntimeError(
             f"{task_name} requires outbound network access, but this UI session already installed the offline socket guard. "
-            "Restart transcribe-ui and run the networked task before any offline-only workflow."
+            "Restart transcribe-ui, enable 'Allow Network Access', and run the networked task before any offline-only workflow."
         )
 
 
@@ -362,7 +377,7 @@ def install_models(
     """Install packaged model assets selected from the manifest."""
     from transcribe.packaged_assets import install_packaged_model_assets, load_packaged_asset_manifest
 
-    ensure_network_downloads_available("Packaged model install")
+    ensure_network_downloads_available("Packaged model install", common=request.common)
     runtime_paths = resolve_app_runtime_paths()
     manifest_path = runtime_paths.packaged_assets_manifest_path
     if not manifest_path.exists():
@@ -432,7 +447,7 @@ def initialize_bench_assets(request: BenchmarkInitRequest) -> BenchmarkInitResul
     """Warm benchmark dataset/model cache without enabling the network guard."""
     from transcribe.bench.harness import initialize_benchmark_assets
 
-    ensure_network_downloads_available("Benchmark cache initialization")
+    ensure_network_downloads_available("Benchmark cache initialization", common=request.common)
     payload = initialize_benchmark_assets(
         dataset_id=request.hf_dataset,
         dataset_config=request.hf_config,

@@ -28,6 +28,7 @@ class UiCommonOptions:
     config_path: Path | None = None
     log_level: str | None = None
     debug: bool = False
+    allow_network: bool = False
 
 
 @dataclass(slots=True)
@@ -188,6 +189,7 @@ class ComplianceResultSummary:
 class BenchmarkInitRequest:
     """UI request model for benchmark cache initialization."""
 
+    common: UiCommonOptions
     transcription_model: str = DEFAULT_BENCH_MODEL
     hf_dataset: str = DEFAULT_BENCH_DATASET
     hf_config: str = DEFAULT_BENCH_CONFIG

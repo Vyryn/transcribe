@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
-from transcribe.runtime_env import RuntimeMode, resolve_app_runtime_paths, resolve_bundled_transcription_model_path
+from transcribe.runtime_env import RuntimeMode, network_access_allowed, resolve_app_runtime_paths, resolve_bundled_transcription_model_path
 
 LOGGER = logging.getLogger("transcribe.transcription_runtime")
 
@@ -106,9 +106,17 @@ def _allow_hf_network_access() -> None:
 
 def _enforce_hf_offline_mode() -> None:
     """Force offline mode for Hugging Face and Transformers clients."""
+    if network_access_allowed():
+        _allow_hf_network_access()
+        return
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["HF_DATASETS_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
+def _effective_local_files_only(local_files_only: bool) -> bool:
+    """Resolve whether one HF-backed call should stay strictly offline."""
+    return local_files_only and not network_access_allowed()
 
 
 def _canonical_transcription_model_id(transcription_model: str) -> str:
@@ -330,10 +338,11 @@ def _resolve_packaged_snapshot_path(repo_id: str) -> str | None:
 
 def _get_hf_repo_snapshot(repo_id: str, *, local_files_only: bool) -> str:
     """Resolve local snapshot path for a Hugging Face repo id."""
-    cache_key = f"{repo_id}|local_files_only={local_files_only}"
+    effective_local_files_only = _effective_local_files_only(local_files_only)
+    cache_key = f"{repo_id}|local_files_only={effective_local_files_only}"
     if cache_key in _HF_REPO_SNAPSHOT_CACHE:
         return _HF_REPO_SNAPSHOT_CACHE[cache_key]
-    if local_files_only and repo_id in _HF_REPO_SNAPSHOT_CACHE:
+    if effective_local_files_only and repo_id in _HF_REPO_SNAPSHOT_CACHE:
         return _HF_REPO_SNAPSHOT_CACHE[repo_id]
 
     packaged_snapshot = _resolve_packaged_snapshot_path(repo_id)
@@ -349,27 +358,29 @@ def _get_hf_repo_snapshot(repo_id: str, *, local_files_only: bool) -> str:
             "Transcription model caching requires `huggingface_hub`."
         ) from exc
 
-    if local_files_only:
+    if effective_local_files_only:
         _enforce_hf_offline_mode()
     try:
-        snapshot_dir = snapshot_download(repo_id=repo_id, local_files_only=local_files_only)
+        snapshot_dir = snapshot_download(repo_id=repo_id, local_files_only=effective_local_files_only)
     except Exception as exc:  # noqa: BLE001
         if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
             raise _offline_model_error(repo_id) from exc
         raise
 
     _HF_REPO_SNAPSHOT_CACHE[cache_key] = snapshot_dir
-    if local_files_only:
+    if effective_local_files_only:
         _HF_REPO_SNAPSHOT_CACHE[repo_id] = snapshot_dir
     return snapshot_dir
+
 
 def _get_faster_whisper_model(model_id: str, *, local_files_only: bool = True) -> Any:
     """Return cached faster-whisper model instance for local benchmarking."""
     normalized = _normalize_transcription_model_id(model_id)
-    cache_key = f"{normalized}|local_files_only={local_files_only}"
+    effective_local_files_only = _effective_local_files_only(local_files_only)
+    cache_key = f"{normalized}|local_files_only={effective_local_files_only}"
     if cache_key in _FASTER_WHISPER_MODEL_CACHE:
         return _FASTER_WHISPER_MODEL_CACHE[cache_key]
-    if local_files_only and normalized in _FASTER_WHISPER_MODEL_CACHE:
+    if effective_local_files_only and normalized in _FASTER_WHISPER_MODEL_CACHE:
         return _FASTER_WHISPER_MODEL_CACHE[normalized]
 
     try:
@@ -379,14 +390,14 @@ def _get_faster_whisper_model(model_id: str, *, local_files_only: bool = True) -
             "Transcription runtime requires `faster-whisper`. Install it before retrying."
         ) from exc
 
-    if local_files_only:
+    if effective_local_files_only:
         _enforce_hf_offline_mode()
     try:
         model = WhisperModel(
             normalized,
             device="cpu",
             compute_type="int8",
-            local_files_only=local_files_only,
+            local_files_only=effective_local_files_only,
         )
     except Exception as exc:  # noqa: BLE001
         if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
@@ -394,7 +405,7 @@ def _get_faster_whisper_model(model_id: str, *, local_files_only: bool = True) -
         raise
 
     _FASTER_WHISPER_MODEL_CACHE[cache_key] = model
-    if local_files_only:
+    if effective_local_files_only:
         _FASTER_WHISPER_MODEL_CACHE[normalized] = model
     return model
 
@@ -530,20 +541,21 @@ def _load_nemo_speechlm_model_from_snapshot(
 def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
     """Return cached NeMo ASR model instance for local benchmarking."""
     _, resolved_model_id = _resolve_transcription_backend(model_id)
-    cache_key = f"{resolved_model_id}|local_files_only={local_files_only}"
+    effective_local_files_only = _effective_local_files_only(local_files_only)
+    cache_key = f"{resolved_model_id}|local_files_only={effective_local_files_only}"
     if cache_key in _NEMO_ASR_MODEL_CACHE:
         model = _NEMO_ASR_MODEL_CACHE[cache_key]
         _prepare_nemo_model_for_inference(model, resolved_model_id)
         return model
-    if local_files_only and resolved_model_id in _NEMO_ASR_MODEL_CACHE:
+    if effective_local_files_only and resolved_model_id in _NEMO_ASR_MODEL_CACHE:
         model = _NEMO_ASR_MODEL_CACHE[resolved_model_id]
         _prepare_nemo_model_for_inference(model, resolved_model_id)
         return model
 
-    if local_files_only:
+    if effective_local_files_only:
         _enforce_hf_offline_mode()
 
-    snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=local_files_only)
+    snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=effective_local_files_only)
     try:
         import nemo.collections.asr as nemo_asr
     except ImportError as exc:
@@ -569,12 +581,12 @@ def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
             model = _load_nemo_speechlm_model_from_snapshot(
                 resolved_model_id,
                 snapshot_dir,
-                local_files_only=local_files_only,
+                local_files_only=effective_local_files_only,
             )
         except Exception as exc:  # noqa: BLE001
             load_errors.append(exc)
 
-    if model is None and not local_files_only:
+    if model is None and not effective_local_files_only:
         try:
             model = nemo_asr.models.ASRModel.from_pretrained(model_name=resolved_model_id)
         except Exception as exc:  # noqa: BLE001
@@ -597,7 +609,7 @@ def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
     _prepare_nemo_model_for_inference(model, resolved_model_id)
 
     _NEMO_ASR_MODEL_CACHE[cache_key] = model
-    if local_files_only:
+    if effective_local_files_only:
         _NEMO_ASR_MODEL_CACHE[resolved_model_id] = model
     return model
 
@@ -605,16 +617,17 @@ def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
 def _get_qwen_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
     """Return cached Qwen ASR model instance for local benchmarking."""
     _, resolved_model_id = _resolve_transcription_backend(model_id)
-    cache_key = f"{resolved_model_id}|local_files_only={local_files_only}"
+    effective_local_files_only = _effective_local_files_only(local_files_only)
+    cache_key = f"{resolved_model_id}|local_files_only={effective_local_files_only}"
     if cache_key in _QWEN_ASR_MODEL_CACHE:
         return _QWEN_ASR_MODEL_CACHE[cache_key]
-    if local_files_only and resolved_model_id in _QWEN_ASR_MODEL_CACHE:
+    if effective_local_files_only and resolved_model_id in _QWEN_ASR_MODEL_CACHE:
         return _QWEN_ASR_MODEL_CACHE[resolved_model_id]
 
-    if local_files_only:
+    if effective_local_files_only:
         _enforce_hf_offline_mode()
 
-    snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=local_files_only)
+    snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=effective_local_files_only)
     try:
         from qwen_asr import Qwen3ASRModel
     except ImportError as exc:
@@ -627,7 +640,7 @@ def _get_qwen_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
         try:
             model = Qwen3ASRModel.from_pretrained(load_source)
             _QWEN_ASR_MODEL_CACHE[cache_key] = model
-            if local_files_only:
+            if effective_local_files_only:
                 _QWEN_ASR_MODEL_CACHE[resolved_model_id] = model
             return model
         except Exception as exc:  # noqa: BLE001
