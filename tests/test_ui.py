@@ -264,9 +264,20 @@ def test_ui_smoke_instantiates_when_tk_available() -> None:
         app = app_module.TranscribeUiApp(root, packaged_runtime=False)
         session_page = app.pages["session"]
         capture_page = app.pages["capture"]
+        notes_page = app.pages["notes"]
         assert "session" in app.pages
         assert "logs" in app.pages
         assert app.log_level_combo.cget("values") == app_module.LOG_LEVEL_OPTIONS
+        assert not hasattr(app, "debug_var")
+        assert session_page.start_button.cget("style") == "Primary.TButton"
+        assert session_page.stop_button.cget("style") == "Danger.TButton"
+        assert hasattr(session_page, "transcription_model_combo")
+        assert hasattr(session_page, "notes_model_combo")
+        assert hasattr(notes_page, "model_combo")
+        assert session_page.transcription_model_combo.cget("state") == "readonly"
+        assert session_page.notes_model_combo.cget("state") == "readonly"
+        assert notes_page.model_combo.cget("state") == "readonly"
+        assert hasattr(session_page, "advanced_scrollbar")
         assert session_page.advanced_visible is False
         assert capture_page.advanced_visible is False
         app.advanced_ui_var.set(True)

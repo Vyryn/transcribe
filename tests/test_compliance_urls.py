@@ -20,3 +20,12 @@ def test_url_literal_check_ignores_safe_source(tmp_path: Path) -> None:
 
     violations = run_url_literal_check(tmp_path)
     assert violations == []
+
+
+def test_url_literal_check_excludes_build_windows_standalone(tmp_path: Path) -> None:
+    source = tmp_path / "scripts" / "build_windows_standalone.py"
+    source.parent.mkdir(parents=True)
+    source.write_text('ENDPOINT = "https://example.org"\n', encoding="utf-8")
+
+    violations = run_url_literal_check(tmp_path)
+    assert violations == []
