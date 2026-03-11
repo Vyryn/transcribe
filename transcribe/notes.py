@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 from transcribe.runtime_defaults import DEFAULT_SESSION_NOTES_MODEL
@@ -787,8 +788,9 @@ def _llama_server_request(
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         headers["Content-Type"] = "application/json"
+    runtime_url = urllib_parse.urlunsplit(("http", host, path, "", ""))
     request = urllib_request.Request(
-        f"http://{host}{path}",
+        runtime_url,
         data=data,
         headers=headers,
         method=method,
