@@ -199,7 +199,6 @@ def test_build_pyinstaller_command_targets_packaged_entrypoint_and_excludes_dev_
         "_module_available",
         lambda module_name: module_name == "nemo.collections.asr",
     )
-
     command = build_script._build_pyinstaller_command(
         package_command=("python", "-m", "PyInstaller"),
         stage_dir=tmp_path / "dist" / "transcribe",
@@ -245,6 +244,12 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_excludes_dev_modul
         lambda module_name: module_name == "nemo.collections.asr",
     )
 
+    monkeypatch.setattr(
+        build_script,
+        "_nuitka_distribution_metadata_names",
+        lambda build_dir: ("libcst", "transformers"),
+    )
+
     command = build_script._build_nuitka_command(
         package_command=("python", "-m", "nuitka"),
         build_dir=tmp_path / "build",
@@ -259,6 +264,10 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_excludes_dev_modul
     assert "--include-package=transcribe" in command
     assert "--include-module=transcribe.packaged_ui" in command
     assert "--include-package=soundcard" in command
+    assert "--include-package-data=soundcard" in command
+    assert "--enable-plugin=tk-inter" in command
+    assert "--include-distribution-metadata=libcst" in command
+    assert "--include-distribution-metadata=transformers" in command
     assert "--noinclude-numba-mode=nofollow" in command
     assert "--module-parameter=numba-disable-jit=yes" in command
     assert "--noinclude-setuptools-mode=nofollow" in command
@@ -479,6 +488,9 @@ def test_main_smoke_acceptance_stages_packaged_output_and_report(
         _ = (backend, package_command, build_dir, bootstrap_dir, clean, include_canary_model, nuitka_options)
         stage_dir.mkdir(parents=True, exist_ok=True)
         (stage_dir / "transcribe.exe").write_bytes(b"exe")
+        soundcard_dir = stage_dir / "soundcard"
+        soundcard_dir.mkdir()
+        (soundcard_dir / "mediafoundation.py.h").write_text("header", encoding="utf-8")
         return stage_dir
 
     monkeypatch.setattr(build_script, "_build_package_bundle", fake_build_package_bundle)
@@ -642,6 +654,9 @@ def test_main_publishes_installer_to_releases(tmp_path: Path, monkeypatch: pytes
         _ = (backend, package_command, build_dir, bootstrap_dir, clean, include_canary_model, nuitka_options)
         stage_dir.mkdir(parents=True, exist_ok=True)
         (stage_dir / "transcribe.exe").write_bytes(b"exe")
+        soundcard_dir = stage_dir / "soundcard"
+        soundcard_dir.mkdir()
+        (soundcard_dir / "mediafoundation.py.h").write_text("header", encoding="utf-8")
         return stage_dir
 
     def fake_build_inno_installer(*, inno_setup_exe: str, stage_dir: Path, installer_dir: Path) -> Path:
@@ -690,7 +705,50 @@ def test_build_nuitka_command_includes_explicit_jobs_and_lto_options(tmp_path: P
     assert "--lto=no" in command
 
 
-def test_package_phase_details_reuses_existing_package_when_fingerprint_matches(
+def test_validate_packaged_bundle_requires_soundcard_header(tmp_path: Path) -> None:
+    stage_dir = tmp_path / "stage"
+    build_dir = tmp_path / "build"
+    stage_dir.mkdir()
+    build_dir.mkdir()
+    (stage_dir / "transcribe.exe").write_bytes(b"exe")
+
+    with pytest.raises(FileNotFoundError, match="soundcard/mediafoundation.py.h"):
+        build_script._validate_packaged_bundle(stage_dir, build_dir=build_dir, backend="nuitka")
+
+
+def test_validate_packaged_bundle_requires_reported_nuitka_data_files(tmp_path: Path) -> None:
+    stage_dir = tmp_path / "stage"
+    build_dir = tmp_path / "build"
+    stage_dir.mkdir()
+    soundcard_dir = stage_dir / "soundcard"
+    soundcard_dir.mkdir(parents=True)
+    (stage_dir / "transcribe.exe").write_bytes(b"exe")
+    (soundcard_dir / "mediafoundation.py.h").write_text("header", encoding="utf-8")
+    report_path = build_script._default_nuitka_report_path(build_dir)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text('<nuitka-report><data_file name="soundcard\\pulseaudio.py.h" /></nuitka-report>\n', encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="soundcard/pulseaudio.py.h"):
+        build_script._validate_packaged_bundle(stage_dir, build_dir=build_dir, backend="nuitka")
+
+
+def test_validate_packaged_bundle_requires_reported_distribution_metadata(tmp_path: Path) -> None:
+    stage_dir = tmp_path / "stage"
+    build_dir = tmp_path / "build"
+    stage_dir.mkdir()
+    soundcard_dir = stage_dir / "soundcard"
+    soundcard_dir.mkdir(parents=True)
+    (stage_dir / "transcribe.exe").write_bytes(b"exe")
+    (soundcard_dir / "mediafoundation.py.h").write_text("header", encoding="utf-8")
+    report_path = build_script._default_nuitka_report_path(build_dir)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text('<nuitka-report><distribution-usage name="libcst" /></nuitka-report>\n', encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="libcst"):
+        build_script._validate_packaged_bundle(stage_dir, build_dir=build_dir, backend="nuitka")
+
+
+def test_package_phase_details_rebuilds_when_reused_bundle_is_missing_runtime_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -703,6 +761,65 @@ def test_package_phase_details_reuses_existing_package_when_fingerprint_matches(
     nuitka_options = build_script.NuitkaBuildOptions(jobs=None, lto=build_script.DEFAULT_NUITKA_LTO_MODE)
     fingerprint, fingerprint_payload = build_script._compute_package_fingerprint(
         backend=build_inputs.backend,
+        build_dir=build_dir,
+        package_command=build_inputs.package_command,
+        include_canary_model=False,
+        nuitka_options=nuitka_options,
+    )
+    build_script._write_package_reuse_metadata(
+        build_dir=build_dir,
+        backend=build_inputs.backend,
+        fingerprint=fingerprint,
+        fingerprint_payload=fingerprint_payload,
+        stage_dir=stage_dir,
+    )
+    calls = {"count": 0}
+
+    def fake_build_package_bundle(**kwargs):
+        calls["count"] += 1
+        repaired_stage_dir = kwargs["stage_dir"]
+        repaired_stage_dir.mkdir(parents=True, exist_ok=True)
+        (repaired_stage_dir / "transcribe.exe").write_bytes(b"exe")
+        soundcard_dir = repaired_stage_dir / "soundcard"
+        soundcard_dir.mkdir(parents=True, exist_ok=True)
+        (soundcard_dir / "mediafoundation.py.h").write_text("header", encoding="utf-8")
+        return repaired_stage_dir
+
+    monkeypatch.setattr(build_script, "_build_package_bundle", fake_build_package_bundle)
+
+    details = build_script._package_phase_details(
+        build_inputs=build_inputs,
+        stage_dir=stage_dir,
+        build_dir=build_dir,
+        bootstrap_dir=tmp_path / "bootstrap",
+        clean=False,
+        include_canary_model=False,
+        reuse_package=True,
+        nuitka_options=nuitka_options,
+    )
+
+    assert calls["count"] == 1
+    assert details["reused_existing_package"] is False
+    assert "soundcard/mediafoundation.py.h" in details["reuse_fallback_reason"]
+
+
+def test_package_phase_details_reuses_existing_package_when_fingerprint_matches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_inputs = _make_build_inputs(tmp_path, backend="nuitka", include_canary_model=False)
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+    (stage_dir / "transcribe.exe").write_bytes(b"exe")
+    soundcard_dir = stage_dir / "soundcard"
+    soundcard_dir.mkdir()
+    (soundcard_dir / "mediafoundation.py.h").write_text("header", encoding="utf-8")
+    nuitka_options = build_script.NuitkaBuildOptions(jobs=None, lto=build_script.DEFAULT_NUITKA_LTO_MODE)
+    fingerprint, fingerprint_payload = build_script._compute_package_fingerprint(
+        backend=build_inputs.backend,
+        build_dir=build_dir,
         package_command=build_inputs.package_command,
         include_canary_model=False,
         nuitka_options=nuitka_options,
@@ -761,6 +878,9 @@ def test_package_phase_details_records_clcache_stats_and_nuitka_report(tmp_path:
         _ = (backend, package_command, bootstrap_dir, clean, include_canary_model, nuitka_options)
         stage_dir.mkdir(parents=True, exist_ok=True)
         (stage_dir / "transcribe.exe").write_bytes(b"exe")
+        soundcard_dir = stage_dir / "soundcard"
+        soundcard_dir.mkdir()
+        (soundcard_dir / "mediafoundation.py.h").write_text("header", encoding="utf-8")
         report_path = build_script._default_nuitka_report_path(build_dir)
         report_path.write_text("<report />\n", encoding="utf-8")
         stats_dir = build_dir / "nuitka" / "packaged_main.build"
@@ -785,4 +905,5 @@ def test_package_phase_details_records_clcache_stats_and_nuitka_report(tmp_path:
     assert details["clcache_stats_after"]["CacheHits"] == 5
     assert details["reused_existing_package"] is False
     assert details["nuitka_report_path"].endswith(build_script.NUITKA_REPORT_FILENAME)
+
 
