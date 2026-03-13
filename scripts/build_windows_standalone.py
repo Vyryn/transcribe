@@ -215,50 +215,14 @@ def _normalize_distribution_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).strip().lower()
 
 
-def _seed_distribution_metadata_names() -> tuple[str, ...]:
-    packages_to_distributions = importlib.metadata.packages_distributions()
+def _installed_distribution_names() -> tuple[str, ...]:
     names: dict[str, str] = {}
-    for module_name in (
-        "transcribe",
-        "huggingface_hub",
-        "soundcard",
-        "transformers",
-        "tokenizers",
-        "libcst",
-        "torch",
-        "nemo",
-        "omegaconf",
-        "safetensors",
-    ):
-        for distribution_name in packages_to_distributions.get(module_name, ()):
-            names.setdefault(_normalize_distribution_name(distribution_name), distribution_name)
-    for distribution_name in ("libcst", "transformers"):
+    for distribution in importlib.metadata.distributions():
+        distribution_name = distribution.metadata.get("Name", "").strip()
+        if not distribution_name:
+            continue
         names.setdefault(_normalize_distribution_name(distribution_name), distribution_name)
     return tuple(names[key] for key in sorted(names))
-
-
-def _distribution_top_level_packages(distribution_name: str) -> tuple[str, ...]:
-    try:
-        distribution = importlib.metadata.distribution(distribution_name)
-    except importlib.metadata.PackageNotFoundError:
-        return ()
-
-    top_level_text = distribution.read_text("top_level.txt")
-    if top_level_text:
-        top_level_names = [line.strip() for line in top_level_text.splitlines() if line.strip()]
-        if top_level_names:
-            return tuple(dict.fromkeys(top_level_names))
-
-    file_paths = distribution.files or ()
-    top_level_names = {
-        file_path.parts[0]
-        for file_path in file_paths
-        if len(file_path.parts) > 1
-        and file_path.parts[0]
-        and not file_path.parts[0].endswith(".dist-info")
-        and file_path.parts[0] != "__pycache__"
-    }
-    return tuple(sorted(top_level_names))
 
 
 def _reported_distribution_usage_names(build_dir: Path) -> tuple[str, ...]:
@@ -276,71 +240,11 @@ def _reported_distribution_usage_names(build_dir: Path) -> tuple[str, ...]:
     return tuple(names[key] for key in sorted(names))
 
 
-def _reported_module_top_level_names(build_dir: Path) -> tuple[str, ...]:
-    report_path = _default_nuitka_report_path(build_dir)
-    if not report_path.exists():
-        return ()
-
-    root = ET.fromstring(report_path.read_text(encoding="utf-8"))
-    names = {
-        module_name.split(".", 1)[0]
-        for element in root.findall(".//module")
-        for module_name in [element.attrib.get("name", "").strip()]
-        if module_name
-    }
-    return tuple(sorted(names))
-
-
-def _required_report_distribution_metadata_names(build_dir: Path) -> tuple[str, ...]:
-    reported_distribution_names = _reported_distribution_usage_names(build_dir)
-    if not reported_distribution_names:
-        return ()
-
-    allowed_package_names = {module_name.lower() for module_name in _reported_module_top_level_names(build_dir)}
-    allowed_package_names.update(
-        module_name.lower()
-        for module_name in (
-            "transcribe",
-            "huggingface_hub",
-            "soundcard",
-            "transformers",
-            "tokenizers",
-            "libcst",
-            "torch",
-            "nemo",
-            "omegaconf",
-            "safetensors",
-        )
-    )
-    excluded_distribution_names = {
-        _normalize_distribution_name(distribution_name)
-        for distribution_name in ("datasets", "pyarrow", "matplotlib", "_pytest", "coverage", "mypy", "IPython", "pytest", "setuptools")
-    }
-    blocked_top_level_packages = {"examples", "tests", "docs", "tools"}
-    names: dict[str, str] = {}
-    for distribution_name in reported_distribution_names:
-        normalized_distribution_name = _normalize_distribution_name(distribution_name)
-        if normalized_distribution_name in excluded_distribution_names:
-            continue
-        top_level_packages = tuple(
-            _normalize_distribution_name(package_name)
-            for package_name in _distribution_top_level_packages(distribution_name)
-        )
-        if any(package_name in blocked_top_level_packages for package_name in top_level_packages):
-            continue
-        candidate_package_names = {normalized_distribution_name}
-        candidate_package_names.update(top_level_packages)
-        if candidate_package_names.isdisjoint(allowed_package_names):
-            continue
-        names.setdefault(normalized_distribution_name, distribution_name)
-    return tuple(names[key] for key in sorted(names))
-
-
 def _nuitka_distribution_metadata_names(build_dir: Path) -> tuple[str, ...]:
     names: dict[str, str] = {}
-    for distribution_name in _seed_distribution_metadata_names():
+    for distribution_name in _installed_distribution_names():
         names.setdefault(_normalize_distribution_name(distribution_name), distribution_name)
-    for distribution_name in _required_report_distribution_metadata_names(build_dir):
+    for distribution_name in _reported_distribution_usage_names(build_dir):
         names.setdefault(_normalize_distribution_name(distribution_name), distribution_name)
     return tuple(names[key] for key in sorted(names))
 
@@ -2112,7 +2016,6 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
 
 
