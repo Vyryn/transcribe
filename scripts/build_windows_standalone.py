@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
-import importlib.metadata
 import importlib.util
 import json
 import os
@@ -13,7 +12,6 @@ import subprocess
 import sys
 import time
 import urllib.request
-import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -68,10 +66,6 @@ DEFAULT_BUILD_PHASE = "all"
 DEFAULT_BUILD_BACKEND = "nuitka"
 DEFAULT_PACKAGE_REUSE_METADATA_PATH = DEFAULT_BUILD_DIR / "package-reuse.json"
 DEFAULT_NUITKA_LTO_MODE = "auto"
-REQUIRED_PACKAGED_RUNTIME_FILES = (
-    Path("transcribe.exe"),
-    Path("soundcard") / "mediafoundation.py.h",
-)
 BUILD_PHASE_CHOICES = ("prepare", "package", "stage-assets", "installer", "all")
 BUILD_BACKEND_CHOICES = ("pyinstaller", "nuitka")
 SUPPORTED_NUITKA_PYTHON = (3, 13)
@@ -207,62 +201,8 @@ def _publish_release_installer(installer_path: Path, *, releases_dir: Path | Non
     return destination
 
 
-
 def _default_nuitka_report_path(build_dir: Path) -> Path:
     return build_dir.resolve() / NUITKA_REPORT_FILENAME
-
-def _normalize_distribution_name(name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).strip().lower()
-
-
-def _installed_distribution_names() -> tuple[str, ...]:
-    names: dict[str, str] = {}
-    for distribution in importlib.metadata.distributions():
-        distribution_name = distribution.metadata.get("Name", "").strip()
-        if not distribution_name:
-            continue
-        names.setdefault(_normalize_distribution_name(distribution_name), distribution_name)
-    return tuple(names[key] for key in sorted(names))
-
-
-def _reported_distribution_usage_names(build_dir: Path) -> tuple[str, ...]:
-    report_path = _default_nuitka_report_path(build_dir)
-    if not report_path.exists():
-        return ()
-
-    root = ET.fromstring(report_path.read_text(encoding="utf-8"))
-    names: dict[str, str] = {}
-    for element in root.findall(".//distribution-usage"):
-        distribution_name = element.attrib.get("name", "").strip()
-        if not distribution_name:
-            continue
-        names.setdefault(_normalize_distribution_name(distribution_name), distribution_name)
-    return tuple(names[key] for key in sorted(names))
-
-
-def _nuitka_distribution_metadata_names(build_dir: Path) -> tuple[str, ...]:
-    names: dict[str, str] = {}
-    for distribution_name in _installed_distribution_names():
-        names.setdefault(_normalize_distribution_name(distribution_name), distribution_name)
-    for distribution_name in _reported_distribution_usage_names(build_dir):
-        names.setdefault(_normalize_distribution_name(distribution_name), distribution_name)
-    return tuple(names[key] for key in sorted(names))
-
-
-def _bundled_distribution_metadata_names(stage_dir: Path) -> set[str]:
-    names: set[str] = set()
-    for metadata_path in stage_dir.resolve().rglob("METADATA"):
-        if not metadata_path.is_file() or not metadata_path.parent.name.endswith(".dist-info"):
-            continue
-        try:
-            metadata_text = metadata_path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        for line in metadata_text.splitlines():
-            if line.lower().startswith("name:"):
-                names.add(_normalize_distribution_name(line.split(":", 1)[1]))
-                break
-    return names
 
 
 def _read_latest_clcache_stats(build_dir: Path) -> dict[str, Any] | None:
@@ -342,7 +282,6 @@ def _iter_package_fingerprint_paths(*, backend: str) -> Iterator[Path]:
 def _compute_package_fingerprint(
     *,
     backend: str,
-    build_dir: Path,
     package_command: Sequence[str],
     include_canary_model: bool,
     nuitka_options: NuitkaBuildOptions | None,
@@ -370,10 +309,6 @@ def _compute_package_fingerprint(
             "jobs": nuitka_options.jobs,
             "lto": nuitka_options.lto,
         }
-    if backend == "nuitka":
-        distribution_metadata_names = _nuitka_distribution_metadata_names(build_dir)
-        payload["distribution_metadata_names"] = list(distribution_metadata_names)
-        payload["distribution_metadata_name_count"] = len(distribution_metadata_names)
 
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest(), payload
@@ -410,72 +345,6 @@ def _write_package_reuse_metadata(
     }
     metadata_path.write_text(json.dumps(metadata, indent=2) + '\n', encoding="utf-8")
     return metadata_path
-
-
-def _missing_packaged_runtime_files(stage_dir: Path) -> list[str]:
-    resolved_stage_dir = stage_dir.resolve()
-    return [
-        required_path.as_posix()
-        for required_path in REQUIRED_PACKAGED_RUNTIME_FILES
-        if not (resolved_stage_dir / required_path).exists()
-    ]
-
-
-def _missing_reported_data_files(*, stage_dir: Path, build_dir: Path) -> list[str]:
-    report_path = _default_nuitka_report_path(build_dir)
-    if not report_path.exists():
-        return []
-
-    root = ET.fromstring(report_path.read_text(encoding="utf-8"))
-    resolved_stage_dir = stage_dir.resolve()
-    missing: list[str] = []
-    for element in root.findall(".//data_file"):
-        relative_name = element.attrib.get("name", "").replace("\\", "/").strip()
-        if not relative_name:
-            continue
-        if not (resolved_stage_dir / Path(relative_name)).exists():
-            missing.append(relative_name)
-    return missing
-
-
-def _missing_reported_distribution_metadata(*, stage_dir: Path, build_dir: Path) -> list[str]:
-    reported_distribution_names = _reported_distribution_usage_names(build_dir)
-    if not reported_distribution_names:
-        return []
-
-    bundled_distribution_names = _bundled_distribution_metadata_names(stage_dir)
-    return [
-        distribution_name
-        for distribution_name in reported_distribution_names
-        if _normalize_distribution_name(distribution_name) not in bundled_distribution_names
-    ]
-
-
-def _validate_packaged_bundle(stage_dir: Path, *, build_dir: Path, backend: str) -> None:
-    missing_files = _missing_packaged_runtime_files(stage_dir)
-    if missing_files:
-        raise FileNotFoundError(
-            "Packaged bundle is missing required runtime files: " + ", ".join(missing_files)
-        )
-
-    if backend == "nuitka":
-        missing_reported_files = _missing_reported_data_files(stage_dir=stage_dir, build_dir=build_dir)
-        if missing_reported_files:
-            preview = ", ".join(missing_reported_files[:10])
-            suffix = "" if len(missing_reported_files) <= 10 else f" (+{len(missing_reported_files) - 10} more)"
-            raise FileNotFoundError(
-                "Packaged bundle is missing Nuitka-reported data files: " + preview + suffix
-            )
-        missing_reported_metadata = _missing_reported_distribution_metadata(
-            stage_dir=stage_dir,
-            build_dir=build_dir,
-        )
-        if missing_reported_metadata:
-            preview = ", ".join(missing_reported_metadata[:10])
-            suffix = "" if len(missing_reported_metadata) <= 10 else f" (+{len(missing_reported_metadata) - 10} more)"
-            raise FileNotFoundError(
-                "Packaged bundle is missing Nuitka-reported distribution metadata: " + preview + suffix
-            )
 
 
 def _write_build_report(
@@ -1158,8 +1027,6 @@ def _build_nuitka_command(
         "--include-module=huggingface_hub",
         "--include-module=huggingface_hub.file_download",
         "--include-package=soundcard",
-        "--include-package-data=soundcard",
-        "--enable-plugin=tk-inter",
         "--noinclude-numba-mode=nofollow",
         "--module-parameter=numba-disable-jit=yes",
         "--noinclude-setuptools-mode=nofollow",
@@ -1167,8 +1034,6 @@ def _build_nuitka_command(
         f"--report={report_path}",
         "--nofollow-import-to=datasets,pyarrow,matplotlib,_pytest,coverage,mypy,IPython,pytest,transcribe.bench,transcribe.test_cov,torch.utils.cpp_extension,setuptools",
     ]
-    for distribution_name in _nuitka_distribution_metadata_names(build_dir):
-        command.append(f"--include-distribution-metadata={distribution_name}")
     if nuitka_options.jobs is not None:
         command.append(f"--jobs={nuitka_options.jobs}")
     if nuitka_options.lto != DEFAULT_NUITKA_LTO_MODE:
@@ -1729,7 +1594,6 @@ def _package_phase_details(
 ) -> dict[str, Any]:
     fingerprint, fingerprint_payload = _compute_package_fingerprint(
         backend=build_inputs.backend,
-        build_dir=build_dir,
         package_command=build_inputs.package_command,
         include_canary_model=include_canary_model,
         nuitka_options=nuitka_options if build_inputs.backend == "nuitka" else None,
@@ -1737,7 +1601,6 @@ def _package_phase_details(
     metadata_path = _package_reuse_metadata_path(build_dir)
     clcache_stats_before = _read_latest_clcache_stats(build_dir) if build_inputs.backend == "nuitka" else None
     existing_metadata = _read_package_reuse_metadata(build_dir) if reuse_package and not clean else None
-    reuse_fallback_reason: str | None = None
     if (
         reuse_package
         and not clean
@@ -1745,26 +1608,20 @@ def _package_phase_details(
         and existing_metadata is not None
         and existing_metadata.get("fingerprint") == fingerprint
     ):
-        missing_files = _missing_packaged_runtime_files(stage_dir)
-        if not missing_files:
-            details = {
-                "stage_dir": str(stage_dir.resolve()),
-                "package_fingerprint": fingerprint,
-                "package_reuse_metadata_path": str(metadata_path),
-                "reused_existing_package": True,
-                "reuse_reason": "Package inputs unchanged; skipped re-running the packager and reused the existing stage directory.",
-            }
-            if build_inputs.backend == "nuitka":
-                details["clcache_stats_before"] = clcache_stats_before
-                details["clcache_stats_after"] = clcache_stats_before
-                report_path = _default_nuitka_report_path(build_dir)
-                if report_path.exists():
-                    details["nuitka_report_path"] = str(report_path)
-            return details
-        reuse_fallback_reason = (
-            "Existing staged bundle matched the package fingerprint but was missing required runtime files: "
-            + ", ".join(missing_files)
-        )
+        details = {
+            "stage_dir": str(stage_dir.resolve()),
+            "package_fingerprint": fingerprint,
+            "package_reuse_metadata_path": str(metadata_path),
+            "reused_existing_package": True,
+            "reuse_reason": "Package inputs unchanged; skipped re-running the packager and reused the existing stage directory.",
+        }
+        if build_inputs.backend == "nuitka":
+            details["clcache_stats_before"] = clcache_stats_before
+            details["clcache_stats_after"] = clcache_stats_before
+            report_path = _default_nuitka_report_path(build_dir)
+            if report_path.exists():
+                details["nuitka_report_path"] = str(report_path)
+        return details
 
     bundle_dir = _build_package_bundle(
         backend=build_inputs.backend,
@@ -1776,7 +1633,6 @@ def _package_phase_details(
         include_canary_model=include_canary_model,
         nuitka_options=nuitka_options,
     )
-    _validate_packaged_bundle(bundle_dir, build_dir=build_dir, backend=build_inputs.backend)
     metadata_path = _write_package_reuse_metadata(
         build_dir=build_dir,
         backend=build_inputs.backend,
@@ -1790,8 +1646,6 @@ def _package_phase_details(
         "package_reuse_metadata_path": str(metadata_path),
         "reused_existing_package": False,
     }
-    if reuse_fallback_reason is not None:
-        details["reuse_fallback_reason"] = reuse_fallback_reason
     if build_inputs.backend == "nuitka":
         details["clcache_stats_before"] = clcache_stats_before
         details["clcache_stats_after"] = _read_latest_clcache_stats(build_dir)
@@ -2016,18 +1870,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
