@@ -67,7 +67,6 @@ def test_build_parser_uses_bootstrap_defaults_and_new_flags() -> None:
     assert args.backend == "nuitka"
     assert args.phase == "all"
     assert args.clean is False
-    assert args.reuse_package is True
     assert args.report_path == build_script.DEFAULT_BUILD_REPORT_PATH
     assert args.bootstrap_missing is True
     assert args.notes_model_4b is None
@@ -77,8 +76,6 @@ def test_build_parser_uses_bootstrap_defaults_and_new_flags() -> None:
     assert args.notes_model_4b_revision == build_script.DEFAULT_NOTES_MODEL_4B_REVISION
     assert args.parakeet_model_repo == build_script.DEFAULT_PARAKEET_MODEL_REPO
     assert args.include_canary_model is False
-    assert args.nuitka_jobs is None
-    assert args.nuitka_lto == build_script.DEFAULT_NUITKA_LTO_MODE
 
 
 def test_select_llama_cpp_windows_asset_prefers_cpu_x64_archive() -> None:
@@ -250,7 +247,6 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_excludes_dev_modul
         build_dir=tmp_path / "build",
         clean=False,
         include_canary_model=include_canary_model,
-        nuitka_options=build_script.NuitkaBuildOptions(jobs=None, lto=build_script.DEFAULT_NUITKA_LTO_MODE),
     )
 
     assert str(build_script.REPO_ROOT / "packaged_main.py") == command[-1]
@@ -465,18 +461,8 @@ def test_main_smoke_acceptance_stages_packaged_output_and_report(
         lambda args: _make_build_inputs(tmp_path, backend=backend, include_canary_model=args.include_canary_model),
     )
 
-    def fake_build_package_bundle(
-        *,
-        backend: str,
-        package_command,
-        stage_dir: Path,
-        build_dir: Path,
-        bootstrap_dir: Path,
-        clean: bool,
-        include_canary_model: bool,
-        nuitka_options,
-    ) -> Path:
-        _ = (backend, package_command, build_dir, bootstrap_dir, clean, include_canary_model, nuitka_options)
+    def fake_build_package_bundle(*, backend: str, package_command, stage_dir: Path, build_dir: Path, bootstrap_dir: Path, clean: bool, include_canary_model: bool) -> Path:
+        _ = (backend, package_command, build_dir, bootstrap_dir, clean, include_canary_model)
         stage_dir.mkdir(parents=True, exist_ok=True)
         (stage_dir / "transcribe.exe").write_bytes(b"exe")
         return stage_dir
@@ -628,18 +614,8 @@ def test_main_publishes_installer_to_releases(tmp_path: Path, monkeypatch: pytes
         lambda args: _make_build_inputs(tmp_path, backend="nuitka", include_canary_model=args.include_canary_model),
     )
 
-    def fake_build_package_bundle(
-        *,
-        backend: str,
-        package_command,
-        stage_dir: Path,
-        build_dir: Path,
-        bootstrap_dir: Path,
-        clean: bool,
-        include_canary_model: bool,
-        nuitka_options,
-    ) -> Path:
-        _ = (backend, package_command, build_dir, bootstrap_dir, clean, include_canary_model, nuitka_options)
+    def fake_build_package_bundle(*, backend: str, package_command, stage_dir: Path, build_dir: Path, bootstrap_dir: Path, clean: bool, include_canary_model: bool) -> Path:
+        _ = (backend, package_command, build_dir, bootstrap_dir, clean, include_canary_model)
         stage_dir.mkdir(parents=True, exist_ok=True)
         (stage_dir / "transcribe.exe").write_bytes(b"exe")
         return stage_dir
@@ -677,68 +653,6 @@ def test_main_publishes_installer_to_releases(tmp_path: Path, monkeypatch: pytes
 
 
 
-def test_build_nuitka_command_includes_explicit_jobs_and_lto_options(tmp_path: Path) -> None:
-    command = build_script._build_nuitka_command(
-        package_command=("python", "-m", "nuitka"),
-        build_dir=tmp_path / "build",
-        clean=False,
-        include_canary_model=False,
-        nuitka_options=build_script.NuitkaBuildOptions(jobs=6, lto="no"),
-    )
-
-    assert "--jobs=6" in command
-    assert "--lto=no" in command
-
-
-def test_package_phase_details_reuses_existing_package_when_fingerprint_matches(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    build_inputs = _make_build_inputs(tmp_path, backend="nuitka", include_canary_model=False)
-    build_dir = tmp_path / "build"
-    build_dir.mkdir()
-    stage_dir = tmp_path / "stage"
-    stage_dir.mkdir()
-    (stage_dir / "transcribe.exe").write_bytes(b"exe")
-    nuitka_options = build_script.NuitkaBuildOptions(jobs=None, lto=build_script.DEFAULT_NUITKA_LTO_MODE)
-    fingerprint, fingerprint_payload = build_script._compute_package_fingerprint(
-        backend=build_inputs.backend,
-        package_command=build_inputs.package_command,
-        include_canary_model=False,
-        nuitka_options=nuitka_options,
-    )
-    build_script._write_package_reuse_metadata(
-        build_dir=build_dir,
-        backend=build_inputs.backend,
-        fingerprint=fingerprint,
-        fingerprint_payload=fingerprint_payload,
-        stage_dir=stage_dir,
-    )
-    calls = {"count": 0}
-
-    def fake_build_package_bundle(**kwargs):
-        calls["count"] += 1
-        raise AssertionError(f"Unexpected rebuild: {kwargs}")
-
-    monkeypatch.setattr(build_script, "_build_package_bundle", fake_build_package_bundle)
-
-    details = build_script._package_phase_details(
-        build_inputs=build_inputs,
-        stage_dir=stage_dir,
-        build_dir=build_dir,
-        bootstrap_dir=tmp_path / "bootstrap",
-        clean=False,
-        include_canary_model=False,
-        reuse_package=True,
-        nuitka_options=nuitka_options,
-    )
-
-    assert calls["count"] == 0
-    assert details["reused_existing_package"] is True
-    assert details["package_fingerprint"] == fingerprint
-    assert details["package_reuse_metadata_path"].endswith("package-reuse.json")
-
-
 def test_package_phase_details_records_clcache_stats_and_nuitka_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     build_inputs = _make_build_inputs(tmp_path, backend="nuitka", include_canary_model=False)
     build_dir = tmp_path / "build"
@@ -747,18 +661,8 @@ def test_package_phase_details_records_clcache_stats_and_nuitka_report(tmp_path:
     stats_before_dir.mkdir(parents=True)
     (stats_before_dir / "clcache-stats.0001.txt").write_text(json.dumps({"CacheHits": 1, "CacheMisses": 3}), encoding="utf-8")
 
-    def fake_build_package_bundle(
-        *,
-        backend: str,
-        package_command,
-        stage_dir: Path,
-        build_dir: Path,
-        bootstrap_dir: Path,
-        clean: bool,
-        include_canary_model: bool,
-        nuitka_options,
-    ) -> Path:
-        _ = (backend, package_command, bootstrap_dir, clean, include_canary_model, nuitka_options)
+    def fake_build_package_bundle(*, backend: str, package_command, stage_dir: Path, build_dir: Path, bootstrap_dir: Path, clean: bool, include_canary_model: bool) -> Path:
+        _ = (backend, package_command, bootstrap_dir, clean, include_canary_model)
         stage_dir.mkdir(parents=True, exist_ok=True)
         (stage_dir / "transcribe.exe").write_bytes(b"exe")
         report_path = build_script._default_nuitka_report_path(build_dir)
@@ -777,12 +681,9 @@ def test_package_phase_details_records_clcache_stats_and_nuitka_report(tmp_path:
         bootstrap_dir=tmp_path / "bootstrap",
         clean=False,
         include_canary_model=False,
-        reuse_package=False,
-        nuitka_options=build_script.NuitkaBuildOptions(jobs=None, lto=build_script.DEFAULT_NUITKA_LTO_MODE),
     )
 
     assert details["clcache_stats_before"]["CacheHits"] == 1
     assert details["clcache_stats_after"]["CacheHits"] == 5
-    assert details["reused_existing_package"] is False
     assert details["nuitka_report_path"].endswith(build_script.NUITKA_REPORT_FILENAME)
 
