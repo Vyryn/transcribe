@@ -705,6 +705,31 @@ def test_build_nuitka_command_includes_explicit_jobs_and_lto_options(tmp_path: P
     assert "--lto=no" in command
 
 
+def test_nuitka_distribution_metadata_names_filters_unrelated_report_distributions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(build_script, "_seed_distribution_metadata_names", lambda: ())
+    monkeypatch.setattr(
+        build_script,
+        "_reported_distribution_usage_names",
+        lambda build_dir: ("Mako", "libcst", "matplotlib", "nemo-toolkit"),
+    )
+    monkeypatch.setattr(
+        build_script,
+        "_reported_module_top_level_names",
+        lambda build_dir: ("libcst", "mpl_toolkits", "nemo", "transcribe"),
+    )
+    monkeypatch.setattr(
+        build_script,
+        "_distribution_top_level_packages",
+        lambda distribution_name: {"Mako": ("mako",), "libcst": ("libcst",), "matplotlib": ("mpl_toolkits", "pylab"), "nemo-toolkit": ("nemo", "examples")}[distribution_name],
+    )
+
+    assert build_script._required_report_distribution_metadata_names(tmp_path / "build") == ("libcst",)
+    assert build_script._nuitka_distribution_metadata_names(tmp_path / "build") == ("libcst",)
+
+
 def test_validate_packaged_bundle_requires_soundcard_header(tmp_path: Path) -> None:
     stage_dir = tmp_path / "stage"
     build_dir = tmp_path / "build"
@@ -905,5 +930,7 @@ def test_package_phase_details_records_clcache_stats_and_nuitka_report(tmp_path:
     assert details["clcache_stats_after"]["CacheHits"] == 5
     assert details["reused_existing_package"] is False
     assert details["nuitka_report_path"].endswith(build_script.NUITKA_REPORT_FILENAME)
+
+
 
 
