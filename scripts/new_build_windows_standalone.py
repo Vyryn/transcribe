@@ -84,10 +84,9 @@ _INNO_SETUP_ASSET_PATTERNS = (
     re.compile(r"innosetup-.*\.exe$", re.IGNORECASE),
     re.compile(r"isetup-.*\.exe$", re.IGNORECASE),
 )
+_NUITKA_REQUIRED_PACKAGE_ROOTS = ("datasets", "pyarrow")
 _NUITKA_METADATA_EXCLUDED_PACKAGE_ROOTS = frozenset(
     {
-        "datasets",
-        "pyarrow",
         "matplotlib",
         "_pytest",
         "coverage",
@@ -497,6 +496,7 @@ def _seed_distribution_metadata_names() -> tuple[str, ...]:
         "numpy",
         "omegaconf",
         "packaging",
+        "pyarrow",
         "regex",
         "requests",
         "safetensors",
@@ -552,7 +552,6 @@ def _is_safe_metadata_distribution(distribution_name: str) -> bool:
     """Return whether one distribution is safe to include as Nuitka metadata."""
     normalized_distribution_name = _normalize_distribution_name(distribution_name)
     blocked_distribution_names = {
-        "pyarrow",
         "matplotlib",
         "mako",
         "_pytest",
@@ -846,8 +845,10 @@ def _build_nuitka_command(*, nuitka_command: Sequence[str], build_dir: Path, ver
         "--noinclude-setuptools-mode=nofollow",
         f"--user-package-configuration-file={NUITKA_PACKAGE_CONFIG_PATH}",
         f"--report={report_path}",
-        "--nofollow-import-to=datasets,pyarrow,matplotlib,_pytest,coverage,mypy,IPython,pytest,transcribe.bench,transcribe.test_cov,torch.utils.cpp_extension,setuptools",
+        "--nofollow-import-to=matplotlib,_pytest,coverage,mypy,IPython,pytest,transcribe.bench,transcribe.test_cov,torch.utils.cpp_extension,setuptools",
     ]
+    for package_name in _NUITKA_REQUIRED_PACKAGE_ROOTS:
+        command.append(f"--include-package={package_name}")
     if _module_available("_yaml"):
         command.append("--include-module=_yaml")
     if _supports_nuitka_option(nuitka_command, "--windows-console-mode="):

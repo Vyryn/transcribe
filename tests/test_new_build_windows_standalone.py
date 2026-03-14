@@ -103,10 +103,14 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_attach_console(
     assert "--windows-console-mode=attach" in command
     assert "--enable-plugin=tk-inter" in command
     assert "--include-module=transcribe.packaged_ui" in command
+    assert "--include-package=datasets" in command
+    assert "--include-package=pyarrow" in command
     assert "--include-package=soundcard" in command
     assert "--include-module=_yaml" in command
     assert "--include-distribution-metadata=libcst" in command
     assert "--include-distribution-metadata=transformers" in command
+    assert not any(item.startswith("--nofollow-import-to=") and "datasets" in item for item in command)
+    assert not any(item.startswith("--nofollow-import-to=") and "pyarrow" in item for item in command)
     assert str(build_script.REPO_ROOT / "packaged_main.py") == command[-1]
 
 
@@ -248,7 +252,7 @@ def test_seed_distribution_metadata_names_skips_nofollowed_package_metadata(
         build_script.importlib.metadata,
         "packages_distributions",
         lambda: {
-            "datasets": ["datasets"],
+            "matplotlib": ["matplotlib"],
             "requests": ["requests"],
             "transcribe": ["transcribe"],
         },
@@ -257,7 +261,7 @@ def test_seed_distribution_metadata_names_skips_nofollowed_package_metadata(
         build_script,
         "_distribution_top_level_packages",
         lambda distribution_name: {
-            "datasets": ("datasets",),
+            "matplotlib": ("matplotlib",),
             "requests": ("requests",),
             "transcribe": ("transcribe",),
         }.get(build_script._normalize_distribution_name(distribution_name), (distribution_name,)),
@@ -268,7 +272,7 @@ def test_seed_distribution_metadata_names_skips_nofollowed_package_metadata(
         for distribution_name in build_script._seed_distribution_metadata_names()
     }
 
-    assert "datasets" not in names
+    assert "matplotlib" not in names
     assert {"requests", "transcribe"}.issubset(names)
 
 
@@ -283,6 +287,7 @@ def test_seed_distribution_metadata_names_includes_transformers_runtime_metadata
             "requests": ["requests"],
             "packaging": ["packaging"],
             "filelock": ["filelock"],
+            "pyarrow": ["pyarrow"],
             "yaml": ["PyYAML"],
             "tqdm": ["tqdm"],
             "regex": ["regex"],
@@ -307,6 +312,7 @@ def test_seed_distribution_metadata_names_includes_transformers_runtime_metadata
             "requests": ("requests",),
             "packaging": ("packaging",),
             "filelock": ("filelock",),
+            "pyarrow": ("pyarrow",),
             "pyyaml": ("yaml",),
             "tqdm": ("tqdm",),
             "regex": ("regex",),
@@ -331,10 +337,12 @@ def test_seed_distribution_metadata_names_includes_transformers_runtime_metadata
 
     assert {
         "accelerate",
+        "datasets",
         "filelock",
         "huggingface-hub",
         "numpy",
         "packaging",
+        "pyarrow",
         "pyyaml",
         "regex",
         "requests",
