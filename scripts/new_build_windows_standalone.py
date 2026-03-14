@@ -43,6 +43,8 @@ NUITKA_REPORT_FILENAME = "nuitka-report.xml"
 APP_NAME = "Transcribe"
 APP_PUBLISHER = "Transcribe"
 DEFAULT_DOWNLOAD_USER_AGENT = "transcribe-new-windows-build"
+DEFAULT_INNO_SETUP_REPO = "jrsoftware/issrc"
+DEFAULT_INNO_SETUP_RELEASE = "latest"
 DEFAULT_LLAMA_CPP_REPO = "ggml-org/llama.cpp"
 DEFAULT_LLAMA_CPP_RELEASE = "latest"
 DEFAULT_LLAMA_CPP_RELEASE_SCAN_COUNT = 12
@@ -77,6 +79,10 @@ SUPPORTED_PYTHON = (3, 13)
 _LLAMA_CPP_WINDOWS_ASSET_PATTERNS = (
     re.compile(r"llama-b\d+-bin-win-cpu-x64\.zip$", re.IGNORECASE),
     re.compile(r"llama-b\d+-bin-win-avx2-x64\.zip$", re.IGNORECASE),
+)
+_INNO_SETUP_ASSET_PATTERNS = (
+    re.compile(r"innosetup-.*\.exe$", re.IGNORECASE),
+    re.compile(r"isetup-.*\.exe$", re.IGNORECASE),
 )
 
 
@@ -164,27 +170,29 @@ def _run(
 
 
 def _require_repo_runtime_dependencies() -> None:
-    """Fail fast when the packaged app runtime dependencies are missing."""
+    """Ensure the packaged app runtime dependencies are available."""
     missing_modules = [module_name for module_name in REQUIRED_RUNTIME_MODULES if not _module_available(module_name)]
+    if missing_modules:
+        _bootstrap_repo_runtime_dependencies()
+        missing_modules = [module_name for module_name in REQUIRED_RUNTIME_MODULES if not _module_available(module_name)]
     if not missing_modules:
         return
 
     missing_list = ", ".join(missing_modules)
     raise RuntimeError(
-        "The Windows build requires project dependencies that are not installed "
-        f"({missing_list}). Run `uv sync --extra nemo-asr --inexact` and retry."
+        "The Windows build could not install the required project dependencies "
+        f"({missing_list})."
     )
 
 
 def _require_nuitka() -> tuple[str, ...]:
-    """Return the Nuitka command when the active environment already provides it."""
+    """Return the Nuitka command, installing Nuitka when necessary."""
+    if not _module_available("nuitka"):
+        _bootstrap_nuitka()
     if _module_available("nuitka"):
         return (sys.executable, "-m", "nuitka")
 
-    raise RuntimeError(
-        "Nuitka is required on the developer machine for Windows builds. "
-        "Install it into the project environment and retry."
-    )
+    raise RuntimeError("Nuitka could not be installed into the active project environment.")
 
 
 def _known_inno_setup_paths() -> tuple[Path, ...]:
@@ -204,6 +212,38 @@ def _resolve_known_executable(paths: Sequence[Path]) -> str | None:
         if path.exists():
             return str(path.resolve())
     return None
+
+
+def _ensure_pip_available() -> None:
+    """Ensure pip is importable before falling back to pip-based bootstrap."""
+    if _module_available("pip"):
+        return
+
+    import ensurepip
+
+    ensurepip.bootstrap(upgrade=True)
+
+
+def _bootstrap_repo_runtime_dependencies() -> None:
+    """Install the project runtime dependencies used by the Windows bundle."""
+    uv_exe = _resolve_executable("uv")
+    if uv_exe is not None:
+        _run([uv_exe, "sync", "--extra", "nemo-asr", "--inexact"], cwd=REPO_ROOT)
+        return
+
+    _ensure_pip_available()
+    _run([sys.executable, "-m", "pip", "install", "-e", ".[nemo-asr]"], cwd=REPO_ROOT)
+
+
+def _bootstrap_nuitka() -> None:
+    """Install Nuitka into the active project environment when it is missing."""
+    uv_exe = _resolve_executable("uv")
+    if uv_exe is not None:
+        _run([uv_exe, "pip", "install", "--python", sys.executable, "nuitka"], cwd=REPO_ROOT)
+        return
+
+    _ensure_pip_available()
+    _run([sys.executable, "-m", "pip", "install", "nuitka"], cwd=REPO_ROOT)
 
 
 def _github_release_api_url(*, repo: str, release: str) -> str:
@@ -302,20 +342,74 @@ def _find_named_file(root: Path, filename: str) -> Path | None:
     return matches[0]
 
 
+def _select_inno_setup_asset(assets: Sequence[Mapping[str, object]]) -> GitHubReleaseAsset:
+    """Select the preferred Inno Setup installer asset from a release payload."""
+    candidates: list[GitHubReleaseAsset] = []
+    for raw_asset in assets:
+        name = raw_asset.get("name")
+        download_url = raw_asset.get("browser_download_url")
+        if isinstance(name, str) and isinstance(download_url, str):
+            candidates.append(GitHubReleaseAsset(name=name, download_url=download_url))
+
+    for pattern in _INNO_SETUP_ASSET_PATTERNS:
+        for asset in candidates:
+            if pattern.search(asset.name):
+                return asset
+
+    available = ", ".join(sorted(asset.name for asset in candidates))
+    raise RuntimeError(
+        "Unable to find a supported Inno Setup installer asset in the selected release. "
+        f"Available assets: {available}"
+    )
+
+
+def _download_inno_setup_installer(*, tools_dir: Path, release: str) -> Path:
+    """Download the Inno Setup installer used for local tool bootstrap."""
+    release_payload = _fetch_json(_github_release_api_url(repo=DEFAULT_INNO_SETUP_REPO, release=release))
+    assets = release_payload.get("assets")
+    if not isinstance(assets, list):
+        raise RuntimeError("Inno Setup release payload did not include an asset list.")
+
+    asset = _select_inno_setup_asset(assets)
+    return _download_file(asset.download_url, tools_dir / "downloads" / asset.name)
+
+
 def _require_inno_setup() -> str:
-    """Return the existing Inno Setup compiler path from the developer machine."""
+    """Return the Inno Setup compiler path, bootstrapping a local install when needed."""
     resolved = _resolve_executable("iscc")
     if resolved is not None:
         return resolved
+
+    local_bootstrap_install = TOOLS_DIR / "inno-setup" / "ISCC.exe"
+    if local_bootstrap_install.exists():
+        return str(local_bootstrap_install.resolve())
 
     resolved = _resolve_known_executable(_known_inno_setup_paths())
     if resolved is not None:
         return resolved
 
-    raise RuntimeError(
-        "Inno Setup 6 is required on the developer machine for Windows builds. "
-        "Install it and ensure `ISCC.exe` is on PATH or available in Program Files."
+    installer_path = _download_inno_setup_installer(tools_dir=TOOLS_DIR, release=DEFAULT_INNO_SETUP_RELEASE)
+    install_root = TOOLS_DIR / "inno-setup"
+    _run(
+        [
+            str(installer_path),
+            f"/DIR={install_root}",
+            "/SP-",
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/NOICONS",
+        ],
+        cwd=REPO_ROOT,
     )
+    if local_bootstrap_install.exists():
+        return str(local_bootstrap_install.resolve())
+
+    resolved = _resolve_known_executable(_known_inno_setup_paths())
+    if resolved is not None:
+        return resolved
+
+    raise FileNotFoundError("Automatic Inno Setup installation completed, but ISCC.exe could not be located.")
 
 
 def _download_llama_cpp_runtime() -> Path:

@@ -116,12 +116,38 @@ def test_require_inno_setup_uses_existing_compiler(monkeypatch: pytest.MonkeyPat
     assert resolved == "C:/Tools/ISCC.exe"
 
 
-def test_require_inno_setup_raises_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_require_inno_setup_bootstraps_local_install_when_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer_path = tmp_path / "downloads" / "innosetup.exe"
+    installer_path.parent.mkdir(parents=True, exist_ok=True)
+    installer_path.write_bytes(b"installer")
+    observed: dict[str, list[str]] = {}
+
+    monkeypatch.setattr(build_script, "TOOLS_DIR", tmp_path)
     monkeypatch.setattr(build_script, "_resolve_executable", lambda candidate: None)
     monkeypatch.setattr(build_script, "_resolve_known_executable", lambda paths: None)
+    monkeypatch.setattr(
+        build_script,
+        "_download_inno_setup_installer",
+        lambda *, tools_dir, release: installer_path,
+    )
 
-    with pytest.raises(RuntimeError, match="Inno Setup 6 is required"):
-        build_script._require_inno_setup()
+    def fake_run(command, **kwargs):
+        del kwargs
+        observed["command"] = list(command)
+        iscc_path = tmp_path / "inno-setup" / "ISCC.exe"
+        iscc_path.parent.mkdir(parents=True, exist_ok=True)
+        iscc_path.write_bytes(b"iscc")
+
+    monkeypatch.setattr(build_script, "_run", fake_run)
+
+    resolved = build_script._require_inno_setup()
+
+    assert Path(resolved) == (tmp_path / "inno-setup" / "ISCC.exe").resolve()
+    assert observed["command"][0] == str(installer_path)
+    assert "/VERYSILENT" in observed["command"]
 
 
 def test_require_nuitka_uses_lowercase_module_name(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -136,7 +162,48 @@ def test_require_nuitka_uses_lowercase_module_name(monkeypatch: pytest.MonkeyPat
     command = build_script._require_nuitka()
 
     assert command == (build_script.sys.executable, "-m", "nuitka")
-    assert seen_module_names == ["nuitka"]
+    assert seen_module_names
+    assert set(seen_module_names) == {"nuitka"}
+
+
+def test_require_nuitka_bootstraps_missing_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    installed = {"ready": False}
+
+    def fake_module_available(module_name: str) -> bool:
+        return module_name == "nuitka" and installed["ready"]
+
+    def fake_bootstrap_nuitka() -> None:
+        installed["ready"] = True
+
+    monkeypatch.setattr(build_script, "_module_available", fake_module_available)
+    monkeypatch.setattr(build_script, "_bootstrap_nuitka", fake_bootstrap_nuitka)
+
+    command = build_script._require_nuitka()
+
+    assert command == (build_script.sys.executable, "-m", "nuitka")
+
+
+def test_require_repo_runtime_dependencies_bootstraps_missing_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = {"ready": False}
+
+    def fake_module_available(module_name: str) -> bool:
+        if module_name in build_script.REQUIRED_RUNTIME_MODULES:
+            return installed["ready"]
+        return True
+
+    def fake_bootstrap_runtime_dependencies() -> None:
+        installed["ready"] = True
+
+    monkeypatch.setattr(build_script, "_module_available", fake_module_available)
+    monkeypatch.setattr(
+        build_script,
+        "_bootstrap_repo_runtime_dependencies",
+        fake_bootstrap_runtime_dependencies,
+    )
+
+    build_script._require_repo_runtime_dependencies()
 
 
 def test_seed_distribution_metadata_names_skips_blocked_seed_distributions(
