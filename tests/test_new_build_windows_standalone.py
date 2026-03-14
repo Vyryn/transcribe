@@ -181,6 +181,77 @@ def test_seed_distribution_metadata_names_skips_blocked_seed_distributions(
     assert {"torch", "transformers", "libcst"}.issubset(names)
 
 
+def test_seed_distribution_metadata_names_includes_transformers_runtime_metadata_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        build_script.importlib.metadata,
+        "packages_distributions",
+        lambda: {
+            "datasets": ["datasets"],
+            "requests": ["requests"],
+            "packaging": ["packaging"],
+            "filelock": ["filelock"],
+            "yaml": ["PyYAML"],
+            "tqdm": ["tqdm"],
+            "regex": ["regex"],
+            "accelerate": ["accelerate"],
+            "numpy": ["numpy"],
+            "transformers": ["transformers"],
+            "tokenizers": ["tokenizers"],
+            "huggingface_hub": ["huggingface_hub"],
+            "safetensors": ["safetensors"],
+            "torch": ["torch"],
+            "soundcard": ["SoundCard"],
+            "omegaconf": ["omegaconf"],
+            "libcst": ["libcst"],
+            "transcribe": ["transcribe"],
+        },
+    )
+    monkeypatch.setattr(
+        build_script,
+        "_distribution_top_level_packages",
+        lambda distribution_name: {
+            "datasets": ("datasets",),
+            "requests": ("requests",),
+            "packaging": ("packaging",),
+            "filelock": ("filelock",),
+            "pyyaml": ("yaml",),
+            "tqdm": ("tqdm",),
+            "regex": ("regex",),
+            "accelerate": ("accelerate",),
+            "numpy": ("numpy",),
+            "transformers": ("transformers",),
+            "tokenizers": ("tokenizers",),
+            "huggingface-hub": ("huggingface_hub",),
+            "safetensors": ("safetensors",),
+            "torch": ("torch",),
+            "soundcard": ("soundcard",),
+            "omegaconf": ("omegaconf",),
+            "libcst": ("libcst",),
+            "transcribe": ("transcribe",),
+        }.get(build_script._normalize_distribution_name(distribution_name), (distribution_name,)),
+    )
+
+    names = {
+        build_script._normalize_distribution_name(distribution_name)
+        for distribution_name in build_script._seed_distribution_metadata_names()
+    }
+
+    assert {
+        "accelerate",
+        "datasets",
+        "filelock",
+        "huggingface-hub",
+        "numpy",
+        "packaging",
+        "pyyaml",
+        "regex",
+        "requests",
+        "tqdm",
+    }.issubset(names)
+
+
 def test_download_llama_cpp_runtime_scans_recent_releases_when_latest_is_incomplete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -237,6 +308,32 @@ def test_download_llama_cpp_runtime_scans_recent_releases_when_latest_is_incompl
 
     assert runtime_dir == (tmp_path / "tools" / "llama.cpp" / "llama-b9998-bin-win-cpu-x64" / "bundle").resolve()
     assert (runtime_dir / "llama-server.exe").read_text(encoding="utf-8") == "exe"
+
+
+def test_build_nuitka_command_keeps_existing_report_available_for_metadata_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_path = (tmp_path / "nuitka" / build_script.NUITKA_REPORT_FILENAME)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("<report />", encoding="utf-8")
+    seen: dict[str, bool] = {}
+
+    def fake_metadata_names(build_dir: Path) -> tuple[str, ...]:
+        seen["report_exists"] = build_script._default_nuitka_report_path(build_dir).exists()
+        return ()
+
+    monkeypatch.setattr(build_script, "_supports_nuitka_option", lambda command, option_fragment: False)
+    monkeypatch.setattr(build_script, "_nuitka_distribution_metadata_names", fake_metadata_names)
+
+    build_script._build_nuitka_command(
+        nuitka_command=("python", "-m", "nuitka"),
+        build_dir=tmp_path / "nuitka",
+        version="1.2.3",
+    )
+
+    assert seen == {"report_exists": True}
+    assert report_path.exists()
 
 
 def test_publish_release_installer_clears_existing_releases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

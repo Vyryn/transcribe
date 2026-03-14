@@ -529,15 +529,24 @@ def _seed_distribution_metadata_names() -> tuple[str, ...]:
     names: dict[str, str] = {}
     for module_name in (
         "transcribe",
+        "accelerate",
+        "datasets",
+        "filelock",
         "huggingface_hub",
-        "soundcard",
-        "transformers",
-        "tokenizers",
         "libcst",
-        "torch",
         "nemo",
+        "numpy",
         "omegaconf",
+        "packaging",
+        "regex",
+        "requests",
         "safetensors",
+        "soundcard",
+        "tokenizers",
+        "torch",
+        "tqdm",
+        "transformers",
+        "yaml",
     ):
         for distribution_name in packages_to_distributions.get(module_name, ()):
             if not _is_safe_metadata_distribution(distribution_name):
@@ -584,7 +593,6 @@ def _is_safe_metadata_distribution(distribution_name: str) -> bool:
     """Return whether one distribution is safe to include as Nuitka metadata."""
     normalized_distribution_name = _normalize_distribution_name(distribution_name)
     blocked_distribution_names = {
-        "datasets",
         "pyarrow",
         "matplotlib",
         "mako",
@@ -795,8 +803,7 @@ def _build_nuitka_command(*, nuitka_command: Sequence[str], build_dir: Path, ver
     """Build the simplified Nuitka standalone command line."""
     build_dir.mkdir(parents=True, exist_ok=True)
     report_path = _default_nuitka_report_path(build_dir)
-    if report_path.exists():
-        report_path.unlink()
+    metadata_names = _nuitka_distribution_metadata_names(build_dir)
 
     command = [
         *nuitka_command,
@@ -833,7 +840,7 @@ def _build_nuitka_command(*, nuitka_command: Sequence[str], build_dir: Path, ver
     ]
     if _supports_nuitka_option(nuitka_command, "--windows-console-mode="):
         command.append("--windows-console-mode=attach")
-    for distribution_name in _nuitka_distribution_metadata_names(build_dir):
+    for distribution_name in metadata_names:
         command.append(f"--include-distribution-metadata={distribution_name}")
     command.append(str(REPO_ROOT / "packaged_main.py"))
     return command
