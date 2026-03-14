@@ -87,7 +87,6 @@ _INNO_SETUP_ASSET_PATTERNS = (
 _NUITKA_REQUIRED_PACKAGE_ROOTS = (
     "datasets",
     "pyarrow",
-    "transformers",
     "hydra",
     "lightning",
     "pytorch_lightning",
@@ -850,6 +849,7 @@ def _build_nuitka_command(*, nuitka_command: Sequence[str], build_dir: Path, ver
         "--include-module=transcribe.transcription_runtime",
         "--include-module=huggingface_hub",
         "--include-module=huggingface_hub.file_download",
+        "--include-package=transformers.commands",
         "--include-module=nemo.collections.asr",
         "--include-module=nemo.collections.speechlm2.models",
         "--include-module=omegaconf",

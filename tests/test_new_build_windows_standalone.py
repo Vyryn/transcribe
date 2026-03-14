@@ -6,6 +6,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 from transcribe.packaged_assets import load_packaged_asset_manifest
 
@@ -105,7 +106,7 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_attach_console(
     assert "--include-module=transcribe.packaged_ui" in command
     assert "--include-package=datasets" in command
     assert "--include-package=pyarrow" in command
-    assert "--include-package=transformers" in command
+    assert "--include-package=transformers.commands" in command
     assert "--include-package=hydra" in command
     assert "--include-package=lightning" in command
     assert "--include-package=librosa" in command
@@ -119,6 +120,7 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_attach_console(
     assert not any(item.startswith("--nofollow-import-to=") and "pyarrow" in item for item in command)
     assert not any(item.startswith("--nofollow-import-to=") and "matplotlib" in item for item in command)
     assert not any(item.startswith("--nofollow-import-to=") and "IPython" in item for item in command)
+    assert not any(item.startswith("--nofollow-import-to=") and "transformers.commands" in item for item in command)
     assert str(build_script.REPO_ROOT / "packaged_main.py") == command[-1]
 
 
@@ -520,6 +522,16 @@ def test_build_nuitka_command_keeps_existing_report_available_for_metadata_selec
 
     assert seen == {"report_exists": True}
     assert report_path.exists()
+
+
+def test_nuitka_package_config_includes_transformers_commands_workaround() -> None:
+    config_text = build_script.NUITKA_PACKAGE_CONFIG_PATH.read_text(encoding="utf-8")
+    config_data = yaml.safe_load(config_text)
+
+    assert "module-name: 'transformers.commands.add_new_model_like'" in config_text
+    assert "rewrite generated init template to avoid Nuitka f-string transformation bug" in config_text
+    assert "init_template = \"\"\"" in config_text
+    assert isinstance(config_data, list)
 
 
 def test_publish_release_installer_clears_existing_releases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

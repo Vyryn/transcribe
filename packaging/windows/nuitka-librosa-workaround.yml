@@ -25,3 +25,53 @@
             if _STATE.current is None:
                 assert False  # pragma: no cover
             return _STATE.current
+
+- module-name: 'transformers.commands.add_new_model_like'
+  anti-bloat:
+    - description: 'rewrite generated init template to avoid Nuitka f-string transformation bug'
+      replacements_plain:
+        ? |-
+          imports = "\n            ".join(f"from .{file} import *" for file, to_add in filenames_to_add if to_add)
+          init_file = COPYRIGHT + textwrap.dedent(
+              f"""
+              from typing import TYPE_CHECKING
+
+              from ...utils import _LazyModule
+              from ...utils.import_utils import define_import_structure
+
+
+              if TYPE_CHECKING:
+                  {imports}
+              else:
+                  import sys
+
+                  _file = globals()["__file__"]
+                  sys.modules[__name__] = _LazyModule(__name__, _file, define_import_structure(_file), module_spec=__spec__)
+              """
+          )
+          return init_file
+        : |-
+          imports = "\n            ".join(f"from .{file} import *" for file, to_add in filenames_to_add if to_add)
+          init_template = """
+          from typing import TYPE_CHECKING
+
+          from ...utils import _LazyModule
+          from ...utils.import_utils import define_import_structure
+
+
+          if TYPE_CHECKING:
+          {imports_block}
+          else:
+              import sys
+
+              _file = globals()["__file__"]
+              sys.modules[__name__] = _LazyModule(
+                  __name__,
+                  _file,
+                  define_import_structure(_file),
+                  module_spec=__spec__,
+              )
+          """
+          imports_block = textwrap.indent(imports if imports else "pass", " " * 4)
+          init_file = COPYRIGHT + textwrap.dedent(init_template.format(imports_block=imports_block))
+          return init_file
