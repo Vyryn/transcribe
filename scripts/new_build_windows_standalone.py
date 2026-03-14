@@ -84,14 +84,35 @@ _INNO_SETUP_ASSET_PATTERNS = (
     re.compile(r"innosetup-.*\.exe$", re.IGNORECASE),
     re.compile(r"isetup-.*\.exe$", re.IGNORECASE),
 )
-_NUITKA_REQUIRED_PACKAGE_ROOTS = ("datasets", "pyarrow")
+_NUITKA_REQUIRED_PACKAGE_ROOTS = (
+    "datasets",
+    "pyarrow",
+    "transformers",
+    "hydra",
+    "lightning",
+    "pytorch_lightning",
+    "omegaconf",
+    "torchmetrics",
+    "librosa",
+    "scipy",
+    "sentencepiece",
+    "jiwer",
+    "editdistance",
+    "lhotse",
+    "webdataset",
+    "wget",
+    "soundfile",
+    "pydub",
+    "pandas",
+    "pyannote",
+    "matplotlib",
+    "IPython",
+)
 _NUITKA_METADATA_EXCLUDED_PACKAGE_ROOTS = frozenset(
     {
-        "matplotlib",
         "_pytest",
         "coverage",
         "mypy",
-        "ipython",
         "pytest",
         "setuptools",
     }
@@ -488,15 +509,12 @@ def _seed_distribution_metadata_names() -> tuple[str, ...]:
     for module_name in (
         "transcribe",
         "accelerate",
-        "datasets",
         "filelock",
         "huggingface_hub",
         "libcst",
         "nemo",
         "numpy",
-        "omegaconf",
         "packaging",
-        "pyarrow",
         "regex",
         "requests",
         "safetensors",
@@ -504,8 +522,8 @@ def _seed_distribution_metadata_names() -> tuple[str, ...]:
         "tokenizers",
         "torch",
         "tqdm",
-        "transformers",
         "yaml",
+        *_NUITKA_REQUIRED_PACKAGE_ROOTS,
     ):
         for distribution_name in packages_to_distributions.get(module_name, ()):
             if not _is_safe_metadata_distribution(distribution_name):
@@ -552,12 +570,10 @@ def _is_safe_metadata_distribution(distribution_name: str) -> bool:
     """Return whether one distribution is safe to include as Nuitka metadata."""
     normalized_distribution_name = _normalize_distribution_name(distribution_name)
     blocked_distribution_names = {
-        "matplotlib",
         "mako",
         "_pytest",
         "coverage",
         "mypy",
-        "ipython",
         "pytest",
         "setuptools",
         "nemo-toolkit",
@@ -845,7 +861,7 @@ def _build_nuitka_command(*, nuitka_command: Sequence[str], build_dir: Path, ver
         "--noinclude-setuptools-mode=nofollow",
         f"--user-package-configuration-file={NUITKA_PACKAGE_CONFIG_PATH}",
         f"--report={report_path}",
-        "--nofollow-import-to=matplotlib,_pytest,coverage,mypy,IPython,pytest,transcribe.bench,transcribe.test_cov,torch.utils.cpp_extension,setuptools",
+        "--nofollow-import-to=_pytest,coverage,mypy,pytest,transcribe.bench,transcribe.test_cov,torch.utils.cpp_extension,setuptools",
     ]
     for package_name in _NUITKA_REQUIRED_PACKAGE_ROOTS:
         command.append(f"--include-package={package_name}")

@@ -105,12 +105,20 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_attach_console(
     assert "--include-module=transcribe.packaged_ui" in command
     assert "--include-package=datasets" in command
     assert "--include-package=pyarrow" in command
+    assert "--include-package=transformers" in command
+    assert "--include-package=hydra" in command
+    assert "--include-package=lightning" in command
+    assert "--include-package=librosa" in command
+    assert "--include-package=matplotlib" in command
+    assert "--include-package=IPython" in command
     assert "--include-package=soundcard" in command
     assert "--include-module=_yaml" in command
     assert "--include-distribution-metadata=libcst" in command
     assert "--include-distribution-metadata=transformers" in command
     assert not any(item.startswith("--nofollow-import-to=") and "datasets" in item for item in command)
     assert not any(item.startswith("--nofollow-import-to=") and "pyarrow" in item for item in command)
+    assert not any(item.startswith("--nofollow-import-to=") and "matplotlib" in item for item in command)
+    assert not any(item.startswith("--nofollow-import-to=") and "IPython" in item for item in command)
     assert str(build_script.REPO_ROOT / "packaged_main.py") == command[-1]
 
 
@@ -245,14 +253,14 @@ def test_seed_distribution_metadata_names_skips_blocked_seed_distributions(
     assert {"torch", "transformers", "libcst"}.issubset(names)
 
 
-def test_seed_distribution_metadata_names_skips_nofollowed_package_metadata(
+def test_seed_distribution_metadata_names_skips_dev_only_package_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         build_script.importlib.metadata,
         "packages_distributions",
         lambda: {
-            "matplotlib": ["matplotlib"],
+            "pytest": ["pytest"],
             "requests": ["requests"],
             "transcribe": ["transcribe"],
         },
@@ -261,7 +269,7 @@ def test_seed_distribution_metadata_names_skips_nofollowed_package_metadata(
         build_script,
         "_distribution_top_level_packages",
         lambda distribution_name: {
-            "matplotlib": ("matplotlib",),
+            "pytest": ("pytest",),
             "requests": ("requests",),
             "transcribe": ("transcribe",),
         }.get(build_script._normalize_distribution_name(distribution_name), (distribution_name,)),
@@ -272,7 +280,7 @@ def test_seed_distribution_metadata_names_skips_nofollowed_package_metadata(
         for distribution_name in build_script._seed_distribution_metadata_names()
     }
 
-    assert "matplotlib" not in names
+    assert "pytest" not in names
     assert {"requests", "transcribe"}.issubset(names)
 
 
@@ -288,6 +296,24 @@ def test_seed_distribution_metadata_names_includes_transformers_runtime_metadata
             "packaging": ["packaging"],
             "filelock": ["filelock"],
             "pyarrow": ["pyarrow"],
+            "hydra": ["hydra-core"],
+            "lightning": ["lightning"],
+            "pytorch_lightning": ["pytorch-lightning"],
+            "torchmetrics": ["torchmetrics"],
+            "librosa": ["librosa"],
+            "scipy": ["scipy"],
+            "sentencepiece": ["sentencepiece"],
+            "jiwer": ["jiwer"],
+            "editdistance": ["editdistance"],
+            "lhotse": ["lhotse"],
+            "webdataset": ["webdataset"],
+            "wget": ["wget"],
+            "soundfile": ["soundfile"],
+            "pydub": ["pydub"],
+            "pandas": ["pandas"],
+            "pyannote": ["pyannote-core", "pyannote-metrics"],
+            "matplotlib": ["matplotlib"],
+            "IPython": ["ipython"],
             "yaml": ["PyYAML"],
             "tqdm": ["tqdm"],
             "regex": ["regex"],
@@ -313,6 +339,25 @@ def test_seed_distribution_metadata_names_includes_transformers_runtime_metadata
             "packaging": ("packaging",),
             "filelock": ("filelock",),
             "pyarrow": ("pyarrow",),
+            "hydra-core": ("hydra",),
+            "lightning": ("lightning",),
+            "pytorch-lightning": ("pytorch_lightning",),
+            "torchmetrics": ("torchmetrics",),
+            "librosa": ("librosa",),
+            "scipy": ("scipy",),
+            "sentencepiece": ("sentencepiece",),
+            "jiwer": ("jiwer",),
+            "editdistance": ("editdistance",),
+            "lhotse": ("lhotse",),
+            "webdataset": ("webdataset",),
+            "wget": ("wget",),
+            "soundfile": ("soundfile",),
+            "pydub": ("pydub",),
+            "pandas": ("pandas",),
+            "pyannote-core": ("pyannote",),
+            "pyannote-metrics": ("pyannote",),
+            "matplotlib": ("matplotlib",),
+            "ipython": ("IPython",),
             "pyyaml": ("yaml",),
             "tqdm": ("tqdm",),
             "regex": ("regex",),
@@ -338,15 +383,33 @@ def test_seed_distribution_metadata_names_includes_transformers_runtime_metadata
     assert {
         "accelerate",
         "datasets",
+        "editdistance",
         "filelock",
+        "hydra-core",
         "huggingface-hub",
+        "ipython",
+        "jiwer",
+        "librosa",
+        "lightning",
+        "lhotse",
+        "matplotlib",
         "numpy",
         "packaging",
+        "pandas",
         "pyarrow",
+        "pyannote-core",
+        "pydub",
         "pyyaml",
+        "pytorch-lightning",
         "regex",
         "requests",
+        "scipy",
+        "sentencepiece",
+        "soundfile",
+        "torchmetrics",
         "tqdm",
+        "webdataset",
+        "wget",
     }.issubset(names)
 
 
