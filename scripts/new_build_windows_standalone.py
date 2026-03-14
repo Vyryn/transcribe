@@ -831,6 +831,8 @@ def _build_nuitka_command(*, nuitka_command: Sequence[str], build_dir: Path, ver
         f"--report={report_path}",
         "--nofollow-import-to=datasets,pyarrow,matplotlib,_pytest,coverage,mypy,IPython,pytest,transcribe.bench,transcribe.test_cov,torch.utils.cpp_extension,setuptools",
     ]
+    if _module_available("_yaml"):
+        command.append("--include-module=_yaml")
     if _supports_nuitka_option(nuitka_command, "--windows-console-mode="):
         command.append("--windows-console-mode=attach")
     for distribution_name in metadata_names:

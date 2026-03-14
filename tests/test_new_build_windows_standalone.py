@@ -91,6 +91,7 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_attach_console(
 ) -> None:
     monkeypatch.setattr(build_script, "_supports_nuitka_option", lambda command, option_fragment: option_fragment == "--windows-console-mode=")
     monkeypatch.setattr(build_script, "_nuitka_distribution_metadata_names", lambda build_dir: ("libcst", "transformers"))
+    monkeypatch.setattr(build_script, "_module_available", lambda module_name: module_name == "_yaml")
 
     command = build_script._build_nuitka_command(
         nuitka_command=("python", "-m", "nuitka"),
@@ -103,6 +104,7 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_attach_console(
     assert "--enable-plugin=tk-inter" in command
     assert "--include-module=transcribe.packaged_ui" in command
     assert "--include-package=soundcard" in command
+    assert "--include-module=_yaml" in command
     assert "--include-distribution-metadata=libcst" in command
     assert "--include-distribution-metadata=transformers" in command
     assert str(build_script.REPO_ROOT / "packaged_main.py") == command[-1]
