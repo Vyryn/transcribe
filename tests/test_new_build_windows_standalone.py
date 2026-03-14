@@ -241,6 +241,37 @@ def test_seed_distribution_metadata_names_skips_blocked_seed_distributions(
     assert {"torch", "transformers", "libcst"}.issubset(names)
 
 
+def test_seed_distribution_metadata_names_skips_nofollowed_package_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        build_script.importlib.metadata,
+        "packages_distributions",
+        lambda: {
+            "datasets": ["datasets"],
+            "requests": ["requests"],
+            "transcribe": ["transcribe"],
+        },
+    )
+    monkeypatch.setattr(
+        build_script,
+        "_distribution_top_level_packages",
+        lambda distribution_name: {
+            "datasets": ("datasets",),
+            "requests": ("requests",),
+            "transcribe": ("transcribe",),
+        }.get(build_script._normalize_distribution_name(distribution_name), (distribution_name,)),
+    )
+
+    names = {
+        build_script._normalize_distribution_name(distribution_name)
+        for distribution_name in build_script._seed_distribution_metadata_names()
+    }
+
+    assert "datasets" not in names
+    assert {"requests", "transcribe"}.issubset(names)
+
+
 def test_seed_distribution_metadata_names_includes_transformers_runtime_metadata_dependencies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -300,7 +331,6 @@ def test_seed_distribution_metadata_names_includes_transformers_runtime_metadata
 
     assert {
         "accelerate",
-        "datasets",
         "filelock",
         "huggingface-hub",
         "numpy",

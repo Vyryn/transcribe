@@ -84,6 +84,19 @@ _INNO_SETUP_ASSET_PATTERNS = (
     re.compile(r"innosetup-.*\.exe$", re.IGNORECASE),
     re.compile(r"isetup-.*\.exe$", re.IGNORECASE),
 )
+_NUITKA_METADATA_EXCLUDED_PACKAGE_ROOTS = frozenset(
+    {
+        "datasets",
+        "pyarrow",
+        "matplotlib",
+        "_pytest",
+        "coverage",
+        "mypy",
+        "ipython",
+        "pytest",
+        "setuptools",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,7 +571,11 @@ def _is_safe_metadata_distribution(distribution_name: str) -> bool:
         _normalize_distribution_name(package_name)
         for package_name in _distribution_top_level_packages(distribution_name)
     )
-    return not any(package_name in blocked_top_level_packages for package_name in top_level_packages)
+    if any(package_name in blocked_top_level_packages for package_name in top_level_packages):
+        return False
+    if normalized_distribution_name in _NUITKA_METADATA_EXCLUDED_PACKAGE_ROOTS:
+        return False
+    return not any(package_name in _NUITKA_METADATA_EXCLUDED_PACKAGE_ROOTS for package_name in top_level_packages)
 
 
 def _default_nuitka_report_path(build_dir: Path) -> Path:
