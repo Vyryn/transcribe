@@ -31,30 +31,11 @@ def _make_inputs(tmp_path: Path, *, version: str = "1.2.3") -> object:
     (llama_runtime_dir / "llama-server.exe").write_bytes(b"exe")
     (llama_runtime_dir / "ggml-base.dll").write_bytes(b"dll")
 
-    notes_model_4b = tmp_path / "Qwen3.5-4B-Q4_K_M.gguf"
-    notes_model_2b = tmp_path / "Qwen3.5-2B-Q4_K_M.gguf"
-    notes_model_4b.write_bytes(b"4b")
-    notes_model_2b.write_bytes(b"2b")
-
-    parakeet_model_dir = tmp_path / "parakeet"
-    parakeet_model_dir.mkdir()
-    (parakeet_model_dir / "parakeet-tdt-0.6b-v3.nemo").write_bytes(b"nemo")
-
-    canary_model_dir = tmp_path / "canary"
-    canary_model_dir.mkdir()
-    (canary_model_dir / "config.json").write_text("{}", encoding="utf-8")
-    (canary_model_dir / "LICENSES").write_text("license", encoding="utf-8")
-    (canary_model_dir / "model.safetensors").write_bytes(b"canary")
-
     return build_script.ResolvedBuildInputs(
         version=version,
         inno_setup_exe="iscc.exe",
         nuitka_command=("python", "-m", "nuitka"),
         llama_runtime_dir=llama_runtime_dir,
-        notes_model_4b=notes_model_4b,
-        notes_model_2b=notes_model_2b,
-        parakeet_model_dir=parakeet_model_dir,
-        canary_model_dir=canary_model_dir,
     )
 
 
@@ -64,15 +45,8 @@ def test_build_parser_defaults_to_package_version() -> None:
     assert args.version == build_script.PACKAGE_VERSION
 
 
-def test_build_packaged_assets_manifest_marks_default_and_optional_assets(tmp_path: Path) -> None:
-    build_inputs = _make_inputs(tmp_path)
-
-    manifest = build_script._build_packaged_assets_manifest(
-        notes_model_4b=build_inputs.notes_model_4b,
-        notes_model_2b=build_inputs.notes_model_2b,
-        parakeet_model_dir=build_inputs.parakeet_model_dir,
-        canary_model_dir=build_inputs.canary_model_dir,
-    )
+def test_build_packaged_assets_manifest_marks_default_and_optional_assets() -> None:
+    manifest = build_script._build_packaged_assets_manifest()
 
     assert manifest.schema_version == build_script.PACKAGED_ASSET_SCHEMA_VERSION
     assert [asset.model_id for asset in manifest.assets] == [
@@ -82,6 +56,8 @@ def test_build_packaged_assets_manifest_marks_default_and_optional_assets(tmp_pa
         "nvidia/canary-qwen-2.5b",
     ]
     assert [asset.default_install for asset in manifest.assets] == [True, False, True, False]
+    assert all(asset.sha256 == build_script.UNKNOWN_PACKAGED_ASSET_SHA256 for asset in manifest.assets)
+    assert all(asset.size_bytes == build_script.UNKNOWN_PACKAGED_ASSET_SIZE_BYTES for asset in manifest.assets)
 
 
 def test_stage_runtime_assets_writes_manifest_prompt_and_llama_runtime(
@@ -132,7 +108,23 @@ def test_build_nuitka_command_targets_packaged_entrypoint_and_attach_console(
     assert str(build_script.REPO_ROOT / "packaged_main.py") == command[-1]
 
 
-def test_ensure_nuitka_uses_lowercase_module_name(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_require_inno_setup_uses_existing_compiler(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(build_script, "_resolve_executable", lambda candidate: "C:/Tools/ISCC.exe")
+
+    resolved = build_script._require_inno_setup()
+
+    assert resolved == "C:/Tools/ISCC.exe"
+
+
+def test_require_inno_setup_raises_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(build_script, "_resolve_executable", lambda candidate: None)
+    monkeypatch.setattr(build_script, "_resolve_known_executable", lambda paths: None)
+
+    with pytest.raises(RuntimeError, match="Inno Setup 6 is required"):
+        build_script._require_inno_setup()
+
+
+def test_require_nuitka_uses_lowercase_module_name(monkeypatch: pytest.MonkeyPatch) -> None:
     seen_module_names: list[str] = []
 
     def fake_module_available(module_name: str) -> bool:
@@ -140,9 +132,8 @@ def test_ensure_nuitka_uses_lowercase_module_name(monkeypatch: pytest.MonkeyPatc
         return module_name == "nuitka"
 
     monkeypatch.setattr(build_script, "_module_available", fake_module_available)
-    monkeypatch.setattr(build_script, "_run", lambda *args, **kwargs: pytest.fail("unexpected installer call"))
 
-    command = build_script._ensure_nuitka()
+    command = build_script._require_nuitka()
 
     assert command == (build_script.sys.executable, "-m", "nuitka")
     assert seen_module_names == ["nuitka"]
@@ -308,6 +299,31 @@ def test_download_llama_cpp_runtime_scans_recent_releases_when_latest_is_incompl
 
     assert runtime_dir == (tmp_path / "tools" / "llama.cpp" / "llama-b9998-bin-win-cpu-x64" / "bundle").resolve()
     assert (runtime_dir / "llama-server.exe").read_text(encoding="utf-8") == "exe"
+
+
+def test_resolve_build_inputs_uses_prerequisites_and_llama_runtime_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llama_runtime_dir = tmp_path / "llama-runtime"
+    llama_runtime_dir.mkdir()
+    calls: list[str] = []
+
+    monkeypatch.setattr(build_script, "_ensure_supported_python", lambda: calls.append("python"))
+    monkeypatch.setattr(build_script, "_require_repo_runtime_dependencies", lambda: calls.append("runtime-deps"))
+    monkeypatch.setattr(build_script, "_require_nuitka", lambda: ("python", "-m", "nuitka"))
+    monkeypatch.setattr(build_script, "_require_inno_setup", lambda: "C:/Tools/ISCC.exe")
+    monkeypatch.setattr(build_script, "_download_llama_cpp_runtime", lambda: llama_runtime_dir)
+
+    build_inputs = build_script._resolve_build_inputs("2.0.0")
+
+    assert calls == ["python", "runtime-deps"]
+    assert build_inputs == build_script.ResolvedBuildInputs(
+        version="2.0.0",
+        inno_setup_exe="C:/Tools/ISCC.exe",
+        nuitka_command=("python", "-m", "nuitka"),
+        llama_runtime_dir=llama_runtime_dir,
+    )
 
 
 def test_build_nuitka_command_keeps_existing_report_available_for_metadata_selection(

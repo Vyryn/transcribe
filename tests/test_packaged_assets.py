@@ -7,7 +7,9 @@ import pytest
 import transcribe.packaged_assets as packaged_assets
 from transcribe.packaged_assets import (
     PACKAGED_ASSET_SCHEMA_VERSION,
+    PackagedAssetFile,
     PackagedAssetsManifest,
+    PackagedModelAsset,
     build_directory_asset,
     build_single_file_asset,
     install_packaged_model_assets,
@@ -215,5 +217,73 @@ def test_install_packaged_model_assets_raises_on_size_mismatch(
             installed_state_path=tmp_path / "installed-assets.json",
             model_ids=["qwen3.5:4b-q4_K_M"],
         )
+
+
+def test_install_packaged_model_assets_supports_remote_only_manifest_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    remote_source = tmp_path / "remote"
+    remote_source.mkdir()
+    note_file = remote_source / "Qwen3.5-4B-Q4_K_M.gguf"
+    note_file.write_bytes(b"notes-4b")
+    parakeet_file = remote_source / "parakeet-tdt-0.6b-v3.nemo"
+    parakeet_file.write_bytes(b"parakeet")
+
+    manifest = PackagedAssetsManifest(
+        schema_version=PACKAGED_ASSET_SCHEMA_VERSION,
+        assets=(
+            PackagedModelAsset(
+                model_id="qwen3.5:4b-q4_K_M",
+                kind="notes",
+                relative_path="notes/qwen3.5-4b-q4_k_m.gguf",
+                source_type="huggingface_file",
+                repo_id="repo/notes-4b",
+                revision="rev-notes-4b",
+                filename="Qwen3.5-4B-Q4_K_M.gguf",
+                required_files=(),
+                sha256="0" * 64,
+                size_bytes=0,
+                default_install=True,
+            ),
+            PackagedModelAsset(
+                model_id="nvidia/parakeet-tdt-0.6b-v3",
+                kind="transcription",
+                relative_path="asr/nvidia/parakeet-tdt-0.6b-v3",
+                source_type="huggingface_snapshot",
+                repo_id="nvidia/parakeet-tdt-0.6b-v3",
+                revision="rev-parakeet",
+                filename=None,
+                required_files=(
+                    PackagedAssetFile(path="parakeet-tdt-0.6b-v3.nemo", sha256="0" * 64, size_bytes=0),
+                ),
+                sha256="0" * 64,
+                size_bytes=0,
+                default_install=True,
+            ),
+        ),
+    )
+
+    repo_files = {
+        ("repo/notes-4b", "rev-notes-4b", "Qwen3.5-4B-Q4_K_M.gguf"): note_file,
+        ("nvidia/parakeet-tdt-0.6b-v3", "rev-parakeet", "parakeet-tdt-0.6b-v3.nemo"): parakeet_file,
+    }
+
+    def fake_download(*, repo_id: str, revision: str, filename: str, cache_dir: Path) -> Path:
+        _ = cache_dir
+        return repo_files[(repo_id, revision, filename)]
+
+    monkeypatch.setattr(packaged_assets, "_hf_download_file", fake_download)
+
+    results = install_packaged_model_assets(
+        manifest,
+        models_root=tmp_path / "installed-models",
+        installed_state_path=tmp_path / "installed-assets.json",
+        default_only=True,
+    )
+
+    assert [result.model_id for result in results] == ["qwen3.5:4b-q4_K_M", "nvidia/parakeet-tdt-0.6b-v3"]
+    assert verify_installed_asset(manifest.assets[0], models_root=tmp_path / "installed-models") is True
+    assert verify_installed_asset(manifest.assets[1], models_root=tmp_path / "installed-models") is True
 
 

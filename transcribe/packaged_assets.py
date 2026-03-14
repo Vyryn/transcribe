@@ -15,6 +15,7 @@ PACKAGED_ASSET_MANIFEST_FILENAME = "packaged-assets.json"
 INSTALLED_ASSET_STATE_FILENAME = "installed-assets.json"
 PACKAGED_ASSET_SCHEMA_VERSION = "transcribe-packaged-assets-v1"
 _HF_CACHE_DIRNAME = "hf-cache"
+_UNKNOWN_SHA256 = "0" * 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,12 +366,24 @@ def _asset_component_files(asset: PackagedModelAsset) -> tuple[PackagedAssetFile
     return (PackagedAssetFile(path=asset.filename, sha256=asset.sha256, size_bytes=asset.size_bytes),)
 
 
+def _has_known_integrity(*, sha256: str, size_bytes: int) -> bool:
+    """Return whether one manifest record carries real size and hash metadata."""
+    return sha256 != _UNKNOWN_SHA256 and size_bytes > 0
+
+
+def _file_entry_has_known_integrity(file_entry: PackagedAssetFile) -> bool:
+    """Return whether one file entry carries real size and hash metadata."""
+    return _has_known_integrity(sha256=file_entry.sha256, size_bytes=file_entry.size_bytes)
+
+
 def verify_installed_asset(asset: PackagedModelAsset, *, models_root: Path) -> bool:
-    """Return True when an installed asset matches manifest size and hash metadata."""
+    """Return True when an installed asset matches manifest metadata or required file presence."""
     target_path = resolve_asset_target_path(asset, models_root=models_root)
     if asset.source_type == "huggingface_file":
         if not target_path.exists() or not target_path.is_file():
             return False
+        if not _has_known_integrity(sha256=asset.sha256, size_bytes=asset.size_bytes):
+            return True
         return target_path.stat().st_size == asset.size_bytes and _sha256_for_file(target_path) == asset.sha256
 
     if not target_path.exists() or not target_path.is_dir():
@@ -383,9 +396,12 @@ def verify_installed_asset(asset: PackagedModelAsset, *, models_root: Path) -> b
             return False
         size_bytes = installed_file.stat().st_size
         sha256 = _sha256_for_file(installed_file)
-        if size_bytes != file_entry.size_bytes or sha256 != file_entry.sha256:
-            return False
+        if _file_entry_has_known_integrity(file_entry):
+            if size_bytes != file_entry.size_bytes or sha256 != file_entry.sha256:
+                return False
         observed_files.append(PackagedAssetFile(path=file_entry.path, sha256=sha256, size_bytes=size_bytes))
+    if not _has_known_integrity(sha256=asset.sha256, size_bytes=asset.size_bytes):
+        return True
     aggregate_sha256, total_size = _aggregate_file_records(tuple(observed_files))
     return aggregate_sha256 == asset.sha256 and total_size == asset.size_bytes
 
@@ -473,18 +489,19 @@ def _write_verified_file(
     expected_size_bytes: int,
 ) -> None:
     source_resolved = source_path.resolve()
-    observed_size = source_resolved.stat().st_size
-    if observed_size != expected_size_bytes:
-        raise RuntimeError(
-            f"Downloaded file size mismatch for {source_resolved}: "
-            f"expected {expected_size_bytes}, got {observed_size}"
-        )
-    observed_sha256 = _sha256_for_file(source_resolved)
-    if observed_sha256 != expected_sha256:
-        raise RuntimeError(
-            f"Downloaded file hash mismatch for {source_resolved}: "
-            f"expected {expected_sha256}, got {observed_sha256}"
-        )
+    if _has_known_integrity(sha256=expected_sha256, size_bytes=expected_size_bytes):
+        observed_size = source_resolved.stat().st_size
+        if observed_size != expected_size_bytes:
+            raise RuntimeError(
+                f"Downloaded file size mismatch for {source_resolved}: "
+                f"expected {expected_size_bytes}, got {observed_size}"
+            )
+        observed_sha256 = _sha256_for_file(source_resolved)
+        if observed_sha256 != expected_sha256:
+            raise RuntimeError(
+                f"Downloaded file hash mismatch for {source_resolved}: "
+                f"expected {expected_sha256}, got {observed_sha256}"
+            )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_destination = destination.with_name(f".{destination.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}")
