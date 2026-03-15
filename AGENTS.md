@@ -13,3 +13,7 @@ Windows standalone builds should resolve PyInstaller package roots from installe
 Windows standalone builds can emit undecodable bytes on stdout/stderr during long PyInstaller runs, especially on Windows console code pages. `run_command()` should pass `errors="replace"` to `subprocess.run(..., text=True)` and treat `CompletedProcess.stdout`/`stderr` as optional values before calling string methods, or the build can fail in logging with `UnicodeDecodeError` and follow-on `AttributeError` instead of surfacing the real subprocess result.
 
 Windows standalone packaging should bootstrap Inno Setup 6 automatically when `ISCC.exe` is missing. Reuse the build downloads directory to cache the official installer, install it silently for the current user into a predictable location such as `%LOCALAPPDATA%\Programs\Inno Setup 6`, and only fail if the bootstrap install does not produce `ISCC.exe`.
+
+Frozen Windows builds should use a windowed PyInstaller launcher (`console=False`) for the main desktop executable, or Start menu / double-click launches will behave like a console app instead of a GUI app. Inno shortcuts should also set `WorkingDir={app}` so launched processes resolve bundled assets relative to the install root.
+
+NeMo packaged runtimes can fail inside installed one-file builds if `lightning_fabric/version.info` is not bundled. Force PyInstaller to collect `lightning_fabric` package data in addition to `lightning`, so Parakeet/Lightning imports can resolve bundled metadata from `_MEIPASS`.

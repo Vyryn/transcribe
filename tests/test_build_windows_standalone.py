@@ -154,3 +154,19 @@ def test_require_inno_setup_bootstraps_when_missing(monkeypatch: pytest.MonkeyPa
     resolved = module.require_inno_setup(explicit_path=None, downloads_dir=downloads_dir)
 
     assert resolved == installed_iscc.resolve()
+
+
+def test_write_pyinstaller_spec_builds_windowed_launcher(tmp_path: Path) -> None:
+    module = _load_build_module()
+    spec_path = tmp_path / "transcribe.spec"
+
+    module.write_pyinstaller_spec(
+        destination=spec_path,
+        package_roots=("transcribe",),
+        distribution_names=("transcribe",),
+        icon_path=tmp_path / "transcribe.ico",
+    )
+
+    spec_text = spec_path.read_text(encoding="utf-8")
+
+    assert "console=False" in spec_text
