@@ -263,18 +263,19 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
         soundcard = load_soundcard()
         if soundcard is None:
             return []
-        return [
-            {
-                "index": device.index,
-                "name": device.name,
-                "max_input_channels": device.max_input_channels,
-                "default_samplerate": device.default_samplerate,
-                "hostapi_name": device.hostapi_name,
-                "device_id": device.soundcard_id,
-                "is_loopback": device.is_loopback,
-            }
-            for device in self._device_catalog(soundcard)
-        ]
+        with _initialize_com_thread():
+            return [
+                {
+                    "index": device.index,
+                    "name": device.name,
+                    "max_input_channels": device.max_input_channels,
+                    "default_samplerate": device.default_samplerate,
+                    "hostapi_name": device.hostapi_name,
+                    "device_id": device.soundcard_id,
+                    "is_loopback": device.is_loopback,
+                }
+                for device in self._device_catalog(soundcard)
+            ]
 
     def open(self, config: CaptureConfig) -> None:
         """Open Windows WASAPI capture streams for configured sources."""
@@ -312,22 +313,23 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
             raise RuntimeError(f"soundcard is required for real Windows capture and could not be imported{suffix}")
 
         resolved_devices: dict[str, list[_WindowsCaptureDevice]] = {}
-        if "mic" in self._active_stream_names:
-            resolved_devices["mic"] = self.resolve_devices(
-                soundcard,
-                configured=config.mic_device,
-                require_monitor=False,
-                include_all=config.capture_all_mic_devices,
-                allow_missing=config.allow_missing_sources,
-            )
-        if "speakers" in self._active_stream_names:
-            resolved_devices["speakers"] = self.resolve_devices(
-                soundcard,
-                configured=config.speaker_device,
-                require_monitor=True,
-                include_all=config.capture_all_speaker_devices,
-                allow_missing=config.allow_missing_sources,
-            )
+        with _initialize_com_thread():
+            if "mic" in self._active_stream_names:
+                resolved_devices["mic"] = self.resolve_devices(
+                    soundcard,
+                    configured=config.mic_device,
+                    require_monitor=False,
+                    include_all=config.capture_all_mic_devices,
+                    allow_missing=config.allow_missing_sources,
+                )
+            if "speakers" in self._active_stream_names:
+                resolved_devices["speakers"] = self.resolve_devices(
+                    soundcard,
+                    configured=config.speaker_device,
+                    require_monitor=True,
+                    include_all=config.capture_all_speaker_devices,
+                    allow_missing=config.allow_missing_sources,
+                )
 
         self._active_stream_names = tuple(name for name in self._active_stream_names if resolved_devices.get(name))
         if not self._active_stream_names:

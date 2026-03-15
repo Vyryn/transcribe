@@ -21,3 +21,7 @@ NeMo packaged runtimes can fail inside installed one-file builds if `lightning_f
 Packaged Windows notes generation can fail right after stopping a session because the private bundled `llama.cpp` server may answer HTTP before its GGUF model finishes loading, returning `{"error":{"message":"Loading model","type":"unavailable_error","code":503}}`. Treat that response as a transient startup state and retry chat-completion requests until the model is ready or a bounded timeout is reached.
 
 Windows standalone capture startup can regress if COM initialization wraps the top-level `soundcard` import or device enumeration path. Keep explicit COM initialization scoped to the SoundCard recorder worker thread that touches WASAPI streams, and leave `load_soundcard()` plus backend `open()` discovery/import behavior unchanged so packaged builds can still import `soundcard` successfully.
+
+Bundled Windows notes generation uses the CPU-only llama.cpp runtime archive, so the packaged `llama-server` launcher must force `--n-gpu-layers 0`. Requesting GPU offload in the packaged notes runtime can leave the server stuck returning `loading model` 503 responses instead of ever serving completions.
+
+The Windows standalone builder should not assume the latest `ggml-org/llama.cpp` release still publishes a `win-cpu-x64` archive. When the latest release only exposes Windows x64 CUDA-branded zip assets, accept those as the runtime bundle and rely on the packaged notes launcher to force CPU execution at runtime.

@@ -76,6 +76,7 @@ DIST_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*")
 LLAMA_RUNTIME_ARCHIVE_PATTERNS = (
     re.compile(r"llama-.*-bin-win-cpu-x64\.zip$", re.IGNORECASE),
     re.compile(r".*win.*cpu.*x64.*\.zip$", re.IGNORECASE),
+    re.compile(r".*(?:llama|cudart).*win.*x64.*\.zip$", re.IGNORECASE),
 )
 PYINSTALLER_EXTRA_MODULES = (
     "ctranslate2",

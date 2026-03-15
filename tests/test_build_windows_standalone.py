@@ -170,3 +170,34 @@ def test_write_pyinstaller_spec_builds_windowed_launcher(tmp_path: Path) -> None
     spec_text = spec_path.read_text(encoding="utf-8")
 
     assert "console=False" in spec_text
+
+
+def test_select_github_asset_falls_back_to_windows_x64_runtime_archive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_build_module()
+
+    monkeypatch.setattr(
+        module,
+        "fetch_json",
+        lambda url: {
+            "assets": [
+                {
+                    "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+                    "browser_download_url": "https://example.invalid/cudart-llama-bin-win-cuda-12.4-x64.zip",
+                },
+                {
+                    "name": "llama-b8361-bin-macos-arm64.tar.gz",
+                    "browser_download_url": "https://example.invalid/llama-b8361-bin-macos-arm64.tar.gz",
+                },
+            ]
+        },
+    )
+
+    asset = module.select_github_asset(
+        repo=module.DEFAULT_LLAMA_CPP_REPO,
+        release=module.DEFAULT_LLAMA_CPP_RELEASE,
+        patterns=module.LLAMA_RUNTIME_ARCHIVE_PATTERNS,
+    )
+
+    assert asset.name == "cudart-llama-bin-win-cuda-12.4-x64.zip"

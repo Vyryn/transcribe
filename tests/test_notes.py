@@ -276,6 +276,90 @@ def test_llama_cpp_runtime_retries_when_model_is_still_loading(
     assert responses == []
 
 
+def test_temporary_llama_cpp_runtime_forces_cpu_layers_for_packaged_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    observed: dict[str, object] = {}
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.stderr = None
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            _ = timeout
+            return 0
+
+    def fake_popen(command, *, env, stdout, stderr, text):
+        observed["command"] = list(command)
+        observed["env"] = dict(env)
+        observed["stdout"] = stdout
+        observed["stderr"] = stderr
+        observed["text"] = text
+        return _FakeProcess()
+
+    monkeypatch.setattr(notes_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(notes_module, "_loopback_host_for_free_port", lambda: "127.0.0.1:8080")
+    monkeypatch.setattr(notes_module, "_wait_for_llama_cpp_runtime_ready", lambda *, process, host: None)
+
+    with notes_module._temporary_llama_cpp_runtime(
+        executable=Path("llama-server.exe"),
+        model_path=Path("model.gguf"),
+        cpu_only=False,
+    ):
+        pass
+
+    command = observed["command"]
+    assert isinstance(command, list)
+    assert "--n-gpu-layers" in command
+    assert command[command.index("--n-gpu-layers") + 1] == "0"
+
+
+def test_wait_for_llama_cpp_runtime_ready_retries_while_model_is_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    responses = [
+        notes_module.NotesRuntimeError(
+            '{"error":{"message":"Loading model","type":"unavailable_error","code":503}}'
+        ),
+        {},
+    ]
+    sleeps: list[float] = []
+
+    class _FakeProcess:
+        stderr = None
+
+        def poll(self) -> None:
+            return None
+
+    def fake_request(*, host: str, path: str, payload: dict[str, object] | None, timeout_sec: float, method: str = "POST") -> dict[str, object]:
+        _ = (host, path, payload, timeout_sec, method)
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(notes_module, "_llama_server_request", fake_request)
+    monkeypatch.setattr(notes_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    notes_module._wait_for_llama_cpp_runtime_ready(
+        process=_FakeProcess(),
+        host="127.0.0.1:1234",
+    )
+
+    assert sleeps == [0.25]
+    assert responses == []
+
+
 def test_run_post_transcription_notes_rejects_empty_transcript(tmp_path: Path) -> None:
     transcript_path = tmp_path / "rough_transcript.txt"
     transcript_path.write_text(" \n", encoding="utf-8")

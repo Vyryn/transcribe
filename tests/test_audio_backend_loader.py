@@ -161,7 +161,7 @@ def test_windows_backend_list_devices_does_not_wrap_soundcard_import_with_com_in
     backend = WindowsAudioCaptureBackend(use_fixture=True)
     backend.list_devices()
 
-    assert observed == []
+    assert observed == ["enter", "exit"]
 
 
 
@@ -397,8 +397,9 @@ def test_windows_backend_open_smoke_imports_soundcard_before_worker_thread_com_i
     )
 
     assert "soundcard-import" in observed
+    assert "com-enter" in observed
     assert "stream-start" in observed
-    assert "com-enter" not in observed
+    assert observed.index("soundcard-import") < observed.index("com-enter")
 
 
 def test_soundcard_recorder_stream_initializes_com_on_worker_thread(

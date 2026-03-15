@@ -622,7 +622,6 @@ def _temporary_llama_cpp_runtime(
     host = _loopback_host_for_free_port()
     host_name, port = _split_host_port(host)
     env = os.environ.copy()
-    env["LLAMA_ARG_N_GPU_LAYERS"] = "0" if cpu_only else "999"
     if cpu_only:
         env.update(
             {
@@ -632,16 +631,19 @@ def _temporary_llama_cpp_runtime(
                 "GPU_DEVICE_ORDINAL": "-1",
             }
         )
+    command = [
+        str(executable),
+        "-m",
+        str(model_path),
+        "--host",
+        host_name or DEFAULT_LLAMA_SERVER_HOST,
+        "--port",
+        str(port),
+        "--n-gpu-layers",
+        "0",
+    ]
     process = subprocess.Popen(
-        [
-            str(executable),
-            "-m",
-            str(model_path),
-            "--host",
-            host_name or DEFAULT_LLAMA_SERVER_HOST,
-            "--port",
-            str(port),
-        ],
+        command,
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -773,7 +775,8 @@ def _wait_for_llama_cpp_runtime_ready(*, process: subprocess.Popen[str], host: s
             )
             return
         except NotesRuntimeError as exc:
-            if not _is_server_unavailable_error(str(exc)):
+            detail = str(exc)
+            if not _is_server_unavailable_error(detail) and not _is_model_loading_error(detail):
                 raise
         time.sleep(0.25)
 
