@@ -61,3 +61,96 @@ def test_safe_filename_component_normalizes_build_metadata() -> None:
     module = _load_build_module()
 
     assert module.safe_filename_component("1.2.3+build.5") == "1.2.3-build.5"
+
+
+def test_distribution_top_level_packages_uses_distribution_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_build_module()
+
+    class FakeDistribution:
+        files = (
+            Path("faster_whisper/__init__.py"),
+            Path("faster_whisper/transcribe.py"),
+            Path("faster_whisper-1.2.1.dist-info/METADATA"),
+        )
+
+        def read_text(self, filename: str) -> str | None:
+            assert filename == "top_level.txt"
+            return None
+
+    monkeypatch.setattr(module.importlib.metadata, "distribution", lambda name: FakeDistribution())
+    monkeypatch.setattr(
+        module,
+        "find_module_spec",
+        lambda name: object() if name == "faster_whisper" else None,
+    )
+
+    assert module.distribution_top_level_packages("faster-whisper") == ("faster_whisper",)
+
+
+def test_run_command_handles_missing_text_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_build_module()
+
+    def fake_run(*args: object, **kwargs: object) -> object:
+        return module.subprocess.CompletedProcess(args=["cmd"], returncode=0, stdout=None, stderr=None)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    completed = module.run_command(["cmd"])
+
+    assert completed.returncode == 0
+
+
+def test_run_command_uses_available_stream_text_for_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_build_module()
+
+    def fake_run(*args: object, **kwargs: object) -> object:
+        return module.subprocess.CompletedProcess(
+            args=["cmd"],
+            returncode=1,
+            stdout=None,
+            stderr="build failed",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="build failed"):
+        module.run_command(["cmd"])
+
+
+def test_require_inno_setup_returns_existing_compiler(tmp_path: Path) -> None:
+    module = _load_build_module()
+    iscc_path = tmp_path / "ISCC.exe"
+    iscc_path.write_text("", encoding="utf-8")
+
+    resolved = module.require_inno_setup(explicit_path=iscc_path, downloads_dir=tmp_path / "downloads")
+
+    assert resolved == iscc_path.resolve()
+
+
+def test_require_inno_setup_bootstraps_when_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    module = _load_build_module()
+    downloads_dir = tmp_path / "downloads"
+    install_dir = tmp_path / "Inno Setup 6"
+    installed_iscc = install_dir / "ISCC.exe"
+
+    monkeypatch.setattr(module, "find_inno_setup_compiler", lambda explicit_path: None)
+    monkeypatch.setattr(module, "inno_setup_install_dir", lambda: install_dir)
+
+    def fake_download_file(*, url: str, destination: Path) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("installer", encoding="utf-8")
+        return destination
+
+    def fake_run_command(command: list[object]) -> object:
+        installed_iscc.parent.mkdir(parents=True, exist_ok=True)
+        installed_iscc.write_text("", encoding="utf-8")
+        return module.subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "download_file", fake_download_file)
+    monkeypatch.setattr(module, "run_command", fake_run_command)
+
+    resolved = module.require_inno_setup(explicit_path=None, downloads_dir=downloads_dir)
+
+    assert resolved == installed_iscc.resolve()

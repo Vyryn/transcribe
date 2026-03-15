@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
 import importlib.metadata
 import importlib.util
 import json
@@ -67,6 +68,7 @@ DEFAULT_CANARY_REQUIRED_FILES = (
 )
 DEFAULT_GITHUB_API_ACCEPT = "application/vnd.github+json"
 DEFAULT_GITHUB_USER_AGENT = "transcribe-windows-builder"
+DEFAULT_INNO_SETUP_DOWNLOAD_URL = "https://jrsoftware.org/download.php/is.exe"
 UNKNOWN_PACKAGED_ASSET_SHA256 = "0" * 64
 UNKNOWN_PACKAGED_ASSET_SIZE_BYTES = 0
 SEMVER_PATTERN = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
@@ -75,26 +77,6 @@ LLAMA_RUNTIME_ARCHIVE_PATTERNS = (
     re.compile(r"llama-.*-bin-win-cpu-x64\.zip$", re.IGNORECASE),
     re.compile(r".*win.*cpu.*x64.*\.zip$", re.IGNORECASE),
 )
-TOP_LEVEL_MODULE_FALLBACKS = {
-    "datasets": ("datasets",),
-    "editdistance": ("editdistance",),
-    "faster-whisper": ("faster_whisper",),
-    "huggingface-hub": ("huggingface_hub",),
-    "hydra-core": ("hydra",),
-    "jiwer": ("jiwer",),
-    "lightning": ("lightning",),
-    "lhotse": ("lhotse",),
-    "nemo-toolkit": ("nemo",),
-    "omegaconf": ("omegaconf",),
-    "pyyaml": ("yaml", "_yaml"),
-    "qwen-asr": ("qwen_asr",),
-    "sentencepiece": ("sentencepiece",),
-    "soundcard": ("soundcard",),
-    "sounddevice": ("sounddevice",),
-    "torch": ("torch",),
-    "torchcodec": ("torchcodec",),
-    "transformers": ("transformers",),
-}
 PYINSTALLER_EXTRA_MODULES = (
     "ctranslate2",
     "datasets",
@@ -363,14 +345,17 @@ def run_command(
         check=False,
         capture_output=True,
         text=True,
+        errors="replace",
     )
-    if completed.stdout.strip():
-        print(completed.stdout.rstrip())
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    if stdout.strip():
+        print(stdout.rstrip())
     if completed.returncode == 0:
-        if completed.stderr.strip():
-            print(completed.stderr.rstrip())
+        if stderr.strip():
+            print(stderr.rstrip())
         return completed
-    detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+    detail = stderr.strip() or stdout.strip() or f"exit code {completed.returncode}"
     raise RuntimeError(f"Command failed ({completed.returncode}): {' '.join(argv)}\n{detail}")
 
 
@@ -546,6 +531,72 @@ def normalize_distribution_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def iter_distribution_top_level_candidates(
+    distribution: importlib.metadata.Distribution,
+) -> tuple[str, ...]:
+    """Infer top-level import names from installed distribution metadata.
+
+    Parameters
+    ----------
+    distribution : importlib.metadata.Distribution
+        Installed distribution metadata handle.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Unique candidate import roots discovered from the distribution metadata.
+    """
+    candidates: list[str] = []
+    top_level_text = distribution.read_text("top_level.txt")
+    if top_level_text:
+        for line in top_level_text.splitlines():
+            module_name = line.strip()
+            if module_name:
+                candidates.append(module_name)
+
+    files = distribution.files or ()
+    package_roots: set[str] = set()
+    package_markers: set[str] = set()
+    module_roots: set[str] = set()
+    for package_file in files:
+        parts = package_file.parts
+        if not parts:
+            continue
+        top_level_name = parts[0]
+        if top_level_name.endswith(".dist-info") or top_level_name.endswith(".data"):
+            continue
+        if len(parts) == 1 and top_level_name.endswith(".py"):
+            module_roots.add(Path(top_level_name).stem)
+            continue
+        if len(parts) > 1 and parts[-1] == "__init__.py":
+            package_markers.add(top_level_name)
+        package_roots.add(top_level_name)
+
+    candidates.extend(sorted(package_markers))
+    candidates.extend(sorted(module_roots))
+    candidates.extend(sorted(package_roots))
+    return tuple(dict.fromkeys(candidates))
+
+
+def find_module_spec(module_name: str) -> importlib.machinery.ModuleSpec | None:
+    """Return a module spec when one import path is importable.
+
+    Parameters
+    ----------
+    module_name : str
+        Candidate module path to probe.
+
+    Returns
+    -------
+    importlib.machinery.ModuleSpec | None
+        Module spec when import resolution succeeds, otherwise ``None``.
+    """
+    try:
+        return importlib.util.find_spec(module_name)
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return None
+
+
 def distribution_top_level_packages(distribution_name: str) -> tuple[str, ...]:
     """Return import roots associated with one installed distribution.
 
@@ -559,7 +610,6 @@ def distribution_top_level_packages(distribution_name: str) -> tuple[str, ...]:
     tuple[str, ...]
         Importable top-level module names.
     """
-    normalized_name = normalize_distribution_name(distribution_name)
     candidate_modules: list[str] = []
     try:
         distribution = importlib.metadata.distribution(distribution_name)
@@ -567,25 +617,13 @@ def distribution_top_level_packages(distribution_name: str) -> tuple[str, ...]:
         distribution = None
 
     if distribution is not None:
-        top_level_text = distribution.read_text("top_level.txt")
-        if top_level_text:
-            for line in top_level_text.splitlines():
-                module_name = line.strip()
-                if module_name:
-                    candidate_modules.append(module_name)
-    candidate_modules.extend(TOP_LEVEL_MODULE_FALLBACKS.get(normalized_name, ()))
-    candidate_modules.extend(
-        (
-            distribution_name.replace("-", "_"),
-            distribution_name.replace("-", "."),
-        )
-    )
+        candidate_modules.extend(iter_distribution_top_level_candidates(distribution))
     filtered: list[str] = []
     for module_name in candidate_modules:
         normalized_module = module_name.strip()
         if not normalized_module or normalized_module in filtered:
             continue
-        if importlib.util.find_spec(normalized_module) is None:
+        if find_module_spec(normalized_module) is None:
             continue
         filtered.append(normalized_module)
     return tuple(filtered)
@@ -611,7 +649,7 @@ def build_pyinstaller_module_roots(distribution_names: Iterable[str]) -> tuple[s
         sorted(
             module_root
             for module_root in module_roots
-            if importlib.util.find_spec(module_root) is not None
+            if find_module_spec(module_root) is not None
         )
     )
 
@@ -770,6 +808,20 @@ def download_file(*, url: str, destination: Path) -> Path:
     with urllib.request.urlopen(request) as response, destination.open("wb") as handle:
         shutil.copyfileobj(response, handle)
     return destination.resolve()
+
+
+def inno_setup_install_dir() -> Path:
+    """Return the preferred per-user Inno Setup installation directory.
+
+    Returns
+    -------
+    Path
+        Preferred installation directory for bootstrap installs.
+    """
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        return Path(local_app_data) / "Programs" / "Inno Setup 6"
+    return REPO_ROOT / "build" / "tools" / "Inno Setup 6"
 
 
 def copy_file(source: Path, destination: Path) -> None:
@@ -1174,8 +1226,8 @@ def known_inno_setup_paths() -> tuple[Path, ...]:
     return tuple(deduplicated)
 
 
-def require_inno_setup(explicit_path: Path | None) -> Path:
-    """Resolve the Inno Setup compiler or raise a user-facing error.
+def find_inno_setup_compiler(explicit_path: Path | None) -> Path | None:
+    """Return the Inno Setup compiler path when one is available.
 
     Parameters
     ----------
@@ -1184,8 +1236,8 @@ def require_inno_setup(explicit_path: Path | None) -> Path:
 
     Returns
     -------
-    Path
-        Resolved compiler path.
+    Path | None
+        Resolved compiler path when available, otherwise ``None``.
     """
     if explicit_path is not None:
         candidate = explicit_path.expanduser().resolve()
@@ -1195,9 +1247,65 @@ def require_inno_setup(explicit_path: Path | None) -> Path:
     for candidate in known_inno_setup_paths():
         if candidate.exists():
             return candidate
-    raise RuntimeError(
-        "Unable to find a supported Inno Setup compiler. Install Inno Setup 6 or pass --inno-setup-exe."
+    return None
+
+
+def install_inno_setup(*, downloads_dir: Path) -> Path:
+    """Download and install Inno Setup 6 for the current user.
+
+    Parameters
+    ----------
+    downloads_dir : Path
+        Directory used to cache the installer executable.
+
+    Returns
+    -------
+    Path
+        Resolved path to the installed ``ISCC.exe`` compiler.
+    """
+    installer_path = download_file(
+        url=DEFAULT_INNO_SETUP_DOWNLOAD_URL,
+        destination=downloads_dir / "innosetup-6-installer.exe",
     )
+    install_dir = inno_setup_install_dir()
+    run_command(
+        [
+            installer_path,
+            "/SP-",
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CURRENTUSER",
+            f"/DIR={install_dir}",
+        ]
+    )
+    iscc_path = install_dir / "ISCC.exe"
+    if not iscc_path.exists():
+        raise RuntimeError(f"Inno Setup bootstrap install did not create the expected compiler: {iscc_path}")
+    return iscc_path.resolve()
+
+
+def require_inno_setup(*, explicit_path: Path | None, downloads_dir: Path) -> Path:
+    """Resolve the Inno Setup compiler, installing it when needed.
+
+    Parameters
+    ----------
+    explicit_path : Path | None
+        Optional explicit path to ``ISCC.exe``.
+    downloads_dir : Path
+        Directory used to cache the Inno Setup bootstrap installer.
+
+    Returns
+    -------
+    Path
+        Resolved compiler path.
+    """
+    compiler_path = find_inno_setup_compiler(explicit_path)
+    if compiler_path is not None:
+        return compiler_path
+    if explicit_path is not None:
+        raise RuntimeError(f"Unable to find the requested Inno Setup compiler: {explicit_path}")
+    return install_inno_setup(downloads_dir=downloads_dir)
 
 
 def build_inno_installer(
@@ -1314,7 +1422,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Windows stage: {layout.stage_dir}")
         return 0
 
-    iscc_path = require_inno_setup(args.inno_setup_exe)
+    iscc_path = require_inno_setup(explicit_path=args.inno_setup_exe, downloads_dir=layout.downloads_dir)
     installer_path = build_inno_installer(iscc_path=iscc_path, layout=layout, version=version)
     release_path = publish_release_installer(installer_path=installer_path, release_dir=args.release_dir)
     print(f"Installer: {release_path}")
