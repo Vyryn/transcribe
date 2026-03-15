@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import transcribe.bench.harness as bench_harness
+import transcribe.transcription_runtime as transcription_runtime
 from transcribe.bench.harness import (
     DEFAULT_HF_SAMPLE_LIMIT,
     DEFAULT_TRANSCRIPTION_MODEL,
@@ -527,6 +528,39 @@ def test_get_nemo_asr_model_surfaces_nemo_archive_restore_error_without_speechlm
 
     with pytest.raises(RuntimeError, match="restore exploded"):
         _get_nemo_asr_model("nvidia/parakeet-tdt-0.6b-v3", local_files_only=True)
+
+
+def test_bench_runtime_sync_restores_runtime_helpers_after_delegate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot_dir = tmp_path / "snapshot"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "parakeet-tdt-0.6b-v3.nemo").write_bytes(b"placeholder")
+
+    sentinel_model = object()
+    original_snapshot_helper = transcription_runtime._get_hf_repo_snapshot
+
+    fake_nemo = types.ModuleType("nemo")
+    fake_collections = types.ModuleType("nemo.collections")
+    fake_asr = types.ModuleType("nemo.collections.asr")
+    fake_asr.models = types.SimpleNamespace(ASRModel=object())
+    fake_collections.asr = fake_asr
+    fake_nemo.collections = fake_collections
+
+    monkeypatch.setitem(sys.modules, "nemo", fake_nemo)
+    monkeypatch.setitem(sys.modules, "nemo.collections", fake_collections)
+    monkeypatch.setitem(sys.modules, "nemo.collections.asr", fake_asr)
+    monkeypatch.setattr(bench_harness, "_NEMO_ASR_MODEL_CACHE", {})
+    monkeypatch.setattr(bench_harness, "_get_hf_repo_snapshot", lambda *args, **kwargs: str(snapshot_dir))
+    monkeypatch.setattr(bench_harness, "_load_nemo_model_from_snapshot", lambda *args, **kwargs: sentinel_model)
+    monkeypatch.setattr(bench_harness, "_apply_parakeet_runtime_compatibility", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bench_harness, "_prepare_nemo_model_for_inference", lambda *args, **kwargs: None)
+
+    model = _get_nemo_asr_model("nvidia/parakeet-tdt-0.6b-v3", local_files_only=True)
+
+    assert model is sentinel_model
+    assert transcription_runtime._get_hf_repo_snapshot is original_snapshot_helper
 
 
 def test_load_nemo_model_from_snapshot_retries_on_cpu_after_cuda_oom(tmp_path: Path) -> None:

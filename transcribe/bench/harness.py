@@ -9,6 +9,7 @@ import os
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -1438,62 +1439,79 @@ _QWEN_AUDIO_BYTES_PATH_CACHE = _runtime_asr._QWEN_AUDIO_BYTES_PATH_CACHE
 _NEMO_AUDIO_BYTES_PATH_CACHE = _runtime_asr._NEMO_AUDIO_BYTES_PATH_CACHE
 
 
-def _sync_runtime_transcription_state() -> None:
-    _runtime_asr._FASTER_WHISPER_MODEL_CACHE = _FASTER_WHISPER_MODEL_CACHE
-    _runtime_asr._NEMO_ASR_MODEL_CACHE = _NEMO_ASR_MODEL_CACHE
-    _runtime_asr._QWEN_ASR_MODEL_CACHE = _QWEN_ASR_MODEL_CACHE
-    _runtime_asr._HF_REPO_SNAPSHOT_CACHE = _HF_REPO_SNAPSHOT_CACHE
-    _runtime_asr._QWEN_AUDIO_BYTES_PATH_CACHE = _QWEN_AUDIO_BYTES_PATH_CACHE
-    _runtime_asr._NEMO_AUDIO_BYTES_PATH_CACHE = _NEMO_AUDIO_BYTES_PATH_CACHE
-    _runtime_asr._enforce_hf_offline_mode = _enforce_hf_offline_mode
-    _runtime_asr._resolve_transcription_backend = _resolve_transcription_backend
-    _runtime_asr._extract_audio_input = _extract_audio_input
-    _runtime_asr._extract_audio_path = _extract_audio_path
-    _runtime_asr._extract_qwen_audio_input = _extract_qwen_audio_input
-    _runtime_asr._is_model_cache_miss_error = _is_model_cache_miss_error
-    _runtime_asr._is_hf_offline_network_error = _is_hf_offline_network_error
-    _runtime_asr._offline_model_error = _offline_model_error
-    _runtime_asr._get_hf_repo_snapshot = _get_hf_repo_snapshot
-    _runtime_asr._load_nemo_model_from_snapshot = _load_nemo_model_from_snapshot
-    _runtime_asr._is_nemo_speechlm_snapshot = _is_nemo_speechlm_snapshot
-    _runtime_asr._load_nemo_speechlm_model_from_snapshot = _load_nemo_speechlm_model_from_snapshot
-    _runtime_asr._apply_parakeet_runtime_compatibility = _apply_parakeet_runtime_compatibility
-    _runtime_asr._prepare_nemo_model_for_inference = _prepare_nemo_model_for_inference
-    _runtime_asr._collect_unique_cached_models = _collect_unique_cached_models
-    _runtime_asr._selected_transcription_model_caches = _selected_transcription_model_caches
-    _runtime_asr._offload_model_to_cpu = _offload_model_to_cpu
-    _runtime_asr._clear_accelerator_caches = _clear_accelerator_caches
-    _runtime_asr._to_float = _to_float
+def _runtime_transcription_overrides() -> dict[str, object]:
+    """Return benchmark-specific runtime helpers delegated into transcription runtime."""
+    return {
+        "_FASTER_WHISPER_MODEL_CACHE": _FASTER_WHISPER_MODEL_CACHE,
+        "_NEMO_ASR_MODEL_CACHE": _NEMO_ASR_MODEL_CACHE,
+        "_QWEN_ASR_MODEL_CACHE": _QWEN_ASR_MODEL_CACHE,
+        "_HF_REPO_SNAPSHOT_CACHE": _HF_REPO_SNAPSHOT_CACHE,
+        "_QWEN_AUDIO_BYTES_PATH_CACHE": _QWEN_AUDIO_BYTES_PATH_CACHE,
+        "_NEMO_AUDIO_BYTES_PATH_CACHE": _NEMO_AUDIO_BYTES_PATH_CACHE,
+        "_enforce_hf_offline_mode": _enforce_hf_offline_mode,
+        "_resolve_transcription_backend": _resolve_transcription_backend,
+        "_extract_audio_input": _extract_audio_input,
+        "_extract_audio_path": _extract_audio_path,
+        "_extract_qwen_audio_input": _extract_qwen_audio_input,
+        "_is_model_cache_miss_error": _is_model_cache_miss_error,
+        "_is_hf_offline_network_error": _is_hf_offline_network_error,
+        "_offline_model_error": _offline_model_error,
+        "_get_hf_repo_snapshot": _get_hf_repo_snapshot,
+        "_load_nemo_model_from_snapshot": _load_nemo_model_from_snapshot,
+        "_is_nemo_speechlm_snapshot": _is_nemo_speechlm_snapshot,
+        "_load_nemo_speechlm_model_from_snapshot": _load_nemo_speechlm_model_from_snapshot,
+        "_apply_parakeet_runtime_compatibility": _apply_parakeet_runtime_compatibility,
+        "_prepare_nemo_model_for_inference": _prepare_nemo_model_for_inference,
+        "_collect_unique_cached_models": _collect_unique_cached_models,
+        "_selected_transcription_model_caches": _selected_transcription_model_caches,
+        "_offload_model_to_cpu": _offload_model_to_cpu,
+        "_clear_accelerator_caches": _clear_accelerator_caches,
+        "_to_float": _to_float,
+    }
+
+
+@contextmanager
+def _synced_runtime_transcription_state() -> Iterable[None]:
+    """Temporarily wire benchmark overrides into the shared transcription runtime."""
+    overrides = _runtime_transcription_overrides()
+    originals = {name: getattr(_runtime_asr, name) for name in overrides}
+    try:
+        for name, value in overrides.items():
+            setattr(_runtime_asr, name, value)
+        yield
+    finally:
+        for name, value in originals.items():
+            setattr(_runtime_asr, name, value)
 
 
 def _get_faster_whisper_model(model_id: str, *, local_files_only: bool = True) -> Any:
-    _sync_runtime_transcription_state()
-    return _runtime_asr._get_faster_whisper_model(model_id, local_files_only=local_files_only)
+    with _synced_runtime_transcription_state():
+        return _runtime_asr._get_faster_whisper_model(model_id, local_files_only=local_files_only)
 
 
 def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
-    _sync_runtime_transcription_state()
-    return _runtime_asr._get_nemo_asr_model(model_id, local_files_only=local_files_only)
+    with _synced_runtime_transcription_state():
+        return _runtime_asr._get_nemo_asr_model(model_id, local_files_only=local_files_only)
 
 
 def _get_qwen_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
-    _sync_runtime_transcription_state()
-    return _runtime_asr._get_qwen_asr_model(model_id, local_files_only=local_files_only)
+    with _synced_runtime_transcription_state():
+        return _runtime_asr._get_qwen_asr_model(model_id, local_files_only=local_files_only)
 
 
 def transcribe_row_with_faster_whisper(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
-    _sync_runtime_transcription_state()
-    return _runtime_asr.transcribe_row_with_faster_whisper(row, transcription_model)
+    with _synced_runtime_transcription_state():
+        return _runtime_asr.transcribe_row_with_faster_whisper(row, transcription_model)
 
 
 def transcribe_row_with_nemo_asr(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
-    _sync_runtime_transcription_state()
-    return _runtime_asr.transcribe_row_with_nemo_asr(row, transcription_model)
+    with _synced_runtime_transcription_state():
+        return _runtime_asr.transcribe_row_with_nemo_asr(row, transcription_model)
 
 
 def transcribe_row_with_qwen_asr(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
-    _sync_runtime_transcription_state()
-    return _runtime_asr.transcribe_row_with_qwen_asr(row, transcription_model)
+    with _synced_runtime_transcription_state():
+        return _runtime_asr.transcribe_row_with_qwen_asr(row, transcription_model)
 
 
 def _default_hf_segment_transcriber(transcription_model: str) -> HfSegmentTranscriber:
@@ -1510,10 +1528,10 @@ def preload_transcription_model(
     *,
     max_model_ram_gb: float = DEFAULT_MAX_MODEL_RAM_GB,
 ) -> None:
-    _sync_runtime_transcription_state()
-    _runtime_asr.preload_transcription_model(transcription_model, max_model_ram_gb=max_model_ram_gb)
+    with _synced_runtime_transcription_state():
+        _runtime_asr.preload_transcription_model(transcription_model, max_model_ram_gb=max_model_ram_gb)
 
 
 def release_transcription_runtime_resources(transcription_model: str | None = None) -> int:
-    _sync_runtime_transcription_state()
-    return _runtime_asr.release_transcription_runtime_resources(transcription_model)
+    with _synced_runtime_transcription_state():
+        return _runtime_asr.release_transcription_runtime_resources(transcription_model)

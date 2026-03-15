@@ -43,6 +43,16 @@ POLL_INTERVAL_MS = 75
 LOG_LEVEL_OPTIONS = ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')
 
 
+class StableCombobox(ttk.Combobox):
+    """Combobox variant that normalizes Tk state values into plain strings."""
+
+    def cget(self, key: str) -> object:
+        value = super().cget(key)
+        if key == "state":
+            return str(value)
+        return value
+
+
 @dataclass(slots=True)
 class TaskBinding:
     """UI handlers bound to the currently active background task."""
@@ -190,7 +200,7 @@ class SessionPage(BasePage):
         self.advanced_canvas.bind("<Configure>", self._resize_advanced_content)
 
         ttk.Label(self.advanced_content, text="Voice Model").grid(row=0, column=0, sticky="w")
-        self.transcription_model_combo = ttk.Combobox(
+        self.transcription_model_combo = StableCombobox(
             self.advanced_content,
             textvariable=self.transcription_model_var,
             values=self.transcription_model_choices,
@@ -198,7 +208,7 @@ class SessionPage(BasePage):
         )
         self.transcription_model_combo.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 6), pady=(0, 6))
         ttk.Label(self.advanced_content, text="Notes Model").grid(row=0, column=2, sticky="w")
-        self.notes_model_combo = ttk.Combobox(
+        self.notes_model_combo = StableCombobox(
             self.advanced_content,
             textvariable=self.notes_model_var,
             values=self.notes_model_choices,
@@ -209,14 +219,14 @@ class SessionPage(BasePage):
         ttk.Label(self.advanced_content, text="Duration (sec)").grid(row=2, column=0, sticky="w")
         ttk.Entry(self.advanced_content, textvariable=self.duration_var).grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
         ttk.Label(self.advanced_content, text="Audio Source").grid(row=2, column=1, sticky="w")
-        ttk.Combobox(
+        StableCombobox(
             self.advanced_content,
             textvariable=self.mode_var,
             values=[mode.value for mode in AudioSourceMode],
             state="readonly",
         ).grid(row=3, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
         ttk.Label(self.advanced_content, text="Notes Runtime").grid(row=2, column=2, sticky="w")
-        ttk.Combobox(
+        StableCombobox(
             self.advanced_content,
             textvariable=self.notes_runtime_var,
             values=["auto", "ollama", "llama_cpp"],
@@ -226,7 +236,7 @@ class SessionPage(BasePage):
         self.refresh_button.grid(row=3, column=3, sticky="ew", pady=(0, 6))
 
         ttk.Label(self.advanced_content, text="Mic Device").grid(row=4, column=0, sticky="w")
-        self.mic_combo = ttk.Combobox(
+        self.mic_combo = StableCombobox(
             self.advanced_content,
             textvariable=self.mic_device_var,
             values=self.device_labels,
@@ -234,7 +244,7 @@ class SessionPage(BasePage):
         )
         self.mic_combo.grid(row=5, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
         ttk.Label(self.advanced_content, text="Speaker Device").grid(row=4, column=1, sticky="w")
-        self.speaker_combo = ttk.Combobox(
+        self.speaker_combo = StableCombobox(
             self.advanced_content,
             textvariable=self.speaker_device_var,
             values=self.device_labels,
@@ -487,14 +497,14 @@ class CapturePage(BasePage):
         ttk.Label(self.advanced_frame, text="Duration (sec)").grid(row=0, column=0, sticky="w")
         ttk.Entry(self.advanced_frame, textvariable=self.duration_var).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
         ttk.Label(self.advanced_frame, text="Audio Source").grid(row=0, column=1, sticky="w")
-        ttk.Combobox(
+        StableCombobox(
             self.advanced_frame,
             textvariable=self.mode_var,
             values=[mode.value for mode in AudioSourceMode],
             state="readonly",
         ).grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
         ttk.Label(self.advanced_frame, text="Mic Device").grid(row=0, column=2, sticky="w")
-        self.mic_combo = ttk.Combobox(
+        self.mic_combo = StableCombobox(
             self.advanced_frame,
             textvariable=self.mic_device_var,
             values=self.device_labels,
@@ -502,7 +512,7 @@ class CapturePage(BasePage):
         )
         self.mic_combo.grid(row=1, column=2, sticky="ew", padx=(0, 6), pady=(0, 6))
         ttk.Label(self.advanced_frame, text="Speaker Device").grid(row=0, column=3, sticky="w")
-        self.speaker_combo = ttk.Combobox(
+        self.speaker_combo = StableCombobox(
             self.advanced_frame,
             textvariable=self.speaker_device_var,
             values=self.device_labels,
@@ -639,10 +649,10 @@ class NotesPage(BasePage):
         ttk.Entry(controls, textvariable=self.output_dir_var).grid(row=1, column=1, sticky="ew", padx=(6, 6), pady=(0, 6))
         ttk.Button(controls, text="Browse", command=lambda: self.app.choose_directory(self.output_dir_var)).grid(row=1, column=2, sticky="ew")
         ttk.Label(controls, text="Model").grid(row=2, column=0, sticky="w")
-        self.model_combo = ttk.Combobox(controls, textvariable=self.model_var, values=self.model_choices, state="readonly")
+        self.model_combo = StableCombobox(controls, textvariable=self.model_var, values=self.model_choices, state="readonly")
         self.model_combo.grid(row=2, column=1, sticky="ew", padx=(6, 6), pady=(0, 6))
         ttk.Label(controls, text="Runtime").grid(row=3, column=0, sticky="w")
-        ttk.Combobox(controls, textvariable=self.runtime_var, values=["auto", "ollama", "llama_cpp"], state="readonly").grid(row=3, column=1, sticky="ew", padx=(6, 6), pady=(0, 6))
+        StableCombobox(controls, textvariable=self.runtime_var, values=["auto", "ollama", "llama_cpp"], state="readonly").grid(row=3, column=1, sticky="ew", padx=(6, 6), pady=(0, 6))
         self.start_button = ttk.Button(controls, text="Run Notes", command=self.start)
         self.start_button.grid(row=3, column=2, sticky="ew")
         ttk.Label(controls, text="Status").grid(row=4, column=0, sticky="w")
@@ -845,7 +855,7 @@ class BenchPage(BasePage):
         run_frame.columnconfigure(1, weight=1)
         self.notebook.add(run_frame, text="Run Benchmark")
         ttk.Label(run_frame, text="Scenario").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(run_frame, textvariable=self.run_scenario_var, values=["hf_diarized_transcription", "capture_sync"], state="readonly").grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        StableCombobox(run_frame, textvariable=self.run_scenario_var, values=["hf_diarized_transcription", "capture_sync"], state="readonly").grid(row=0, column=1, sticky="ew", pady=(0, 6))
         self._bench_entry(run_frame, 1, "Runs", self.run_runs_var)
         self._bench_entry(run_frame, 2, "Duration", self.run_duration_var)
         self._bench_entry(run_frame, 3, "Output Dir", self.run_output_var)
@@ -1041,7 +1051,7 @@ class TranscribeUiApp:
         ttk.Button(self.global_advanced_frame, text="Browse", command=lambda: self.choose_file(self.config_path_var)).grid(row=0, column=2, sticky="ew")
         ttk.Label(self.global_advanced_frame, text="Log Level").grid(row=0, column=3, sticky="w", padx=(12, 0))
         self.log_level_var = tk.StringVar(value=services.DEFAULT_LOG_LEVEL)
-        self.log_level_combo = ttk.Combobox(
+        self.log_level_combo = StableCombobox(
             self.global_advanced_frame,
             textvariable=self.log_level_var,
             values=LOG_LEVEL_OPTIONS,
