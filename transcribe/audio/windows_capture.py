@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import contextlib
+import ctypes
 import importlib
 import logging
 import queue
@@ -22,6 +24,10 @@ _SOUNDCARD: Any | None = None
 _SOUNDCARD_ATTEMPTED = False
 _SOUNDCARD_IMPORT_ERROR: Exception | None = None
 _SOUNDCARD_NUMPY_PATCHED = False
+_COINIT_MULTITHREADED = 0x0
+_S_OK = 0
+_S_FALSE = 1
+_RPC_E_CHANGED_MODE = 0x80010106
 
 
 def _patch_soundcard_numpy_fromstring() -> None:
@@ -84,6 +90,35 @@ def _soundcard_runtime_warning_category() -> type[Warning]:
     return RuntimeWarning
 
 
+@contextlib.contextmanager
+def _initialize_com_thread() -> Any:
+    """Initialize COM for the current thread before touching WASAPI APIs."""
+    if not _running_on_windows():
+        yield
+        return
+
+    ole32 = getattr(ctypes, "OleDLL", None)
+    if ole32 is None:
+        yield
+        return
+
+    com_library = ole32("ole32")
+    result = int(com_library.CoInitializeEx(None, _COINIT_MULTITHREADED)) & 0xFFFFFFFF
+    should_uninitialize = result in {_S_OK, _S_FALSE}
+    if result not in {_S_OK, _S_FALSE, _RPC_E_CHANGED_MODE}:
+        raise OSError(f"CoInitializeEx failed with HRESULT 0x{result:08X}")
+    try:
+        yield
+    finally:
+        if should_uninitialize:
+            com_library.CoUninitialize()
+
+
+def _running_on_windows() -> bool:
+    """Return True when the current process is running on Windows."""
+    return importlib.import_module("sys").platform == "win32"
+
+
 @dataclass(slots=True)
 class _WindowsCaptureDevice:
     """Resolved Windows capture endpoint backed by SoundCard/WASAPI."""
@@ -138,28 +173,29 @@ class _SoundCardRecorderStream:
 
     def _run(self) -> None:
         try:
-            device = self._resolve_device()
-            warning_category = _soundcard_runtime_warning_category()
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="data discontinuity in recording",
-                    category=warning_category,
-                )
-                with device.recorder(
-                    samplerate=self.sample_rate_hz,
-                    channels=self.device_channels,
-                    blocksize=self.frame_samples,
-                    exclusive_mode=False,
-                ) as recorder:
-                    self.active = True
-                    self.stopped = False
-                    self._started_event.set()
-                    while not self._stop_event.is_set():
-                        block = recorder.record(numframes=self.frame_samples)
-                        if self._stop_event.is_set():
-                            break
-                        self.callback(block, self.frame_samples, None, None)
+            with _initialize_com_thread():
+                device = self._resolve_device()
+                warning_category = _soundcard_runtime_warning_category()
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="data discontinuity in recording",
+                        category=warning_category,
+                    )
+                    with device.recorder(
+                        samplerate=self.sample_rate_hz,
+                        channels=self.device_channels,
+                        blocksize=self.frame_samples,
+                        exclusive_mode=False,
+                    ) as recorder:
+                        self.active = True
+                        self.stopped = False
+                        self._started_event.set()
+                        while not self._stop_event.is_set():
+                            block = recorder.record(numframes=self.frame_samples)
+                            if self._stop_event.is_set():
+                                break
+                            self.callback(block, self.frame_samples, None, None)
         except Exception as exc:  # noqa: BLE001
             if not self._started_event.is_set():
                 self._open_error = exc if isinstance(exc, Exception) else Exception(str(exc))

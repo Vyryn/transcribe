@@ -30,6 +30,8 @@ DEFAULT_OLLAMA_HOST = "127.0.0.1:11434"
 DEFAULT_LLAMA_SERVER_HOST = "127.0.0.1"
 _MAX_CLEAN_TRANSCRIPT_CHUNK_WORDS = 700
 _TEMP_SERVER_START_TIMEOUT_SEC = 20.0
+_MODEL_LOADING_RETRY_TIMEOUT_SEC = 120.0
+_MODEL_LOADING_RETRY_INTERVAL_SEC = 0.5
 _PROMPT_TIMEOUT_SEC = 1_800.0
 _CLEAN_TRANSCRIPT_PROMPT = """You are cleaning a rough ASR transcript of a psychotherapy session.
 
@@ -211,11 +213,9 @@ class LlamaCppRuntimeSession:
             "max_tokens": 2048,
             "stream": False,
         }
-        response = _llama_server_request(
+        response = _llama_server_chat_completion_request(
             host=self.host,
-            path="/v1/chat/completions",
             payload=payload,
-            timeout_sec=_PROMPT_TIMEOUT_SEC,
         )
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -230,6 +230,33 @@ class LlamaCppRuntimeSession:
         if not isinstance(content, str):
             raise NotesRuntimeError("Bundled notes runtime returned non-text content.")
         return content
+
+
+def _llama_server_chat_completion_request(
+    *,
+    host: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Call llama.cpp chat completions, retrying while the model is still loading."""
+    deadline = time.monotonic() + min(_MODEL_LOADING_RETRY_TIMEOUT_SEC, _PROMPT_TIMEOUT_SEC)
+    last_loading_error: NotesRuntimeError | None = None
+    while True:
+        try:
+            return _llama_server_request(
+                host=host,
+                path="/v1/chat/completions",
+                payload=payload,
+                timeout_sec=_PROMPT_TIMEOUT_SEC,
+            )
+        except NotesRuntimeError as exc:
+            if not _is_model_loading_error(str(exc)):
+                raise
+            last_loading_error = exc
+            if time.monotonic() >= deadline:
+                raise NotesRuntimeError(
+                    "Bundled llama.cpp runtime did not finish loading the model before timeout."
+                ) from exc
+            time.sleep(_MODEL_LOADING_RETRY_INTERVAL_SEC)
 
 
 def default_notes_prompt_path() -> Path:
@@ -864,6 +891,16 @@ def _is_gpu_runtime_error(message: str) -> bool:
     """Detect GPU-runtime failures that warrant a CPU retry."""
     lowered = message.lower()
     return any(needle in lowered for needle in _GPU_ERROR_NEEDLES)
+
+
+def _is_model_loading_error(message: str) -> bool:
+    """Detect llama.cpp responses that mean the server is alive but still loading a model."""
+    lowered = message.lower()
+    return (
+        "loading model" in lowered
+        or '"type":"unavailable_error"' in lowered
+        or "'type': 'unavailable_error'" in lowered
+    )
 
 
 def _is_server_unavailable_error(message: str) -> bool:

@@ -17,3 +17,7 @@ Windows standalone packaging should bootstrap Inno Setup 6 automatically when `I
 Frozen Windows builds should use a windowed PyInstaller launcher (`console=False`) for the main desktop executable, or Start menu / double-click launches will behave like a console app instead of a GUI app. Inno shortcuts should also set `WorkingDir={app}` so launched processes resolve bundled assets relative to the install root.
 
 NeMo packaged runtimes can fail inside installed one-file builds if `lightning_fabric/version.info` is not bundled. Force PyInstaller to collect `lightning_fabric` package data in addition to `lightning`, so Parakeet/Lightning imports can resolve bundled metadata from `_MEIPASS`.
+
+Packaged Windows notes generation can fail right after stopping a session because the private bundled `llama.cpp` server may answer HTTP before its GGUF model finishes loading, returning `{"error":{"message":"Loading model","type":"unavailable_error","code":503}}`. Treat that response as a transient startup state and retry chat-completion requests until the model is ready or a bounded timeout is reached.
+
+Windows standalone capture startup can regress if COM initialization wraps the top-level `soundcard` import or device enumeration path. Keep explicit COM initialization scoped to the SoundCard recorder worker thread that touches WASAPI streams, and leave `load_soundcard()` plus backend `open()` discovery/import behavior unchanged so packaged builds can still import `soundcard` successfully.

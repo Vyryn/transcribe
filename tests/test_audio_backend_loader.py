@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import importlib
 import queue
 import time
 
@@ -137,6 +139,29 @@ def test_windows_backend_lists_soundcard_devices_in_wasapi_order(
             "is_loopback": True,
         },
     ]
+
+
+def test_windows_backend_list_devices_does_not_wrap_soundcard_import_with_com_init(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_soundcard: _FakeSoundCard,
+) -> None:
+    observed: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_initialize_com_thread():
+        observed.append("enter")
+        try:
+            yield
+        finally:
+            observed.append("exit")
+
+    monkeypatch.setattr(windows_capture_module, "_initialize_com_thread", fake_initialize_com_thread)
+    monkeypatch.setattr(windows_capture_module, "load_soundcard", lambda: fake_soundcard)
+
+    backend = WindowsAudioCaptureBackend(use_fixture=True)
+    backend.list_devices()
+
+    assert observed == []
 
 
 
@@ -294,6 +319,144 @@ def test_windows_backend_open_supports_mixed_device_sample_rates(
     assert backend.active_devices == {"mic": (0,), "speakers": (2,)}
     assert backend.device_sample_rates_hz == {"mic:0": 16_000, "speakers:2": 48_000}
     assert backend.device_channels == {"mic:0": 2, "speakers:2": 2}
+
+
+def test_windows_backend_open_smoke_imports_soundcard_before_worker_thread_com_init(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_soundcard: _FakeSoundCard,
+) -> None:
+    observed: list[str] = []
+
+    class _FakeStream:
+        def __init__(
+            self,
+            *,
+            stream_key: str,
+            device_id: str,
+            include_loopback: bool,
+            sample_rate_hz: int,
+            frame_samples: int,
+            device_channels: int,
+            callback,
+        ) -> None:
+            _ = (
+                stream_key,
+                device_id,
+                include_loopback,
+                sample_rate_hz,
+                frame_samples,
+                device_channels,
+                callback,
+            )
+
+        def start(self) -> None:
+            observed.append("stream-start")
+
+        def stop(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class _FakeMediaFoundation:
+        numpy = np
+        SoundcardRuntimeWarning = RuntimeWarning
+
+    def fake_import_module(name: str):
+        if name == "soundcard":
+            observed.append("soundcard-import")
+            return fake_soundcard
+        if name == "soundcard.mediafoundation":
+            return _FakeMediaFoundation()
+        return importlib.import_module(name)
+
+    @contextlib.contextmanager
+    def fake_initialize_com_thread():
+        observed.append("com-enter")
+        try:
+            yield
+        finally:
+            observed.append("com-exit")
+
+    monkeypatch.setattr(windows_capture_module, "_SOUNDCARD", None)
+    monkeypatch.setattr(windows_capture_module, "_SOUNDCARD_ATTEMPTED", False)
+    monkeypatch.setattr(windows_capture_module, "_SOUNDCARD_IMPORT_ERROR", None)
+    monkeypatch.setattr(windows_capture_module, "_SOUNDCARD_NUMPY_PATCHED", False)
+    monkeypatch.setattr(windows_capture_module.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(windows_capture_module, "_SoundCardRecorderStream", _FakeStream)
+    monkeypatch.setattr(windows_capture_module, "_initialize_com_thread", fake_initialize_com_thread)
+
+    backend = WindowsAudioCaptureBackend(use_fixture=False)
+    backend.open(
+        CaptureConfig(
+            sample_rate_hz=16_000,
+            frame_ms=20,
+            channels=1,
+            source_mode=AudioSourceMode.BOTH,
+        )
+    )
+
+    assert "soundcard-import" in observed
+    assert "stream-start" in observed
+    assert "com-enter" not in observed
+
+
+def test_soundcard_recorder_stream_initializes_com_on_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_initialize_com_thread():
+        observed.append("enter")
+        try:
+            yield
+        finally:
+            observed.append("exit")
+
+    class _FakeRecorder:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def record(self, *, numframes: int):
+            del numframes
+            return np.zeros((320, 1), dtype=np.float32)
+
+    class _FakeDevice:
+        def recorder(self, **kwargs):
+            observed.append(f"recorder:{kwargs['samplerate']}")
+            return _FakeRecorder()
+
+    monkeypatch.setattr(windows_capture_module, "_initialize_com_thread", fake_initialize_com_thread)
+    monkeypatch.setattr(
+        windows_capture_module,
+        "load_soundcard",
+        lambda: type(
+            "_FakeSoundcardRuntime",
+            (),
+            {"get_microphone": staticmethod(lambda device_id, include_loopback=False: _FakeDevice())},
+        )(),
+    )
+
+    stream = windows_capture_module._SoundCardRecorderStream(
+        stream_key="mic:0",
+        device_id="mic-default",
+        include_loopback=False,
+        sample_rate_hz=16_000,
+        frame_samples=320,
+        device_channels=1,
+        callback=lambda block, frames, time_info, status: stream._stop_event.set(),
+    )
+
+    stream.start()
+    stream.stop()
+
+    assert observed[0] == "enter"
+    assert "recorder:16000" in observed
+    assert observed[-1] == "exit"
 
 
 

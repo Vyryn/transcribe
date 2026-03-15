@@ -12,7 +12,7 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
 from transcribe.models import AudioSourceMode
-from transcribe.runtime_env import RuntimeMode, detect_runtime_mode, set_network_access_allowed
+from transcribe.runtime_env import RuntimeMode, detect_runtime_mode, resolve_app_runtime_paths, set_network_access_allowed
 from transcribe.ui.controller import ControllerMessage, UiTaskController
 from transcribe.ui import services
 from transcribe.ui.preferences import UiPreferences, load_ui_preferences, save_ui_preferences
@@ -1004,10 +1004,33 @@ class TranscribeUiApp:
         self.preferences = load_ui_preferences()
         set_network_access_allowed(self.preferences.allow_network)
 
+        self._apply_window_icon()
         self._apply_theme()
         self._build_shell()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_messages()
+
+    def _apply_window_icon(self) -> None:
+        """Apply the packaged application icon to the Tk root when available."""
+        icon_path = self._resolve_window_icon_path()
+        if icon_path is None:
+            return
+        try:
+            self.root.iconbitmap(default=str(icon_path))
+        except tk.TclError:
+            return
+
+    def _resolve_window_icon_path(self) -> Path | None:
+        """Resolve the preferred icon file for the desktop UI."""
+        runtime_paths = resolve_app_runtime_paths()
+        candidates = [
+            runtime_paths.install_root / "transcribe.ico",
+            Path(__file__).resolve().parents[2] / "packaging" / "windows" / "transcribe.ico",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
 
     def _apply_theme(self) -> None:
         style = ttk.Style(self.root)

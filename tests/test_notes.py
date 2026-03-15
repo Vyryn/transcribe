@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from transcribe.notes import (
+    LlamaCppRuntimeSession,
     NotesGpuRuntimeError,
     SessionNotesConfig,
     SessionNotesResult,
@@ -231,6 +232,48 @@ def test_run_post_transcription_notes_retries_on_cpu_after_gpu_error(tmp_path: P
     assert result.clean_transcript_path.read_text(encoding="utf-8") == "Clean transcript\n"
     assert result.client_notes_path.read_text(encoding="utf-8") == "Client note\n"
     assert runtime_factory.calls == [False, True]
+
+
+def test_llama_cpp_runtime_retries_when_model_is_still_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    responses = [
+        notes_module.NotesRuntimeError(
+            '{"error":{"message":"Loading model","type":"unavailable_error","code":503}}'
+        ),
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "Client note",
+                    }
+                }
+            ]
+        },
+    ]
+
+    def fake_request(*, host: str, path: str, payload: dict[str, object] | None, timeout_sec: float, method: str = "POST") -> dict[str, object]:
+        _ = (host, path, payload, timeout_sec, method)
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(notes_module, "_llama_server_request", fake_request)
+    monkeypatch.setattr(notes_module.time, "sleep", lambda seconds: None)
+
+    runtime = LlamaCppRuntimeSession(
+        binary_path=Path("llama-server.exe"),
+        model_path=Path("model.gguf"),
+        host="127.0.0.1:1234",
+    )
+
+    result = runtime.run_prompt(model="ignored", prompt="hello")
+
+    assert result == "Client note"
+    assert responses == []
 
 
 def test_run_post_transcription_notes_rejects_empty_transcript(tmp_path: Path) -> None:
