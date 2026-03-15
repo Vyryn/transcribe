@@ -47,8 +47,8 @@ Source: "{#SourceDir}\prompts\*"; DestDir: "{app}\prompts"; Flags: ignoreversion
 Source: "{#SourceDir}\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\Transcribe"; Filename: "{app}\Transcribe.exe"; WorkingDir: "{app}"; IconFilename: "{app}\transcribe.ico"; Tasks: startmenuicon
-Name: "{commondesktop}\Transcribe"; Filename: "{app}\Transcribe.exe"; WorkingDir: "{app}"; IconFilename: "{app}\transcribe.ico"; Tasks: desktopicon
+Name: "{group}\Transcribe"; Filename: "{app}\Transcribe.exe"; WorkingDir: "{app}"; IconFilename: "{app}\Transcribe.exe"; IconIndex: 0; Tasks: startmenuicon
+Name: "{commondesktop}\Transcribe"; Filename: "{app}\Transcribe.exe"; WorkingDir: "{app}"; IconFilename: "{app}\Transcribe.exe"; IconIndex: 0; Tasks: desktopicon
 
 [Code]
 var
