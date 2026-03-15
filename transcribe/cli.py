@@ -16,7 +16,7 @@ from transcribe.runtime_defaults import (
     DEFAULT_LIVE_TRANSCRIPTION_MODEL,
     DEFAULT_SESSION_NOTES_MODEL,
 )
-from transcribe.runtime_env import resolve_app_runtime_paths
+from transcribe.runtime_env import network_access_allowed, resolve_app_runtime_paths
 
 LOGGER = logging.getLogger("transcribe")
 
@@ -469,7 +469,8 @@ def load_and_configure_logging(args: argparse.Namespace) -> None:
         },
     )
     configure_logging(app_config.log_level, redact_logs=app_config.redact_logs)
-    install_outbound_network_guard()
+    if not network_access_allowed():
+        install_outbound_network_guard()
     if getattr(args, "debug", False):
         security_log(LOGGER, logging.INFO, "startup", offline_only=app_config.offline_only)
 
