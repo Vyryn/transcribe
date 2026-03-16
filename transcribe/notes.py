@@ -124,7 +124,13 @@ class PromptRuntime(Protocol):
     def ensure_model_available(self, model: str) -> None:
         """Raise when the requested model is unavailable."""
 
-    def run_prompt(self, *, model: str, prompt: str) -> str:
+    def run_prompt(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> str:
         """Run one local prompt and return raw model output."""
 
 
@@ -155,7 +161,13 @@ class OllamaRuntimeSession:
             raise NotesGpuRuntimeError(detail)
         raise NotesRuntimeError(f"Unable to use Ollama model {model!r}: {detail}")
 
-    def run_prompt(self, *, model: str, prompt: str) -> str:
+    def run_prompt(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> str:
         result = _run_ollama_command(
             [
                 "run",
@@ -184,6 +196,8 @@ class OllamaRuntimeSession:
                     "Start `ollama serve` or ensure the local daemon can accept requests."
                 )
             raise NotesRuntimeError(f"Ollama notes generation failed: {detail}")
+        if on_text_delta is not None and result.stdout:
+            on_text_delta(result.stdout)
         return result.stdout
 
 
@@ -206,14 +220,26 @@ class LlamaCppRuntimeSession:
                 f"Bundled notes model for {model!r} is missing: {self.model_path}"
             )
 
-    def run_prompt(self, *, model: str, prompt: str) -> str:
+    def run_prompt(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> str:
         del model
         payload = {
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
             "max_tokens": 2048,
-            "stream": False,
+            "stream": on_text_delta is not None,
         }
+        if on_text_delta is not None:
+            return _llama_server_stream_chat_completion_request(
+                host=self.host,
+                payload=payload,
+                on_text_delta=on_text_delta,
+            )
         response = _llama_server_chat_completion_request(
             host=self.host,
             payload=payload,
@@ -253,6 +279,33 @@ def _llama_server_chat_completion_request(
             if not _is_model_loading_error(str(exc)):
                 raise
             last_loading_error = exc
+            if time.monotonic() >= deadline:
+                raise NotesRuntimeError(
+                    "Bundled llama.cpp runtime did not finish loading the model before timeout."
+                ) from exc
+            time.sleep(_MODEL_LOADING_RETRY_INTERVAL_SEC)
+
+
+def _llama_server_stream_chat_completion_request(
+    *,
+    host: str,
+    payload: dict[str, object],
+    on_text_delta: Callable[[str], None],
+) -> str:
+    """Stream llama.cpp chat completions while retrying transient model-loading responses."""
+    deadline = time.monotonic() + min(_MODEL_LOADING_RETRY_TIMEOUT_SEC, _PROMPT_TIMEOUT_SEC)
+    while True:
+        try:
+            return _llama_server_stream_request_once(
+                host=host,
+                path="/v1/chat/completions",
+                payload=payload,
+                timeout_sec=_PROMPT_TIMEOUT_SEC,
+                on_text_delta=on_text_delta,
+            )
+        except NotesRuntimeError as exc:
+            if not _is_model_loading_error(str(exc)):
+                raise
             if time.monotonic() >= deadline:
                 raise NotesRuntimeError(
                     "Bundled llama.cpp runtime did not finish loading the model before timeout."
@@ -310,16 +363,47 @@ def _run_normalized_prompt_with_retries(
     model: str,
     prompt: str,
     attempts: int = _EMPTY_MODEL_OUTPUT_RETRY_ATTEMPTS,
+    on_text_delta: Callable[[str], None] | None = None,
 ) -> str:
     """Run one prompt, retrying when the model returns only empty/auxiliary output."""
     last_output = ""
     for _attempt_index in range(max(1, attempts)):
-        raw_output = runtime.run_prompt(model=model, prompt=prompt)
+        raw_output = _run_runtime_prompt(
+            runtime=runtime,
+            model=model,
+            prompt=prompt,
+            on_text_delta=on_text_delta,
+        )
         normalized_output = _normalize_model_output(raw_output)
         if normalized_output:
             return normalized_output
         last_output = raw_output
     return _normalize_model_output(last_output)
+
+
+def _run_runtime_prompt(
+    *,
+    runtime: PromptRuntime,
+    model: str,
+    prompt: str,
+    on_text_delta: Callable[[str], None] | None = None,
+) -> str:
+    """Call one runtime prompt method while tolerating older non-streaming runtimes."""
+    if on_text_delta is None:
+        return runtime.run_prompt(model=model, prompt=prompt)
+    try:
+        return runtime.run_prompt(
+            model=model,
+            prompt=prompt,
+            on_text_delta=on_text_delta,
+        )
+    except TypeError as exc:
+        if "on_text_delta" not in str(exc):
+            raise
+        result = runtime.run_prompt(model=model, prompt=prompt)
+        if result:
+            on_text_delta(result)
+        return result
 
 
 def _subprocess_creationflags_no_window() -> int:
@@ -385,6 +469,14 @@ def run_post_transcription_notes(
                         chunk_count=len(cleanup_chunks),
                         cpu_only=cpu_only,
                     )
+                _emit_progress(
+                    progress_callback,
+                    "clean_transcript_chunk_ready",
+                    chunk_index=chunk_index,
+                    chunk_count=len(cleanup_chunks),
+                    cpu_only=cpu_only,
+                    text=cleaned_chunk,
+                )
                 cleaned_chunks.append(cleaned_chunk)
             clean_transcript = "\n\n".join(chunk.strip() for chunk in cleaned_chunks if chunk.strip()).strip()
             clean_duration_sec = time.monotonic() - clean_started
@@ -403,10 +495,25 @@ def run_post_transcription_notes(
                 cpu_only=cpu_only,
             )
             notes_started = time.monotonic()
+            streamed_note_text = False
+
+            def _emit_notes_delta(text: str) -> None:
+                nonlocal streamed_note_text
+                if not text:
+                    return
+                streamed_note_text = True
+                _emit_progress(
+                    progress_callback,
+                    "client_notes_delta",
+                    cpu_only=cpu_only,
+                    text=text,
+                )
+
             client_notes = _run_normalized_prompt_with_retries(
                 runtime=runtime,
                 model=config.model,
                 prompt=build_client_notes_prompt(prompt_template, clean_transcript),
+                on_text_delta=_emit_notes_delta,
             )
             notes_duration_sec = time.monotonic() - notes_started
             if not client_notes:
@@ -415,6 +522,8 @@ def run_post_transcription_notes(
                 progress_callback,
                 "client_notes_ready",
                 cpu_only=cpu_only,
+                text=client_notes,
+                streamed=streamed_note_text,
             )
 
             return clean_transcript, client_notes, clean_duration_sec, notes_duration_sec
@@ -882,6 +991,83 @@ def _llama_server_request(
     if not isinstance(parsed, dict):
         raise NotesRuntimeError("Bundled llama.cpp runtime returned an unexpected JSON payload.")
     return parsed
+
+
+def _llama_server_stream_request_once(
+    *,
+    host: str,
+    path: str,
+    payload: dict[str, object],
+    timeout_sec: float,
+    on_text_delta: Callable[[str], None],
+) -> str:
+    """Call one llama.cpp streaming endpoint and emit text deltas as they arrive."""
+    data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    runtime_url = urllib_parse.urlunsplit(("http", host, path, "", ""))
+    request = urllib_request.Request(
+        runtime_url,
+        data=data,
+        headers={
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    content_parts: list[str] = []
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_sec) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload_text = line[5:].strip()
+                if not payload_text or payload_text == "[DONE]":
+                    continue
+                try:
+                    parsed = json.loads(payload_text)
+                except json.JSONDecodeError as exc:
+                    raise NotesRuntimeError("Bundled llama.cpp runtime returned invalid stream JSON.") from exc
+                if not isinstance(parsed, dict):
+                    raise NotesRuntimeError("Bundled llama.cpp runtime returned an unexpected stream payload.")
+                delta_text = _extract_llama_stream_delta(parsed)
+                if not delta_text:
+                    continue
+                content_parts.append(delta_text)
+                on_text_delta(delta_text)
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        if _is_gpu_runtime_error(detail):
+            raise NotesGpuRuntimeError(detail) from exc
+        raise NotesRuntimeError(detail or f"llama.cpp server returned HTTP {exc.code}") from exc
+    except urllib_error.URLError as exc:
+        detail = str(exc.reason or exc).strip()
+        if _is_server_unavailable_error(detail):
+            raise NotesRuntimeError(detail) from exc
+        raise NotesRuntimeError(f"Unable to contact bundled llama.cpp runtime: {detail}") from exc
+    except TimeoutError as exc:
+        raise NotesRuntimeError("Bundled llama.cpp request timed out.") from exc
+    return "".join(content_parts)
+
+
+def _extract_llama_stream_delta(payload: dict[str, object]) -> str:
+    """Extract one streamed text delta from a llama.cpp SSE payload."""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return ""
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        content = delta.get("content")
+        if isinstance(content, str):
+            return content
+    message = choice.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+    return ""
 
 
 def _run_ollama_command(

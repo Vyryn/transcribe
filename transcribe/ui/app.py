@@ -144,6 +144,8 @@ class SessionPage(BasePage):
         self.device_labels: tuple[str, ...] = ("Auto",)
         self.advanced_visible = False
         self._advanced_window_id: int | None = None
+        self._notes_progress_active = False
+        self._notes_stream_started = False
 
         controls = ttk.LabelFrame(self, text="Live Session")
         controls.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
@@ -298,14 +300,49 @@ class SessionPage(BasePage):
         ttk.Label(outputs, text="Current Partial").grid(row=4, column=0, sticky="nw")
         ttk.Label(outputs, textvariable=self.partial_text_var, wraplength=420, justify="left").grid(row=4, column=1, columnspan=2, sticky="w")
 
-        transcript = ttk.LabelFrame(self, text="Final Transcript")
-        transcript.grid(row=3, column=0, columnspan=2, sticky="nsew")
-        transcript.columnconfigure(0, weight=1)
-        transcript.rowconfigure(0, weight=1)
-        self.transcript_text = ScrolledText(transcript, wrap="word", height=16)
+        self.transcript_frame = ttk.LabelFrame(self, text="Final Transcript")
+        self.transcript_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        self.transcript_frame.columnconfigure(0, weight=1)
+        self.transcript_frame.rowconfigure(0, weight=1)
+        self.transcript_text = ScrolledText(self.transcript_frame, wrap="word", height=16)
         self.transcript_text.grid(row=0, column=0, sticky="nsew")
         self.transcript_text.configure(state="disabled")
         self.set_advanced_mode(False)
+
+    def _set_transcript_frame_title(self, title: str) -> None:
+        """Update the session output panel title."""
+        self.transcript_frame.configure(text=title)
+
+    def _replace_transcript_text(self, text: str) -> None:
+        """Replace the session output text widget contents."""
+        self.transcript_text.configure(state="normal")
+        self.transcript_text.delete("1.0", tk.END)
+        if text:
+            self.transcript_text.insert(tk.END, text)
+        self.transcript_text.see(tk.END)
+        self.transcript_text.configure(state="disabled")
+
+    def _append_transcript_text(self, text: str) -> None:
+        """Append text to the session output text widget."""
+        if not text:
+            return
+        self.transcript_text.configure(state="normal")
+        self.transcript_text.insert(tk.END, text)
+        self.transcript_text.see(tk.END)
+        self.transcript_text.configure(state="disabled")
+
+    def _append_transcript_line(self, text: str = "") -> None:
+        """Append one line to the session output text widget."""
+        self._append_transcript_text(f"{text}\n")
+
+    def _begin_notes_progress_view(self) -> None:
+        """Switch the transcript area into a notes-progress console."""
+        if self._notes_progress_active:
+            return
+        self._notes_progress_active = True
+        self._notes_stream_started = False
+        self._set_transcript_frame_title("Notes Progress")
+        self._replace_transcript_text("Preparing notes model...\n")
 
     def _prepare_launch_paths(self) -> tuple[Path, str, Path]:
         output_root_text = self.output_root_var.get().strip()
@@ -360,9 +397,10 @@ class SessionPage(BasePage):
         self.status_var.set(f"Loaded {len(result.devices)} devices")
 
     def start(self) -> None:
-        self.transcript_text.configure(state="normal")
-        self.transcript_text.delete("1.0", tk.END)
-        self.transcript_text.configure(state="disabled")
+        self._notes_progress_active = False
+        self._notes_stream_started = False
+        self._set_transcript_frame_title("Final Transcript")
+        self._replace_transcript_text("")
         self.partial_text_var.set("")
         output_root, session_id, _ = self._prepare_launch_paths()
         self.status_var.set("Starting session...")
@@ -415,15 +453,18 @@ class SessionPage(BasePage):
         elif name == "final":
             text = str(fields.get("text", "")).strip()
             if text:
-                self.transcript_text.configure(state="normal")
-                self.transcript_text.insert(tk.END, text + "\n")
-                self.transcript_text.see(tk.END)
-                self.transcript_text.configure(state="disabled")
+                self._append_transcript_line(text)
                 self.partial_text_var.set("")
         elif name == "notes_preparing":
             self.status_var.set("Preparing notes")
+            self._begin_notes_progress_view()
         elif name == "notes_started":
             self.status_var.set("Generating notes")
+            model = str(fields.get("model", "")).strip()
+            if model:
+                self._append_transcript_line(f"Starting notes model: {model}")
+            else:
+                self._append_transcript_line("Starting notes generation")
         elif name == "clean_transcript_started":
             chunk_count = fields.get("chunk_count")
             self.status_var.set(
@@ -431,28 +472,69 @@ class SessionPage(BasePage):
                 if isinstance(chunk_count, int)
                 else "Cleaning transcript"
             )
+            self._append_transcript_line("")
+            self._append_transcript_line("Transcript cleanup")
         elif name == "clean_transcript_chunk_started":
             chunk_index = fields.get("chunk_index")
             chunk_count = fields.get("chunk_count")
             if isinstance(chunk_index, int) and isinstance(chunk_count, int):
                 self.status_var.set(f"Cleaning transcript ({chunk_index}/{chunk_count})")
+                self._append_transcript_line(f"[Cleanup {chunk_index}/{chunk_count}] Running")
             else:
                 self.status_var.set("Cleaning transcript")
+                self._append_transcript_line("[Cleanup] Running")
         elif name == "clean_transcript_chunk_fallback":
             chunk_index = fields.get("chunk_index")
             chunk_count = fields.get("chunk_count")
             if isinstance(chunk_index, int) and isinstance(chunk_count, int):
                 self.status_var.set(f"Cleanup fallback used ({chunk_index}/{chunk_count})")
+                self._append_transcript_line(f"[Cleanup {chunk_index}/{chunk_count}] Fallback to raw transcript chunk")
             else:
                 self.status_var.set("Cleanup fallback used")
+                self._append_transcript_line("[Cleanup] Fallback to raw transcript chunk")
+        elif name == "clean_transcript_chunk_ready":
+            chunk_index = fields.get("chunk_index")
+            chunk_count = fields.get("chunk_count")
+            text = str(fields.get("text", "")).strip()
+            if isinstance(chunk_index, int) and isinstance(chunk_count, int):
+                self._append_transcript_line(f"[Cleanup {chunk_index}/{chunk_count}] Result")
+            else:
+                self._append_transcript_line("[Cleanup] Result")
+            if text:
+                self._append_transcript_line(text)
+                self._append_transcript_line("")
         elif name == "clean_transcript_ready":
             self.status_var.set("Clean transcript ready")
+            self._append_transcript_line("Clean transcript complete")
+            self._append_transcript_line("")
         elif name == "notes_cpu_fallback":
             self.status_var.set("Retrying notes on CPU")
+            self._append_transcript_line("Retrying notes generation on CPU")
         elif name == "client_notes_started":
             self.status_var.set("Generating client notes")
+            self._notes_stream_started = False
+            self._append_transcript_line("Client notes generation")
+            self._append_transcript_line("")
         elif name == "client_notes_ready":
             self.status_var.set("Client notes ready")
+            text = str(fields.get("text", ""))
+            streamed = bool(fields.get("streamed", False))
+            if not streamed and text.strip():
+                self._append_transcript_text(text.rstrip())
+            if not self._notes_stream_started:
+                self._append_transcript_line("Client notes ready")
+            else:
+                self._append_transcript_line("")
+                self._append_transcript_line("Client notes ready")
+        elif name == "client_notes_delta":
+            text = str(fields.get("text", ""))
+            if text:
+                self._notes_stream_started = True
+                self._append_transcript_text(text)
+        elif name == "transcription_resources_released":
+            released_models = fields.get("released_models")
+            if isinstance(released_models, int):
+                self._append_transcript_line(f"Released transcription resources ({released_models} model cache entr{'y' if released_models == 1 else 'ies'})")
 
     def handle_result(self, result: object) -> None:
         assert isinstance(result, SessionResultSummary)
@@ -460,11 +542,16 @@ class SessionPage(BasePage):
         self.transcript_path_var.set(str(result.transcript_txt_path))
         if result.notes_summary is not None:
             self.notes_path_var.set(str(result.notes_summary.client_notes_path))
+            self.status_var.set("Notes ready")
         elif not self.notes_enabled_var.get():
             self.notes_path_var.set("")
-        self.status_var.set(
-            "Session stopped" if result.interrupted else f"Saved {result.final_segment_count} final segments"
-        )
+            self.status_var.set(
+                "Session stopped" if result.interrupted else f"Saved {result.final_segment_count} final segments"
+            )
+        else:
+            self.status_var.set(
+                "Session stopped" if result.interrupted else f"Saved {result.final_segment_count} final segments"
+            )
 
     def set_busy(self, busy: bool, *, cancelable: bool) -> None:
         self.start_button.configure(state="disabled" if busy else "normal")
@@ -1348,8 +1435,6 @@ class TranscribeUiApp:
     def _set_busy(self, busy: bool, task_name: str, *, cancelable: bool) -> None:
         for page in self.pages.values():
             page.set_busy(busy, cancelable=cancelable)
-        for button in self.nav_buttons.values():
-            button.configure(state="disabled" if busy else "normal")
         self.cancel_button.configure(state="normal" if busy and cancelable else "disabled")
         if busy:
             self.append_log(f"Running task: {task_name}")
