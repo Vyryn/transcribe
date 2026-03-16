@@ -32,6 +32,7 @@ _MAX_CLEAN_TRANSCRIPT_CHUNK_WORDS = 700
 _TEMP_SERVER_START_TIMEOUT_SEC = 20.0
 _MODEL_LOADING_RETRY_TIMEOUT_SEC = 120.0
 _MODEL_LOADING_RETRY_INTERVAL_SEC = 0.5
+_EMPTY_MODEL_OUTPUT_RETRY_ATTEMPTS = 2
 _PROMPT_TIMEOUT_SEC = 1_800.0
 _CLEAN_TRANSCRIPT_PROMPT = """You are cleaning a rough ASR transcript of a psychotherapy session.
 
@@ -303,6 +304,30 @@ def _write_text_artifact(path: Path, text: str) -> None:
     path.write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
+def _run_normalized_prompt_with_retries(
+    *,
+    runtime: PromptRuntime,
+    model: str,
+    prompt: str,
+    attempts: int = _EMPTY_MODEL_OUTPUT_RETRY_ATTEMPTS,
+) -> str:
+    """Run one prompt, retrying when the model returns only empty/auxiliary output."""
+    last_output = ""
+    for _attempt_index in range(max(1, attempts)):
+        raw_output = runtime.run_prompt(model=model, prompt=prompt)
+        normalized_output = _normalize_model_output(raw_output)
+        if normalized_output:
+            return normalized_output
+        last_output = raw_output
+    return _normalize_model_output(last_output)
+
+
+def _subprocess_creationflags_no_window() -> int:
+    """Return Windows subprocess flags that avoid spawning a console window."""
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return int(create_no_window) if os.name == "nt" else 0
+
+
 def run_post_transcription_notes(
     config: SessionNotesConfig,
     *,
@@ -346,14 +371,20 @@ def run_post_transcription_notes(
                     chunk_count=len(cleanup_chunks),
                     cpu_only=cpu_only,
                 )
-                cleaned_chunk = _normalize_model_output(
-                    runtime.run_prompt(
-                        model=config.model,
-                        prompt=build_clean_transcript_prompt(cleanup_chunk),
-                    )
+                cleaned_chunk = _run_normalized_prompt_with_retries(
+                    runtime=runtime,
+                    model=config.model,
+                    prompt=build_clean_transcript_prompt(cleanup_chunk),
                 )
                 if not cleaned_chunk:
-                    raise NotesRuntimeError("Clean transcript generation returned no content.")
+                    cleaned_chunk = cleanup_chunk.strip()
+                    _emit_progress(
+                        progress_callback,
+                        "clean_transcript_chunk_fallback",
+                        chunk_index=chunk_index,
+                        chunk_count=len(cleanup_chunks),
+                        cpu_only=cpu_only,
+                    )
                 cleaned_chunks.append(cleaned_chunk)
             clean_transcript = "\n\n".join(chunk.strip() for chunk in cleaned_chunks if chunk.strip()).strip()
             clean_duration_sec = time.monotonic() - clean_started
@@ -372,11 +403,10 @@ def run_post_transcription_notes(
                 cpu_only=cpu_only,
             )
             notes_started = time.monotonic()
-            client_notes = _normalize_model_output(
-                runtime.run_prompt(
-                    model=config.model,
-                    prompt=build_client_notes_prompt(prompt_template, clean_transcript),
-                )
+            client_notes = _run_normalized_prompt_with_retries(
+                runtime=runtime,
+                model=config.model,
+                prompt=build_client_notes_prompt(prompt_template, clean_transcript),
             )
             notes_duration_sec = time.monotonic() - notes_started
             if not client_notes:
@@ -648,6 +678,7 @@ def _temporary_llama_cpp_runtime(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
+        creationflags=_subprocess_creationflags_no_window(),
     )
     try:
         _wait_for_llama_cpp_runtime_ready(process=process, host=host)
@@ -706,6 +737,7 @@ def _temporary_ollama_runtime(*, cpu_only: bool) -> Iterator[OllamaRuntimeSessio
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
+        creationflags=_subprocess_creationflags_no_window(),
     )
     try:
         _wait_for_runtime_ready(process=process, env=env)

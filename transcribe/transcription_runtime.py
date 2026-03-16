@@ -849,10 +849,9 @@ def release_transcription_runtime_resources(transcription_model: str | None = No
     for cache in caches:
         cache.clear()
     for model in models_to_release:
-        _offload_model_to_cpu(model)
+        _release_model_resources(model)
 
-    gc.collect()
-    _clear_accelerator_caches()
+    _drain_process_memory_pressure()
     return len(models_to_release)
 
 
@@ -887,6 +886,37 @@ def _collect_unique_cached_models(caches: Iterable[dict[str, Any]]) -> list[Any]
     return unique_models
 
 
+def _release_model_resources(model: Any) -> None:
+    """Best-effort unload of one cached model before dropping references."""
+    _call_model_release_hooks(model)
+    _offload_model_to_cpu(model)
+    _clear_model_attributes(model)
+
+
+def _call_model_release_hooks(model: Any) -> None:
+    """Call common best-effort model teardown hooks when available."""
+    hook_names = (
+        "close",
+        "shutdown",
+        "unload",
+        "unload_model",
+        "teardown",
+    )
+    for candidate in (model, getattr(model, "model", None)):
+        if candidate is None:
+            continue
+        for hook_name in hook_names:
+            hook = getattr(candidate, hook_name, None)
+            if not callable(hook):
+                continue
+            try:
+                hook()
+            except TypeError:
+                continue
+            except Exception:  # noqa: BLE001
+                continue
+
+
 def _offload_model_to_cpu(model: Any) -> None:
     """Best-effort move a cached model off accelerator memory before dropping references."""
     for candidate in (model, getattr(model, "model", None)):
@@ -915,6 +945,42 @@ def _offload_model_to_cpu(model: Any) -> None:
                 return
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _clear_model_attributes(model: Any) -> None:
+    """Drop references to common heavy model attributes once inference is complete."""
+    heavy_attribute_names = (
+        "model",
+        "_model",
+        "models",
+        "_models",
+        "encoder",
+        "decoder",
+        "feature_extractor",
+        "processor",
+        "preprocessor",
+        "backbone",
+        "pipeline",
+        "session",
+        "engine",
+        "_engine",
+        "llm",
+    )
+    for attribute_name in heavy_attribute_names:
+        if not hasattr(model, attribute_name):
+            continue
+        try:
+            setattr(model, attribute_name, None)
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def _drain_process_memory_pressure() -> None:
+    """Run repeated best-effort allocator cleanup after cached ASR models are dropped."""
+    gc.collect()
+    _clear_accelerator_caches()
+    gc.collect()
+    _clear_accelerator_caches()
 
 
 def _clear_accelerator_caches() -> None:

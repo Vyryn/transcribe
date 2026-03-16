@@ -234,6 +234,33 @@ def test_run_post_transcription_notes_retries_on_cpu_after_gpu_error(tmp_path: P
     assert runtime_factory.calls == [False, True]
 
 
+def test_run_post_transcription_notes_falls_back_to_raw_cleanup_chunk_when_model_returns_empty(
+    tmp_path: Path,
+) -> None:
+    transcript_path = tmp_path / "rough_transcript.txt"
+    transcript_path.write_text("rough text", encoding="utf-8")
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("WRITE THE NOTE", encoding="utf-8")
+
+    runtime = FakePromptRuntime(["", "", "Client note"])
+    runtime_factory = FakeRuntimeFactory({False: [runtime], True: []})
+    progress_events: list[tuple[str, dict[str, object]]] = []
+
+    result = run_post_transcription_notes(
+        SessionNotesConfig(
+            transcript_path=transcript_path,
+            output_dir=tmp_path / "notes_out",
+            prompt_path=prompt_path,
+        ),
+        runtime_factory=runtime_factory,
+        progress_callback=lambda event, fields: progress_events.append((event, fields)),
+    )
+
+    assert result.clean_transcript_path.read_text(encoding="utf-8") == "rough text\n"
+    assert result.client_notes_path.read_text(encoding="utf-8") == "Client note\n"
+    assert any(event == "clean_transcript_chunk_fallback" for event, _fields in progress_events)
+
+
 def test_llama_cpp_runtime_retries_when_model_is_still_loading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -297,12 +324,13 @@ def test_temporary_llama_cpp_runtime_forces_cpu_layers_for_packaged_runtime(
             _ = timeout
             return 0
 
-    def fake_popen(command, *, env, stdout, stderr, text):
+    def fake_popen(command, *, env, stdout, stderr, text, creationflags):
         observed["command"] = list(command)
         observed["env"] = dict(env)
         observed["stdout"] = stdout
         observed["stderr"] = stderr
         observed["text"] = text
+        observed["creationflags"] = creationflags
         return _FakeProcess()
 
     monkeypatch.setattr(notes_module.subprocess, "Popen", fake_popen)
@@ -320,6 +348,7 @@ def test_temporary_llama_cpp_runtime_forces_cpu_layers_for_packaged_runtime(
     assert isinstance(command, list)
     assert "--n-gpu-layers" in command
     assert command[command.index("--n-gpu-layers") + 1] == "0"
+    assert observed["creationflags"] == notes_module._subprocess_creationflags_no_window()
 
 
 def test_wait_for_llama_cpp_runtime_ready_retries_while_model_is_loading(

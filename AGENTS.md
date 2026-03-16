@@ -25,3 +25,5 @@ Windows standalone capture startup can regress if COM initialization wraps the t
 Bundled Windows notes generation uses the CPU-only llama.cpp runtime archive, so the packaged `llama-server` launcher must force `--n-gpu-layers 0`. Requesting GPU offload in the packaged notes runtime can leave the server stuck returning `loading model` 503 responses instead of ever serving completions.
 
 The Windows standalone builder should not assume the latest `ggml-org/llama.cpp` release still publishes a `win-cpu-x64` archive. When the latest release only exposes Windows x64 CUDA-branded zip assets, accept those as the runtime bundle and rely on the packaged notes launcher to force CPU execution at runtime.
+
+Packaged Windows note generation can hit extreme RAM use if the completed ASR session still holds model/runtime allocations while the notes model is starting. Start ASR cleanup immediately after live transcription returns, let that release continue in a background thread while notes preparation begins, and make the runtime release path aggressively drop cached model references, call best-effort unload hooks, and flush allocator caches before loading the notes model.

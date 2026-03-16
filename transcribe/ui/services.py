@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import Callable
 
 from transcribe.config import load_app_config
@@ -51,6 +51,49 @@ from transcribe.ui.types import (
 
 LOGGER = logging.getLogger("transcribe.ui")
 ProgressCallback = Callable[[str, dict[str, object]], None]
+
+
+def _release_transcription_resources_in_background(
+    transcription_model: str,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> Thread:
+    """Start best-effort ASR resource cleanup without blocking notes startup for long."""
+    from transcribe.transcription_runtime import release_transcription_runtime_resources
+
+    def _run_release() -> None:
+        try:
+            released_models = release_transcription_runtime_resources(transcription_model)
+            if progress_callback is not None:
+                progress_callback(
+                    "transcription_resources_released",
+                    {
+                        "transcription_model": transcription_model,
+                        "released_models": released_models,
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "Best-effort transcription resource release failed for %s: %s",
+                transcription_model,
+                exc,
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    "transcription_resources_release_failed",
+                    {
+                        "transcription_model": transcription_model,
+                        "error": str(exc),
+                    },
+                )
+
+    thread = Thread(
+        target=_run_release,
+        name="transcription-resource-release",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def transcription_model_options() -> tuple[str, ...]:
@@ -245,8 +288,6 @@ def run_session(
     """Run a live transcription session and optional notes pipeline."""
     from transcribe.live.session import LiveSessionConfig, run_live_transcription_session
     from transcribe.notes import SessionNotesConfig, run_post_transcription_notes
-    from transcribe.transcription_runtime import release_transcription_runtime_resources
-
     configure_runtime(request.common)
     transcription_model = validate_transcription_model_for_runtime(request.transcription_model)
     session_id = request.session_id or default_session_id("live")
@@ -280,7 +321,11 @@ def run_session(
     if request.notes_enabled and result.final_segment_count > 0:
         if progress_callback is not None:
             progress_callback("notes_preparing", {"transcription_model": transcription_model})
-        release_transcription_runtime_resources(transcription_model)
+        release_thread = _release_transcription_resources_in_background(
+            transcription_model,
+            progress_callback=progress_callback,
+        )
+        release_thread.join(timeout=3.0)
         notes_result = run_post_transcription_notes(
             SessionNotesConfig(
                 transcript_path=result.transcript_txt_path,

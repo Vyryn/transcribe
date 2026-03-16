@@ -424,8 +424,35 @@ class SessionPage(BasePage):
             self.status_var.set("Preparing notes")
         elif name == "notes_started":
             self.status_var.set("Generating notes")
+        elif name == "clean_transcript_started":
+            chunk_count = fields.get("chunk_count")
+            self.status_var.set(
+                f"Cleaning transcript ({chunk_count} chunk{'s' if chunk_count != 1 else ''})"
+                if isinstance(chunk_count, int)
+                else "Cleaning transcript"
+            )
+        elif name == "clean_transcript_chunk_started":
+            chunk_index = fields.get("chunk_index")
+            chunk_count = fields.get("chunk_count")
+            if isinstance(chunk_index, int) and isinstance(chunk_count, int):
+                self.status_var.set(f"Cleaning transcript ({chunk_index}/{chunk_count})")
+            else:
+                self.status_var.set("Cleaning transcript")
+        elif name == "clean_transcript_chunk_fallback":
+            chunk_index = fields.get("chunk_index")
+            chunk_count = fields.get("chunk_count")
+            if isinstance(chunk_index, int) and isinstance(chunk_count, int):
+                self.status_var.set(f"Cleanup fallback used ({chunk_index}/{chunk_count})")
+            else:
+                self.status_var.set("Cleanup fallback used")
+        elif name == "clean_transcript_ready":
+            self.status_var.set("Clean transcript ready")
         elif name == "notes_cpu_fallback":
             self.status_var.set("Retrying notes on CPU")
+        elif name == "client_notes_started":
+            self.status_var.set("Generating client notes")
+        elif name == "client_notes_ready":
+            self.status_var.set("Client notes ready")
 
     def handle_result(self, result: object) -> None:
         assert isinstance(result, SessionResultSummary)
