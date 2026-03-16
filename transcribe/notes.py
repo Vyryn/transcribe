@@ -92,6 +92,15 @@ class NotesGpuRuntimeError(NotesRuntimeError):
 SessionNotesProgressCallback = Callable[[str, dict[str, object]], None]
 
 
+def _subprocess_text_mode_kwargs() -> dict[str, str | bool]:
+    """Return text-mode subprocess options that tolerate undecodable output."""
+    return {
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+
+
 @dataclass(slots=True)
 class SessionNotesConfig:
     """Configuration for transcript cleanup and post-session notes generation."""
@@ -566,12 +575,62 @@ def _default_runtime_factory(
     """Resolve the default notes runtime factory for one request."""
     runtime_name = (config.runtime or "auto").strip().lower()
     if runtime_name in {"", "auto"}:
-        runtime_name = default_notes_runtime()
+        preferred_runtime = default_notes_runtime()
+        alternate_runtime = "llama_cpp" if preferred_runtime == "ollama" else "ollama"
+        return _open_auto_notes_runtime(
+            model=config.model,
+            preferred_runtime=preferred_runtime,
+            alternate_runtime=alternate_runtime,
+        )
+    return _runtime_factory_for_name(runtime_name, model=config.model)
+
+
+def _runtime_factory_for_name(
+    runtime_name: str,
+    *,
+    model: str,
+) -> Callable[..., contextlib.AbstractContextManager[PromptRuntime]]:
+    """Resolve one explicit runtime name into a context-manager factory."""
     if runtime_name == "ollama":
         return open_ollama_runtime
     if runtime_name == "llama_cpp":
-        return lambda *, cpu_only=False: open_llama_cpp_runtime(model=config.model, cpu_only=cpu_only)
-    raise NotesRuntimeError(f"Unsupported notes runtime {config.runtime!r}. Use 'auto', 'ollama', or 'llama_cpp'.")
+        return lambda *, cpu_only=False: open_llama_cpp_runtime(model=model, cpu_only=cpu_only)
+    raise NotesRuntimeError(f"Unsupported notes runtime {runtime_name!r}. Use 'auto', 'ollama', or 'llama_cpp'.")
+
+
+def _open_auto_notes_runtime(
+    *,
+    model: str,
+    preferred_runtime: str,
+    alternate_runtime: str,
+) -> Callable[..., contextlib.AbstractContextManager[PromptRuntime]]:
+    """Build an auto runtime factory that can fall back across local runtimes."""
+
+    @contextlib.contextmanager
+    def _factory(*, cpu_only: bool = False) -> Iterator[PromptRuntime]:
+        last_error: NotesRuntimeError | None = None
+        attempted_messages: list[str] = []
+        for runtime_name in (preferred_runtime, alternate_runtime):
+            runtime_factory = _runtime_factory_for_name(runtime_name, model=model)
+            try:
+                with runtime_factory(cpu_only=cpu_only) as runtime:
+                    yield runtime
+                    return
+            except NotesRuntimeError as exc:
+                if not _is_runtime_bootstrap_unavailable_error(str(exc)):
+                    raise
+                last_error = exc
+                attempted_messages.append(f"{runtime_name}: {exc}")
+                continue
+
+        detail = "; ".join(attempted_messages) if attempted_messages else "no runtime candidates attempted"
+        if last_error is not None:
+            raise NotesRuntimeError(
+                f"Unable to initialize any local notes runtime. Tried {detail}"
+            ) from last_error
+        raise NotesRuntimeError("Unable to initialize any local notes runtime.")
+
+    return _factory
 
 
 def load_transcript_units(transcript_path: Path) -> list[str]:
@@ -786,7 +845,7 @@ def _temporary_llama_cpp_runtime(
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        text=True,
+        **_subprocess_text_mode_kwargs(),
         creationflags=_subprocess_creationflags_no_window(),
     )
     try:
@@ -845,7 +904,7 @@ def _temporary_ollama_runtime(*, cpu_only: bool) -> Iterator[OllamaRuntimeSessio
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        text=True,
+        **_subprocess_text_mode_kwargs(),
         creationflags=_subprocess_creationflags_no_window(),
     )
     try:
@@ -1084,7 +1143,7 @@ def _run_ollama_command(
             env=env,
             input=input_text,
             capture_output=True,
-            text=True,
+            **_subprocess_text_mode_kwargs(),
             timeout=timeout_sec,
             check=False,
         )
@@ -1128,6 +1187,25 @@ def _is_server_unavailable_error(message: str) -> bool:
     """Detect inability to connect to a local Ollama runtime."""
     lowered = message.lower()
     return any(needle in lowered for needle in _SERVER_UNAVAILABLE_NEEDLES)
+
+
+def _is_runtime_bootstrap_unavailable_error(message: str) -> bool:
+    """Detect runtime startup failures where trying another local backend is reasonable."""
+    lowered = message.lower()
+    needles = (
+        "requires bundled llama-server",
+        "missing llama-server binary",
+        "bundled notes model",
+        "not installed locally in ollama",
+        "requires the local `ollama` command",
+        "unable to reach a local ollama runtime",
+        "unable to initialize local ollama runtime",
+        "unable to start local ollama runtime",
+        "timed out while waiting for a private local ollama runtime to start",
+        "timed out while waiting for a private bundled llama.cpp runtime to start",
+        "unable to start bundled llama.cpp runtime",
+    )
+    return any(needle in lowered for needle in needles)
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:

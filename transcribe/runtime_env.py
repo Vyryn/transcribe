@@ -133,6 +133,17 @@ def _notes_binary_specs() -> tuple[BundledBinarySpec, ...]:
     return (BundledBinarySpec("llama_server", Path("runtime/llm") / executable_name),)
 
 
+def _resolve_notes_prompt_path(*, install_root: Path) -> Path:
+    """Resolve the packaged notes prompt path, preferring the install root layout."""
+    root_prompt_path = install_root / "clinical_note_synthesis_llm_prompt.md"
+    prompts_dir_path = install_root / "prompts" / "clinical_note_synthesis_llm_prompt.md"
+    if root_prompt_path.exists():
+        return root_prompt_path
+    if prompts_dir_path.exists():
+        return prompts_dir_path
+    return root_prompt_path
+
+
 def bundled_notes_model_specs() -> tuple[BundledModelSpec, ...]:
     """Return the packaged note-model mapping relative to the models root."""
     return (
@@ -225,7 +236,7 @@ def resolve_app_runtime_paths() -> AppRuntimePaths:
         packaged_assets_manifest_path=manifest_path,
         installed_assets_state_path=installed_assets_state_path,
         notes_runtime_binary=binary_map["llama_server"],
-        notes_prompt_path=prompt_root / "clinical_note_synthesis_llm_prompt.md",
+        notes_prompt_path=_resolve_notes_prompt_path(install_root=install_root),
         notes_models=notes_models,
         transcription_models=transcription_models,
     )

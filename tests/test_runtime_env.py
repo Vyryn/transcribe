@@ -123,7 +123,7 @@ def test_resolve_app_runtime_paths_uses_data_root_models_for_packaged_runtime(
     assert paths.data_root == data_root.resolve()
     assert paths.models_root == data_root.resolve() / "models"
     assert paths.notes_runtime_binary.parent == app_root.resolve() / "runtime/llm"
-    assert paths.notes_prompt_path == app_root.resolve() / "prompts/clinical_note_synthesis_llm_prompt.md"
+    assert paths.notes_prompt_path == app_root.resolve() / "clinical_note_synthesis_llm_prompt.md"
     assert paths.notes_models[DEFAULT_SESSION_NOTES_MODEL] == data_root.resolve() / "models/notes/qwen3.5-4b-q4_k_m.gguf"
     assert paths.transcription_models[DEFAULT_LIVE_TRANSCRIPTION_MODEL] == (
         data_root.resolve() / "models/asr/nvidia/parakeet-tdt-0.6b-v3"

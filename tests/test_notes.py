@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -324,12 +325,14 @@ def test_temporary_llama_cpp_runtime_forces_cpu_layers_for_packaged_runtime(
             _ = timeout
             return 0
 
-    def fake_popen(command, *, env, stdout, stderr, text, creationflags):
+    def fake_popen(command, *, env, stdout, stderr, text, encoding, errors, creationflags):
         observed["command"] = list(command)
         observed["env"] = dict(env)
         observed["stdout"] = stdout
         observed["stderr"] = stderr
         observed["text"] = text
+        observed["encoding"] = encoding
+        observed["errors"] = errors
         observed["creationflags"] = creationflags
         return _FakeProcess()
 
@@ -348,7 +351,41 @@ def test_temporary_llama_cpp_runtime_forces_cpu_layers_for_packaged_runtime(
     assert isinstance(command, list)
     assert "--n-gpu-layers" in command
     assert command[command.index("--n-gpu-layers") + 1] == "0"
+    assert observed["encoding"] == "utf-8"
+    assert observed["errors"] == "replace"
     assert observed["creationflags"] == notes_module._subprocess_creationflags_no_window()
+
+
+def test_run_ollama_command_uses_replace_for_text_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    import transcribe.notes as notes_module
+
+    observed: dict[str, object] = {}
+
+    def fake_run(argv, *, env, input, capture_output, text, encoding, errors, timeout, check):
+        observed["argv"] = list(argv)
+        observed["env"] = dict(env)
+        observed["input"] = input
+        observed["capture_output"] = capture_output
+        observed["text"] = text
+        observed["encoding"] = encoding
+        observed["errors"] = errors
+        observed["timeout"] = timeout
+        observed["check"] = check
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(notes_module, "_ollama_executable", lambda: "ollama")
+    monkeypatch.setattr(notes_module.subprocess, "run", fake_run)
+
+    result = notes_module._run_ollama_command(
+        ["list"],
+        env={"OLLAMA_HOST": "127.0.0.1:11434"},
+        timeout_sec=20.0,
+    )
+
+    assert result.stdout == "ok"
+    assert observed["text"] is True
+    assert observed["encoding"] == "utf-8"
+    assert observed["errors"] == "replace"
 
 
 def test_wait_for_llama_cpp_runtime_ready_retries_while_model_is_loading(
@@ -693,5 +730,43 @@ def test_default_runtime_factory_uses_llama_cpp_when_auto_resolves_to_packaged(
         pass
 
     assert observed == [True]
+
+
+def test_default_runtime_factory_falls_back_to_llama_cpp_when_ollama_model_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    observed: list[tuple[str, bool]] = []
+
+    @contextlib.contextmanager
+    def fake_ollama_runtime(*, cpu_only: bool = False):
+        observed.append(("ollama", cpu_only))
+        raise notes_module.NotesRuntimeError(
+            f"Session notes model {DEFAULT_SESSION_NOTES_MODEL!r} is not installed locally in Ollama."
+        )
+        yield
+
+    @contextlib.contextmanager
+    def fake_llama_runtime(*, model: str, cpu_only: bool = False):
+        assert model == DEFAULT_SESSION_NOTES_MODEL
+        observed.append(("llama_cpp", cpu_only))
+        yield FakePromptRuntime(["unused"])
+
+    monkeypatch.setattr(notes_module, "default_notes_runtime", lambda: "ollama")
+    monkeypatch.setattr(notes_module, "open_ollama_runtime", fake_ollama_runtime)
+    monkeypatch.setattr(notes_module, "open_llama_cpp_runtime", fake_llama_runtime)
+
+    factory = _default_runtime_factory(
+        SessionNotesConfig(
+            transcript_path=Path("rough.txt"),
+            output_dir=Path("out"),
+        )
+    )
+
+    with factory(cpu_only=False):
+        pass
+
+    assert observed == [("ollama", False), ("llama_cpp", False)]
 
 
