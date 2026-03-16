@@ -1,0 +1,4 @@
+› test_files\ground_truth_transcription.txt is the ground truth transcription of an audio play. That audio play, with the parakeet model and default settings, resulted in test_files\transcript.txt . A pass
+  through the transcript cleanup resulted in test_files\clean_transcript.txt . Review the transcription prompt and these transcripts, and alter the transcription prompt such that cleaning the transcript
+  should result in a transcript significantly closer to the ground truth transcript. Additionally, review the default settings for overlap, stitching, chunk size etc and determine if alternate settings, like
+  perhaps a longer default chunk size, are likely to result in an imrpoved transcript. Make changes accordingly.
