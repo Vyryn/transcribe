@@ -46,6 +46,9 @@ Source: "{#SourceDir}\transcribe.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\prompts\*"; DestDir: "{app}\prompts"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}"
+
 [Icons]
 Name: "{group}\Transcribe"; Filename: "{app}\Transcribe.exe"; WorkingDir: "{app}"; IconFilename: "{app}\Transcribe.exe"; IconIndex: 0; Tasks: startmenuicon
 Name: "{commondesktop}\Transcribe"; Filename: "{app}\Transcribe.exe"; WorkingDir: "{app}"; IconFilename: "{app}\Transcribe.exe"; IconIndex: 0; Tasks: desktopicon
