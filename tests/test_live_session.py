@@ -718,6 +718,9 @@ def test_run_live_transcription_session_reports_progress_events(tmp_path) -> Non
     event_names = [event for event, _ in progress_events]
     assert "capture_ready" in event_names
     assert "transcribing_started" in event_names
+    assert "loop_heartbeat" in event_names
+    assert "chunk_transcribe_started" in event_names
+    assert "chunk_transcribe_completed" in event_names
     assert "final" in event_names
 
 
@@ -800,6 +803,80 @@ def test_run_live_transcription_session_buffers_audio_while_model_loads(monkeypa
     assert transcribe_calls["count"] >= 1
     assert result.final_segment_count >= 1
     assert "final" in event_names
+
+
+def test_run_live_transcription_session_reports_capture_stall_and_resume(monkeypatch, tmp_path) -> None:
+    from transcribe.audio.interfaces import RawFrame
+    import transcribe.live.session as live_session_module
+
+    progress_events: list[tuple[str, dict[str, object]]] = []
+
+    class FakeBackend:
+        def __init__(self, *, use_fixture: bool = False) -> None:
+            _ = use_fixture
+            self.sample_rate_hz = 16_000
+            self._calls = 0
+            self._timeouts = 0
+
+        def open(self, config) -> None:
+            _ = config
+
+        def read_frames(self, timeout_ms: int = 500) -> dict[str, RawFrame]:
+            _ = timeout_ms
+            self._calls += 1
+            if self._calls <= 2:
+                self._timeouts += 1
+                raise TimeoutError("capture timeout")
+            frame_samples = int((self.sample_rate_hz * 20) / 1000)
+            voiced_frame = struct.pack("<h", 1_400) * frame_samples
+            return {
+                "mic": RawFrame(
+                    stream="mic",
+                    mono_pcm16=voiced_frame,
+                    captured_at_monotonic_ns=time.monotonic_ns(),
+                    sample_rate_hz=self.sample_rate_hz,
+                )
+            }
+
+        def diagnostics_snapshot(self) -> dict[str, object]:
+            return {
+                "consecutive_timeouts": self._timeouts,
+                "stream_states": {"mic:fixture": {"active": True, "runtime_error": ""}},
+            }
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        live_session_module,
+        "open_audio_backend",
+        lambda *, use_fixture=False: FakeBackend(use_fixture=use_fixture),
+    )
+
+    config = LiveSessionConfig(
+        transcription_model="unit-test-model",
+        duration_sec=0.12,
+        chunk_sec=0.06,
+        partial_interval_sec=0.0,
+        output_dir=tmp_path / "live-stall",
+        session_id="live-stall",
+    )
+    result = run_live_transcription_session(
+        config,
+        use_fixture=False,
+        transcriber=lambda wav_bytes, model_id: ("recovered line", 1.0),
+        progress_callback=lambda event, fields: progress_events.append((event, fields)),
+    )
+
+    event_names = [event for event, _ in progress_events]
+    assert "capture_timeout" in event_names
+    assert "capture_resumed" in event_names
+    assert result.final_segment_count >= 1
+
+    payload = json.loads(result.transcript_json_path.read_text(encoding="utf-8"))
+    capture_diagnostics = payload["capture_diagnostics"]
+    assert any(item["event"] == "capture_timeout" for item in capture_diagnostics)
+    assert any(item["event"] == "capture_resumed" for item in capture_diagnostics)
 
 
 def test_run_session_prints_crisp_feedback_by_default(monkeypatch, tmp_path, capsys) -> None:
@@ -1053,3 +1130,13 @@ def test_should_skip_asr_for_chunk_still_skips_true_silence() -> None:
     silent_pcm16 = struct.pack("<3200h", *([0] * 3200))
 
     assert _should_skip_asr_for_chunk(silent_pcm16, clarity_score=0.8) is True
+
+
+def test_should_skip_asr_for_chunk_keeps_active_speech_after_empty_streak() -> None:
+    voiced_pcm16 = struct.pack("<3200h", *([180] * 3200))
+
+    assert _should_skip_asr_for_chunk(
+        voiced_pcm16,
+        clarity_score=1.0,
+        recent_empty_streak=6,
+    ) is False

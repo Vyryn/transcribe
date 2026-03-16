@@ -178,6 +178,22 @@ def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str,
                 print(f"[final {fields['chunk_index']}] {text}")
             else:
                 print(text)
+            return
+        if event == "capture_timeout":
+            streak = int(fields.get("read_timeout_streak", 0))
+            stall_duration_sec = float(fields.get("stall_duration_sec", 0.0))
+            print(
+                "Capture stalled: "
+                f"{streak} consecutive read timeouts over {_format_buffered_audio_sec(stall_duration_sec)}."
+            )
+            if debug:
+                backend = fields.get("backend")
+                if isinstance(backend, dict):
+                    print(f"Capture diagnostics: {backend}")
+            return
+        if event == "capture_resumed":
+            stall_duration_sec = float(fields.get("stall_duration_sec", 0.0))
+            print(f"Capture resumed after {_format_buffered_audio_sec(stall_duration_sec)}.")
 
     return _report
 

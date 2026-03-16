@@ -455,6 +455,18 @@ class SessionPage(BasePage):
             if text:
                 self._append_transcript_line(text)
                 self.partial_text_var.set("")
+        elif name == "capture_timeout":
+            streak = int(fields.get("read_timeout_streak", 0))
+            stall_duration_sec = float(fields.get("stall_duration_sec", 0.0))
+            self.status_var.set("Waiting for audio")
+            self._append_transcript_line(
+                f"[capture] stalled after {streak} timeout{'s' if streak != 1 else ''} "
+                f"({stall_duration_sec:.1f}s)"
+            )
+        elif name == "capture_resumed":
+            stall_duration_sec = float(fields.get("stall_duration_sec", 0.0))
+            self.status_var.set("Capture resumed")
+            self._append_transcript_line(f"[capture] resumed after {stall_duration_sec:.1f}s")
         elif name == "notes_preparing":
             self.status_var.set("Preparing notes")
             self._begin_notes_progress_view()
@@ -1426,6 +1438,15 @@ class TranscribeUiApp:
             "model_id",
             "target_path",
             "chunk_index",
+            "reason",
+            "selected_source",
+            "audio_sec",
+            "inference_latency_ms",
+            "text_length",
+            "read_timeout_streak",
+            "stall_duration_sec",
+            "total_inference_sec",
+            "empty_output_streak",
         )
         details = ", ".join(f"{key}={progress.fields[key]}" for key in important_keys if key in progress.fields)
         if details:

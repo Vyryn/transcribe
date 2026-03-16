@@ -470,6 +470,47 @@ def test_windows_backend_translates_microphone_access_denied() -> None:
     assert "desktop apps access your microphone" in str(translated)
 
 
+def test_windows_backend_diagnostics_include_runtime_errors() -> None:
+    backend = WindowsAudioCaptureBackend(use_fixture=False)
+    backend._active_stream_names = ("mic",)
+    backend._consecutive_timeouts = 4
+    backend._dropped_callback_frames = 2
+    backend._callback_frame_count = 5
+    backend._queues = {"mic:0": queue.Queue(maxsize=4)}
+    backend._queues["mic:0"].put_nowait(
+        RawFrame(
+            stream="mic",
+            mono_pcm16=b"\x00\x00",
+            captured_at_monotonic_ns=time.monotonic_ns(),
+            sample_rate_hz=16_000,
+        )
+    )
+    backend._last_callback_monotonic_by_stream = {"mic:0": time.monotonic()}
+    backend._streams = {
+        "mic:0": type(
+            "_FakeFailedStream",
+            (),
+            {
+                "active": False,
+                "stopped": True,
+                "closed": False,
+                "_runtime_error": RuntimeError("device removed"),
+            },
+        )()
+    }
+
+    diagnostics = backend.diagnostics_snapshot()
+
+    assert diagnostics["consecutive_timeouts"] == 4
+    assert diagnostics["dropped_callback_frames"] == 2
+    assert diagnostics["callback_frame_count"] == 5
+    assert diagnostics["queue_depths"] == {"mic:0": 1}
+    stream_state = diagnostics["stream_states"]["mic:0"]
+    assert stream_state["active"] is False
+    assert stream_state["stopped"] is True
+    assert "device removed" in stream_state["runtime_error"]
+
+
 def test_patch_soundcard_numpy_fromstring_uses_frombuffer(monkeypatch: pytest.MonkeyPatch) -> None:
     class _FakeNumpyModule:
         def __init__(self) -> None:

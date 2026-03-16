@@ -343,6 +343,15 @@ def _emit_progress(
     progress_callback(event, dict(fields))
 
 
+def _capture_diagnostics_snapshot(backend: object) -> dict[str, object]:
+    """Return backend diagnostics when supported."""
+    snapshotter = getattr(backend, "diagnostics_snapshot", None)
+    if not callable(snapshotter):
+        return {}
+    snapshot = snapshotter()
+    return snapshot if isinstance(snapshot, dict) else {}
+
+
 @contextlib.contextmanager
 def _suppress_backend_output(enabled: bool) -> Iterator[None]:
     """Temporarily silence stdout/stderr from chatty backend libraries."""
@@ -548,8 +557,14 @@ def _should_skip_asr_for_chunk(
     if backlog_ratio > 0.50 and (clarity_score < 1.90 or active_ratio < 0.15):
         return True
 
-    # If we recently produced repeated empty outputs, suppress more low-information chunks.
-    if recent_empty_streak >= 2 and (clarity_score < 2.00 or rms_db < -34.0):
+    # Repeated empty outputs can justify skipping clearly weak follow-up chunks,
+    # but should not lock the session out of continued active speech.
+    if (
+        recent_empty_streak >= 2
+        and clarity_score < 1.20
+        and rms_db < -34.0
+        and active_ratio < 0.20
+    ):
         return True
 
     return False
@@ -639,9 +654,47 @@ def run_live_transcription_session(
     interrupted = False
     previous_final_text = ""
     session_started_monotonic = time.monotonic()
+    capture_diagnostics: list[dict[str, object]] = []
+    read_timeout_streak = 0
+    read_stall_started_monotonic = 0.0
+    last_timeout_reported_streak = 0
+    last_timeout_reported_monotonic = 0.0
+    last_loop_heartbeat_monotonic = 0.0
 
     def _cancel_requested() -> bool:
         return cancel_event is not None and cancel_event.is_set()
+
+    def _record_capture_diagnostic(
+        event: str,
+        *,
+        include_progress: bool,
+        write_handle: object | None = None,
+    ) -> None:
+        nonlocal last_timeout_reported_monotonic, last_timeout_reported_streak
+        now_monotonic = time.monotonic()
+        diagnostics = _capture_diagnostics_snapshot(backend)
+        payload = {
+            "event": event,
+            "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+            "read_timeout_streak": read_timeout_streak,
+            "stall_duration_sec": round(max(0.0, now_monotonic - read_stall_started_monotonic), 3)
+            if read_stall_started_monotonic > 0
+            else 0.0,
+            "backend": diagnostics,
+        }
+        capture_diagnostics.append(payload)
+        if write_handle is not None:
+            _write_event(payload, write_handle)
+        if include_progress:
+            _emit_progress(
+                progress_callback,
+                event,
+                read_timeout_streak=payload["read_timeout_streak"],
+                stall_duration_sec=payload["stall_duration_sec"],
+                backend=diagnostics,
+            )
+        last_timeout_reported_monotonic = now_monotonic
+        last_timeout_reported_streak = read_timeout_streak
 
     _emit_progress(
         progress_callback,
@@ -692,7 +745,24 @@ def run_live_transcription_session(
                 if _cancel_requested():
                     interrupted = True
                     break
+                read_timeout_streak += 1
+                if read_stall_started_monotonic <= 0.0:
+                    read_stall_started_monotonic = time.monotonic()
+                if (
+                    read_timeout_streak == 1
+                    or read_timeout_streak >= 3
+                    and (
+                        read_timeout_streak > last_timeout_reported_streak
+                        or (time.monotonic() - last_timeout_reported_monotonic) >= 1.0
+                    )
+                ):
+                    _record_capture_diagnostic("capture_timeout", include_progress=True)
                 continue
+            if read_timeout_streak > 0:
+                _record_capture_diagnostic("capture_resumed", include_progress=True)
+                read_timeout_streak = 0
+                read_stall_started_monotonic = 0.0
+                last_timeout_reported_streak = 0
             for source_name, frame in frames.items():
                 source_buffer = chunk_pcm16_by_source.setdefault(source_name, bytearray())
                 source_buffer.extend(frame.mono_pcm16)
@@ -768,7 +838,32 @@ def run_live_transcription_session(
                     except TimeoutError:
                         if _cancel_requested():
                             raise KeyboardInterrupt
+                        read_timeout_streak += 1
+                        if read_stall_started_monotonic <= 0.0:
+                            read_stall_started_monotonic = time.monotonic()
+                        if (
+                            read_timeout_streak == 1
+                            or read_timeout_streak >= 3
+                            and (
+                                read_timeout_streak > last_timeout_reported_streak
+                                or (time.monotonic() - last_timeout_reported_monotonic) >= 1.0
+                            )
+                        ):
+                            _record_capture_diagnostic(
+                                "capture_timeout",
+                                include_progress=True,
+                                write_handle=events_file,
+                            )
                         continue
+                    if read_timeout_streak > 0:
+                        _record_capture_diagnostic(
+                            "capture_resumed",
+                            include_progress=True,
+                            write_handle=events_file,
+                        )
+                        read_timeout_streak = 0
+                        read_stall_started_monotonic = 0.0
+                        last_timeout_reported_streak = 0
 
                     for source_name, frame in frames.items():
                         source_buffer = chunk_pcm16_by_source.setdefault(source_name, bytearray())
@@ -778,6 +873,16 @@ def run_live_transcription_session(
                         chunk_pcm16_by_source,
                         bytes_per_second=bytes_per_second,
                     )
+                    if (now - last_loop_heartbeat_monotonic) >= 5.0:
+                        _emit_progress(
+                            progress_callback,
+                            "loop_heartbeat",
+                            chunk_index=chunk_index,
+                            buffered_audio_sec=buffered_audio_sec,
+                            total_inference_sec=round(total_inference_ms / 1000.0, 3),
+                            empty_output_streak=empty_output_streak,
+                        )
+                        last_loop_heartbeat_monotonic = now
 
                     if config.partial_interval_sec > 0 and (now - last_partial_at) >= config.partial_interval_sec:
                         if buffered_audio_sec < 0.5:
@@ -859,20 +964,53 @@ def run_live_transcription_session(
                         recent_empty_streak=empty_output_streak,
                     ):
                         skipped_silence_chunks += 1
+                        _emit_progress(
+                            progress_callback,
+                            "chunk_skipped",
+                            chunk_index=chunk_index,
+                            reason="silence_gate",
+                            selected_source=selected_source,
+                            audio_sec=round(selected_audio_sec, 3),
+                            buffered_audio_sec=round(buffered_audio_sec, 3),
+                        )
                         source_selection_counts[selected_source] = source_selection_counts.get(selected_source, 0) + 1
                         total_audio_bytes += len(selected_pcm16)
-                        empty_output_streak += 1
                         chunk_index += 1
                         chunk_started = now
                         last_partial_at = now
                         last_partial_text = ""
                         chunk_pcm16_by_source = {}
                         continue
+                    _emit_progress(
+                        progress_callback,
+                        "chunk_transcribe_started",
+                        chunk_index=chunk_index,
+                        selected_source=selected_source,
+                        audio_sec=round(selected_audio_sec, 3),
+                        buffered_audio_sec=round(buffered_audio_sec, 3),
+                        backlog_ratio=round(backlog_ratio, 3),
+                    )
                     text, latency_ms = _transcribe_chunk_with_progress(selected_pcm16)
                     total_inference_ms += latency_ms
+                    _emit_progress(
+                        progress_callback,
+                        "chunk_transcribe_completed",
+                        chunk_index=chunk_index,
+                        selected_source=selected_source,
+                        inference_latency_ms=round(latency_ms, 3),
+                        text_length=len(text),
+                    )
 
                     if not text:
                         dropped_empty_chunk_count += 1
+                        _emit_progress(
+                            progress_callback,
+                            "chunk_dropped",
+                            chunk_index=chunk_index,
+                            reason="empty_transcript",
+                            selected_source=selected_source,
+                            inference_latency_ms=round(latency_ms, 3),
+                        )
                         source_selection_counts[selected_source] = source_selection_counts.get(selected_source, 0) + 1
                         total_audio_bytes += len(selected_pcm16)
                         empty_output_streak += 1
@@ -981,7 +1119,6 @@ def run_live_transcription_session(
                 skipped_silence_chunks += 1
                 source_selection_counts[selected_source] = source_selection_counts.get(selected_source, 0) + 1
                 total_audio_bytes += len(selected_pcm16)
-                empty_output_streak += 1
                 selected_source = ""
             else:
                 text, latency_ms = _transcribe_chunk_with_progress(selected_pcm16)
@@ -1075,6 +1212,7 @@ def run_live_transcription_session(
             "dropped_empty_chunk_count": dropped_empty_chunk_count,
             "source_selection_counts": source_selection_counts,
         },
+        "capture_diagnostics": capture_diagnostics,
         "final_segments": final_segments,
     }
     transcript_json_path.write_text(json.dumps(transcript_payload, indent=2, ensure_ascii=True), encoding="utf-8")

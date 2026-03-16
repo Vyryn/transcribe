@@ -150,6 +150,13 @@ class LinuxAudioCaptureBackend:
         self._timeout_recovery_threshold = 3
         self._last_recovery_attempt_monotonic = 0.0
         self._recovery_cooldown_sec = 1.0
+        self._callback_frame_count = 0
+        self._last_callback_monotonic_by_stream: dict[str, float] = {}
+        self._last_successful_read_monotonic = 0.0
+        self._recovery_attempt_count = 0
+        self._recovery_success_count = 0
+        self._recovery_failure_count = 0
+        self._last_recovery_error = ""
 
     @property
     def dropped_callback_frames(self) -> int:
@@ -229,6 +236,13 @@ class LinuxAudioCaptureBackend:
         self._preferred_stream_key = {}
         self._streams.clear()
         self._consecutive_timeouts = 0
+        self._callback_frame_count = 0
+        self._last_callback_monotonic_by_stream = {}
+        self._last_successful_read_monotonic = 0.0
+        self._recovery_attempt_count = 0
+        self._recovery_success_count = 0
+        self._recovery_failure_count = 0
+        self._last_recovery_error = ""
 
         if self._sample_rate_hz <= 0:
             raise ValueError("sample_rate_hz must be > 0")
@@ -715,6 +729,8 @@ class LinuxAudioCaptureBackend:
                 captured_at_monotonic_ns=time.monotonic_ns(),
                 sample_rate_hz=frame_sample_rate_hz,
             )
+            self._callback_frame_count += 1
+            self._last_callback_monotonic_by_stream[stream_key] = time.monotonic()
             try:
                 self._queues[stream_key].put_nowait(raw_frame)
             except queue.Full:
@@ -870,16 +886,62 @@ class LinuxAudioCaptureBackend:
         if (now - self._last_recovery_attempt_monotonic) < self._recovery_cooldown_sec:
             return
         self._last_recovery_attempt_monotonic = now
+        self._recovery_attempt_count += 1
 
         try:
             self.close()
             self.open(self.config)
         except Exception as exc:  # noqa: BLE001
+            self._recovery_failure_count += 1
+            self._last_recovery_error = f"{type(exc).__name__}: {exc}"
             LOGGER.warning("Capture stalled; waiting for audio device recovery: %s", exc)
             return
 
         self._consecutive_timeouts = 0
+        self._recovery_success_count += 1
+        self._last_recovery_error = ""
         LOGGER.warning("Capture stream recovered after device interruption.")
+
+    def diagnostics_snapshot(self) -> dict[str, object]:
+        """Return a best-effort snapshot of capture health and recovery state."""
+        now = time.monotonic()
+        stream_states: dict[str, dict[str, object]] = {}
+        for stream_key, stream in self._streams.items():
+            last_callback = self._last_callback_monotonic_by_stream.get(stream_key)
+            stream_states[stream_key] = {
+                "active": bool(getattr(stream, "active", False)),
+                "stopped": bool(getattr(stream, "stopped", False)),
+                "closed": bool(getattr(stream, "closed", False)),
+                "last_callback_age_sec": round(now - last_callback, 3) if last_callback is not None else None,
+                "runtime_error": self._stream_runtime_error(stream),
+            }
+
+        queue_depths = {stream_key: queue_ref.qsize() for stream_key, queue_ref in self._queues.items()}
+        last_success_age_sec = None
+        if self._last_successful_read_monotonic > 0:
+            last_success_age_sec = round(now - self._last_successful_read_monotonic, 3)
+
+        return {
+            "active_stream_names": list(self._active_stream_names),
+            "consecutive_timeouts": self._consecutive_timeouts,
+            "dropped_callback_frames": self._dropped_callback_frames,
+            "callback_frame_count": self._callback_frame_count,
+            "last_successful_read_age_sec": last_success_age_sec,
+            "recovery_attempt_count": self._recovery_attempt_count,
+            "recovery_success_count": self._recovery_success_count,
+            "recovery_failure_count": self._recovery_failure_count,
+            "last_recovery_error": self._last_recovery_error,
+            "queue_depths": queue_depths,
+            "stream_states": stream_states,
+        }
+
+    @staticmethod
+    def _stream_runtime_error(stream: Any) -> str:
+        """Return a stringified runtime error for one stream when available."""
+        runtime_error = getattr(stream, "_runtime_error", None)
+        if runtime_error is None:
+            return ""
+        return f"{type(runtime_error).__name__}: {runtime_error}"
 
     def read_frames(self, timeout_ms: int = 500) -> dict[str, RawFrame]:
         """Read one frame per active source group.
@@ -923,6 +985,7 @@ class LinuxAudioCaptureBackend:
             raise
 
         self._consecutive_timeouts = 0
+        self._last_successful_read_monotonic = time.monotonic()
         return output
 
     def close(self) -> None:

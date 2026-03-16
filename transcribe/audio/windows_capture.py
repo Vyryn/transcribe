@@ -528,6 +528,8 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
                 captured_at_monotonic_ns=time.monotonic_ns(),
                 sample_rate_hz=frame_sample_rate_hz,
             )
+            self._callback_frame_count += 1
+            self._last_callback_monotonic_by_stream[stream_key] = time.monotonic()
             try:
                 self._queues[stream_key].put_nowait(raw_frame)
             except queue.Full:
