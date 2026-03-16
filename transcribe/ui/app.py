@@ -12,9 +12,14 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
 from transcribe.models import AudioSourceMode
-from transcribe.runtime_env import RuntimeMode, detect_runtime_mode, resolve_app_runtime_paths, set_network_access_allowed
-from transcribe.ui.controller import ControllerMessage, UiTaskController
+from transcribe.runtime_env import (
+    RuntimeMode,
+    detect_runtime_mode,
+    resolve_app_runtime_paths,
+    set_network_access_allowed,
+)
 from transcribe.ui import services
+from transcribe.ui.controller import ControllerMessage, UiTaskController
 from transcribe.ui.preferences import UiPreferences, load_ui_preferences, save_ui_preferences
 from transcribe.ui.services import default_data_subdir
 from transcribe.ui.types import (
@@ -40,7 +45,7 @@ from transcribe.ui.types import (
 
 MAX_LOG_LINES = 2_000
 POLL_INTERVAL_MS = 75
-LOG_LEVEL_OPTIONS = ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')
+LOG_LEVEL_OPTIONS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 class StableCombobox(ttk.Combobox):
@@ -81,6 +86,7 @@ class BasePage(ttk.Frame):
 
     def set_advanced_mode(self, advanced: bool) -> None:
         """Show or hide advanced controls for this page."""
+
 
 class LogsPage(BasePage):
     """Global application log viewer."""
@@ -219,7 +225,9 @@ class SessionPage(BasePage):
         self.notes_model_combo.grid(row=1, column=2, columnspan=2, sticky="ew", pady=(0, 6))
 
         ttk.Label(self.advanced_content, text="Duration (sec)").grid(row=2, column=0, sticky="w")
-        ttk.Entry(self.advanced_content, textvariable=self.duration_var).grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Entry(self.advanced_content, textvariable=self.duration_var).grid(
+            row=3, column=0, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
         ttk.Label(self.advanced_content, text="Audio Source").grid(row=2, column=1, sticky="w")
         StableCombobox(
             self.advanced_content,
@@ -254,7 +262,9 @@ class SessionPage(BasePage):
         )
         self.speaker_combo.grid(row=5, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
         ttk.Label(self.advanced_content, text="Output Root").grid(row=4, column=2, sticky="w")
-        ttk.Entry(self.advanced_content, textvariable=self.output_root_var).grid(row=5, column=2, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Entry(self.advanced_content, textvariable=self.output_root_var).grid(
+            row=5, column=2, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
         ttk.Button(
             self.advanced_content,
             text="Browse",
@@ -262,19 +272,37 @@ class SessionPage(BasePage):
         ).grid(row=5, column=3, sticky="ew", pady=(0, 6))
 
         ttk.Label(self.advanced_content, text="Session Id").grid(row=6, column=0, sticky="w")
-        ttk.Entry(self.advanced_content, textvariable=self.session_id_var).grid(row=7, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Entry(self.advanced_content, textvariable=self.session_id_var).grid(
+            row=7, column=0, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
         ttk.Label(self.advanced_content, text="Chunk (sec)").grid(row=6, column=1, sticky="w")
-        ttk.Entry(self.advanced_content, textvariable=self.chunk_var).grid(row=7, column=1, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Entry(self.advanced_content, textvariable=self.chunk_var).grid(
+            row=7, column=1, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
         ttk.Label(self.advanced_content, text="Partial Interval").grid(row=6, column=2, sticky="w")
-        ttk.Entry(self.advanced_content, textvariable=self.partial_interval_var).grid(row=7, column=2, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Entry(self.advanced_content, textvariable=self.partial_interval_var).grid(
+            row=7, column=2, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
         ttk.Label(self.advanced_content, text="Chunk Overlap").grid(row=6, column=3, sticky="w")
-        ttk.Entry(self.advanced_content, textvariable=self.chunk_overlap_var).grid(row=7, column=3, sticky="ew", pady=(0, 6))
+        ttk.Entry(self.advanced_content, textvariable=self.chunk_overlap_var).grid(
+            row=7, column=3, sticky="ew", pady=(0, 6)
+        )
         ttk.Label(self.advanced_content, text="Max Model RAM").grid(row=8, column=0, sticky="w")
-        ttk.Entry(self.advanced_content, textvariable=self.max_model_ram_var).grid(row=9, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
-        ttk.Checkbutton(self.advanced_content, text="Fixture", variable=self.fixture_var).grid(row=9, column=1, sticky="w", pady=(0, 6))
-        ttk.Checkbutton(self.advanced_content, text="Single Device/Source", variable=self.single_device_var).grid(row=9, column=2, sticky="w", pady=(0, 6))
-        ttk.Checkbutton(self.advanced_content, text="Strict Sources", variable=self.strict_sources_var).grid(row=9, column=3, sticky="w", pady=(0, 6))
-        ttk.Checkbutton(self.advanced_content, text="Stitch Overlap", variable=self.stitch_overlap_var).grid(row=10, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(self.advanced_content, textvariable=self.max_model_ram_var).grid(
+            row=9, column=0, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
+        ttk.Checkbutton(self.advanced_content, text="Fixture", variable=self.fixture_var).grid(
+            row=9, column=1, sticky="w", pady=(0, 6)
+        )
+        ttk.Checkbutton(self.advanced_content, text="Single Device/Source", variable=self.single_device_var).grid(
+            row=9, column=2, sticky="w", pady=(0, 6)
+        )
+        ttk.Checkbutton(self.advanced_content, text="Strict Sources", variable=self.strict_sources_var).grid(
+            row=9, column=3, sticky="w", pady=(0, 6)
+        )
+        ttk.Checkbutton(self.advanced_content, text="Stitch Overlap", variable=self.stitch_overlap_var).grid(
+            row=10, column=0, sticky="w", pady=(4, 0)
+        )
 
         devices = ttk.LabelFrame(self, text="Available Devices")
         devices.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
@@ -290,15 +318,23 @@ class SessionPage(BasePage):
         ttk.Label(outputs, textvariable=self.status_var).grid(row=0, column=1, sticky="w")
         ttk.Label(outputs, text="Session Dir").grid(row=1, column=0, sticky="w")
         ttk.Entry(outputs, textvariable=self.session_dir_var).grid(row=1, column=1, sticky="ew", padx=(6, 6))
-        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.session_dir_var)).grid(row=1, column=2, sticky="ew")
+        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.session_dir_var)).grid(
+            row=1, column=2, sticky="ew"
+        )
         ttk.Label(outputs, text="Transcript").grid(row=2, column=0, sticky="w")
         ttk.Entry(outputs, textvariable=self.transcript_path_var).grid(row=2, column=1, sticky="ew", padx=(6, 6))
-        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.transcript_path_var)).grid(row=2, column=2, sticky="ew")
+        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.transcript_path_var)).grid(
+            row=2, column=2, sticky="ew"
+        )
         ttk.Label(outputs, text="Notes").grid(row=3, column=0, sticky="w")
         ttk.Entry(outputs, textvariable=self.notes_path_var).grid(row=3, column=1, sticky="ew", padx=(6, 6))
-        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.notes_path_var)).grid(row=3, column=2, sticky="ew")
+        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.notes_path_var)).grid(
+            row=3, column=2, sticky="ew"
+        )
         ttk.Label(outputs, text="Current Partial").grid(row=4, column=0, sticky="nw")
-        ttk.Label(outputs, textvariable=self.partial_text_var, wraplength=420, justify="left").grid(row=4, column=1, columnspan=2, sticky="w")
+        ttk.Label(outputs, textvariable=self.partial_text_var, wraplength=420, justify="left").grid(
+            row=4, column=1, columnspan=2, sticky="w"
+        )
 
         self.transcript_frame = ttk.LabelFrame(self, text="Final Transcript")
         self.transcript_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
@@ -460,8 +496,7 @@ class SessionPage(BasePage):
             stall_duration_sec = float(fields.get("stall_duration_sec", 0.0))
             self.status_var.set("Waiting for audio")
             self._append_transcript_line(
-                f"[capture] stalled after {streak} timeout{'s' if streak != 1 else ''} "
-                f"({stall_duration_sec:.1f}s)"
+                f"[capture] stalled after {streak} timeout{'s' if streak != 1 else ''} ({stall_duration_sec:.1f}s)"
             )
         elif name == "capture_resumed":
             stall_duration_sec = float(fields.get("stall_duration_sec", 0.0))
@@ -546,7 +581,9 @@ class SessionPage(BasePage):
         elif name == "transcription_resources_released":
             released_models = fields.get("released_models")
             if isinstance(released_models, int):
-                self._append_transcript_line(f"Released transcription resources ({released_models} model cache entr{'y' if released_models == 1 else 'ies'})")
+                self._append_transcript_line(
+                    f"Released transcription resources ({released_models} model cache entr{'y' if released_models == 1 else 'ies'})"
+                )
 
     def handle_result(self, result: object) -> None:
         assert isinstance(result, SessionResultSummary)
@@ -569,6 +606,7 @@ class SessionPage(BasePage):
         self.start_button.configure(state="disabled" if busy else "normal")
         self.refresh_button.configure(state="disabled" if busy else "normal")
         self.stop_button.configure(state="normal" if busy and cancelable else "disabled")
+
 
 class CapturePage(BasePage):
     """Audio capture workflow page."""
@@ -621,7 +659,9 @@ class CapturePage(BasePage):
         for index in range(4):
             self.advanced_frame.columnconfigure(index, weight=1)
         ttk.Label(self.advanced_frame, text="Duration (sec)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(self.advanced_frame, textvariable=self.duration_var).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ttk.Entry(self.advanced_frame, textvariable=self.duration_var).grid(
+            row=1, column=0, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
         ttk.Label(self.advanced_frame, text="Audio Source").grid(row=0, column=1, sticky="w")
         StableCombobox(
             self.advanced_frame,
@@ -648,11 +688,19 @@ class CapturePage(BasePage):
         self.refresh_button = ttk.Button(self.advanced_frame, text="Refresh Devices", command=self.refresh_devices)
         self.refresh_button.grid(row=2, column=3, sticky="ew", pady=(0, 6))
         ttk.Label(self.advanced_frame, text="Output Root").grid(row=2, column=0, sticky="w")
-        ttk.Entry(self.advanced_frame, textvariable=self.output_root_var).grid(row=3, column=0, columnspan=3, sticky="ew", padx=(0, 6), pady=(0, 6))
-        ttk.Button(self.advanced_frame, text="Browse", command=lambda: self.app.choose_directory(self.output_root_var)).grid(row=3, column=3, sticky="ew", pady=(0, 6))
+        ttk.Entry(self.advanced_frame, textvariable=self.output_root_var).grid(
+            row=3, column=0, columnspan=3, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
+        ttk.Button(
+            self.advanced_frame, text="Browse", command=lambda: self.app.choose_directory(self.output_root_var)
+        ).grid(row=3, column=3, sticky="ew", pady=(0, 6))
         ttk.Label(self.advanced_frame, text="Session Id").grid(row=4, column=0, sticky="w")
-        ttk.Entry(self.advanced_frame, textvariable=self.session_id_var).grid(row=5, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
-        ttk.Checkbutton(self.advanced_frame, text="Fixture", variable=self.fixture_var).grid(row=5, column=1, sticky="w", pady=(0, 6))
+        ttk.Entry(self.advanced_frame, textvariable=self.session_id_var).grid(
+            row=5, column=0, sticky="ew", padx=(0, 6), pady=(0, 6)
+        )
+        ttk.Checkbutton(self.advanced_frame, text="Fixture", variable=self.fixture_var).grid(
+            row=5, column=1, sticky="w", pady=(0, 6)
+        )
 
         devices = ttk.LabelFrame(self, text="Available Devices")
         devices.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
@@ -668,10 +716,14 @@ class CapturePage(BasePage):
         ttk.Label(outputs, textvariable=self.status_var).grid(row=0, column=1, sticky="w")
         ttk.Label(outputs, text="Session Dir").grid(row=1, column=0, sticky="w")
         ttk.Entry(outputs, textvariable=self.session_dir_var).grid(row=1, column=1, sticky="ew", padx=(6, 6))
-        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.session_dir_var)).grid(row=1, column=2, sticky="ew")
+        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.session_dir_var)).grid(
+            row=1, column=2, sticky="ew"
+        )
         ttk.Label(outputs, text="Manifest").grid(row=2, column=0, sticky="w")
         ttk.Entry(outputs, textvariable=self.manifest_path_var).grid(row=2, column=1, sticky="ew", padx=(6, 6))
-        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.manifest_path_var)).grid(row=2, column=2, sticky="ew")
+        ttk.Button(outputs, text="Open", command=lambda: self.app.open_path_var(self.manifest_path_var)).grid(
+            row=2, column=2, sticky="ew"
+        )
         self.set_advanced_mode(False)
 
     def _prepare_launch_paths(self) -> tuple[Path, str, Path]:
@@ -740,12 +792,15 @@ class CapturePage(BasePage):
         assert isinstance(result, CaptureResultSummary)
         self.session_dir_var.set(str(result.session_dir))
         self.manifest_path_var.set(str(result.manifest_path))
-        self.status_var.set("Capture stopped" if result.interrupted else f"Capture complete ({result.pair_count} pairs)")
+        self.status_var.set(
+            "Capture stopped" if result.interrupted else f"Capture complete ({result.pair_count} pairs)"
+        )
 
     def set_busy(self, busy: bool, *, cancelable: bool) -> None:
         self.start_button.configure(state="disabled" if busy else "normal")
         self.refresh_button.configure(state="disabled" if busy else "normal")
         self.stop_button.configure(state="normal" if busy and cancelable else "disabled")
+
 
 class NotesPage(BasePage):
     """Post-session notes workflow page."""
@@ -769,26 +824,44 @@ class NotesPage(BasePage):
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         controls.columnconfigure(1, weight=1)
         ttk.Label(controls, text="Transcript").grid(row=0, column=0, sticky="w")
-        ttk.Entry(controls, textvariable=self.transcript_var).grid(row=0, column=1, sticky="ew", padx=(6, 6), pady=(0, 6))
-        ttk.Button(controls, text="Browse", command=lambda: self.app.choose_file(self.transcript_var)).grid(row=0, column=2, sticky="ew")
+        ttk.Entry(controls, textvariable=self.transcript_var).grid(
+            row=0, column=1, sticky="ew", padx=(6, 6), pady=(0, 6)
+        )
+        ttk.Button(controls, text="Browse", command=lambda: self.app.choose_file(self.transcript_var)).grid(
+            row=0, column=2, sticky="ew"
+        )
         ttk.Label(controls, text="Output Dir").grid(row=1, column=0, sticky="w")
-        ttk.Entry(controls, textvariable=self.output_dir_var).grid(row=1, column=1, sticky="ew", padx=(6, 6), pady=(0, 6))
-        ttk.Button(controls, text="Browse", command=lambda: self.app.choose_directory(self.output_dir_var)).grid(row=1, column=2, sticky="ew")
+        ttk.Entry(controls, textvariable=self.output_dir_var).grid(
+            row=1, column=1, sticky="ew", padx=(6, 6), pady=(0, 6)
+        )
+        ttk.Button(controls, text="Browse", command=lambda: self.app.choose_directory(self.output_dir_var)).grid(
+            row=1, column=2, sticky="ew"
+        )
         ttk.Label(controls, text="Model").grid(row=2, column=0, sticky="w")
-        self.model_combo = StableCombobox(controls, textvariable=self.model_var, values=self.model_choices, state="readonly")
+        self.model_combo = StableCombobox(
+            controls, textvariable=self.model_var, values=self.model_choices, state="readonly"
+        )
         self.model_combo.grid(row=2, column=1, sticky="ew", padx=(6, 6), pady=(0, 6))
         ttk.Label(controls, text="Runtime").grid(row=3, column=0, sticky="w")
-        StableCombobox(controls, textvariable=self.runtime_var, values=["auto", "ollama", "llama_cpp"], state="readonly").grid(row=3, column=1, sticky="ew", padx=(6, 6), pady=(0, 6))
+        StableCombobox(
+            controls, textvariable=self.runtime_var, values=["auto", "ollama", "llama_cpp"], state="readonly"
+        ).grid(row=3, column=1, sticky="ew", padx=(6, 6), pady=(0, 6))
         self.start_button = ttk.Button(controls, text="Run Notes", command=self.start)
         self.start_button.grid(row=3, column=2, sticky="ew")
         ttk.Label(controls, text="Status").grid(row=4, column=0, sticky="w")
         ttk.Label(controls, textvariable=self.status_var).grid(row=4, column=1, sticky="w")
         ttk.Label(controls, text="Clean Transcript").grid(row=5, column=0, sticky="w")
-        ttk.Entry(controls, textvariable=self.clean_path_var).grid(row=5, column=1, sticky="ew", padx=(6, 6), pady=(0, 6))
-        ttk.Button(controls, text="Open", command=lambda: self.app.open_path_var(self.clean_path_var)).grid(row=5, column=2, sticky="ew")
+        ttk.Entry(controls, textvariable=self.clean_path_var).grid(
+            row=5, column=1, sticky="ew", padx=(6, 6), pady=(0, 6)
+        )
+        ttk.Button(controls, text="Open", command=lambda: self.app.open_path_var(self.clean_path_var)).grid(
+            row=5, column=2, sticky="ew"
+        )
         ttk.Label(controls, text="Client Notes").grid(row=6, column=0, sticky="w")
         ttk.Entry(controls, textvariable=self.notes_path_var).grid(row=6, column=1, sticky="ew", padx=(6, 6))
-        ttk.Button(controls, text="Open", command=lambda: self.app.open_path_var(self.notes_path_var)).grid(row=6, column=2, sticky="ew")
+        ttk.Button(controls, text="Open", command=lambda: self.app.open_path_var(self.notes_path_var)).grid(
+            row=6, column=2, sticky="ew"
+        )
 
         log_frame = ttk.LabelFrame(self, text="Notes Progress")
         log_frame.grid(row=1, column=0, sticky="nsew")
@@ -884,7 +957,13 @@ class ModelsPage(BasePage):
             self.status_var.set(result.error)
             return
         for item in result.items:
-            self.tree.insert("", tk.END, iid=item.model_id, text=item.model_id, values=(item.kind, item.install_class, "installed" if item.installed else "not installed"))
+            self.tree.insert(
+                "",
+                tk.END,
+                iid=item.model_id,
+                text=item.model_id,
+                values=(item.kind, item.install_class, "installed" if item.installed else "not installed"),
+            )
         self.status_var.set(f"Loaded {len(result.items)} models")
 
     def install_selected(self) -> None:
@@ -981,12 +1060,21 @@ class BenchPage(BasePage):
         run_frame.columnconfigure(1, weight=1)
         self.notebook.add(run_frame, text="Run Benchmark")
         ttk.Label(run_frame, text="Scenario").grid(row=0, column=0, sticky="w")
-        StableCombobox(run_frame, textvariable=self.run_scenario_var, values=["hf_diarized_transcription", "capture_sync"], state="readonly").grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        StableCombobox(
+            run_frame,
+            textvariable=self.run_scenario_var,
+            values=["hf_diarized_transcription", "capture_sync"],
+            state="readonly",
+        ).grid(row=0, column=1, sticky="ew", pady=(0, 6))
         self._bench_entry(run_frame, 1, "Runs", self.run_runs_var)
         self._bench_entry(run_frame, 2, "Duration", self.run_duration_var)
         self._bench_entry(run_frame, 3, "Output Dir", self.run_output_var)
-        ttk.Button(run_frame, text="Browse", command=lambda: self.app.choose_directory(self.run_output_var)).grid(row=3, column=2, sticky="ew", padx=(6, 0))
-        ttk.Checkbutton(run_frame, text="Use Real Devices", variable=self.run_real_devices_var).grid(row=4, column=1, sticky="w")
+        ttk.Button(run_frame, text="Browse", command=lambda: self.app.choose_directory(self.run_output_var)).grid(
+            row=3, column=2, sticky="ew", padx=(6, 0)
+        )
+        ttk.Checkbutton(run_frame, text="Use Real Devices", variable=self.run_real_devices_var).grid(
+            row=4, column=1, sticky="w"
+        )
         self._bench_entry(run_frame, 5, "Dataset", self.run_dataset_var)
         self._bench_entry(run_frame, 6, "Config", self.run_config_var)
         self._bench_entry(run_frame, 7, "Split", self.run_split_var)
@@ -997,10 +1085,14 @@ class BenchPage(BasePage):
         self.run_button.grid(row=11, column=1, sticky="e", pady=(12, 0))
         ttk.Label(run_frame, text="JSON Report").grid(row=12, column=0, sticky="w")
         ttk.Entry(run_frame, textvariable=self.json_path_var).grid(row=12, column=1, sticky="ew", pady=(6, 6))
-        ttk.Button(run_frame, text="Open", command=lambda: self.app.open_path_var(self.json_path_var)).grid(row=12, column=2, sticky="ew", padx=(6, 0))
+        ttk.Button(run_frame, text="Open", command=lambda: self.app.open_path_var(self.json_path_var)).grid(
+            row=12, column=2, sticky="ew", padx=(6, 0)
+        )
         ttk.Label(run_frame, text="Markdown Report").grid(row=13, column=0, sticky="w")
         ttk.Entry(run_frame, textvariable=self.markdown_path_var).grid(row=13, column=1, sticky="ew")
-        ttk.Button(run_frame, text="Open", command=lambda: self.app.open_path_var(self.markdown_path_var)).grid(row=13, column=2, sticky="ew", padx=(6, 0))
+        ttk.Button(run_frame, text="Open", command=lambda: self.app.open_path_var(self.markdown_path_var)).grid(
+            row=13, column=2, sticky="ew", padx=(6, 0)
+        )
 
         status_frame = ttk.Frame(self)
         status_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -1021,11 +1113,17 @@ class BenchPage(BasePage):
             max_model_ram_gb=float(self.init_ram_var.get() or 8.0),
         )
         self.status_var.set("Initializing benchmark cache...")
-        self.app.start_task("bench-init", lambda cancel, progress: services.initialize_bench_assets(request), on_result=self.handle_init_result)
+        self.app.start_task(
+            "bench-init",
+            lambda cancel, progress: services.initialize_bench_assets(request),
+            on_result=self.handle_init_result,
+        )
 
     def handle_init_result(self, result: object) -> None:
         assert isinstance(result, BenchmarkInitResultSummary)
-        self.status_var.set(f"Cached {result.payload.get('transcription_model', '')} and {result.payload.get('dataset_id', '')}")
+        self.status_var.set(
+            f"Cached {result.payload.get('transcription_model', '')} and {result.payload.get('dataset_id', '')}"
+        )
 
     def start_run(self) -> None:
         request = BenchmarkRunRequest(
@@ -1043,7 +1141,9 @@ class BenchPage(BasePage):
             max_model_ram_gb=float(self.run_ram_var.get() or 8.0),
         )
         self.status_var.set("Running benchmark...")
-        self.app.start_task("bench-run", lambda cancel, progress: services.run_benchmark(request), on_result=self.handle_run_result)
+        self.app.start_task(
+            "bench-run", lambda cancel, progress: services.run_benchmark(request), on_result=self.handle_run_result
+        )
 
     def handle_run_result(self, result: object) -> None:
         assert isinstance(result, BenchmarkRunResultSummary)
@@ -1075,7 +1175,9 @@ class CompliancePage(BasePage):
         ttk.Button(controls, text="Check No Network", command=self.run_network).pack(side="left")
         ttk.Button(controls, text="Check No URLs", command=self.run_urls).pack(side="left", padx=(6, 0))
         ttk.Entry(controls, textvariable=self.urls_target_var, width=60).pack(side="left", padx=(12, 6))
-        ttk.Button(controls, text="Browse", command=lambda: self.app.choose_directory(self.urls_target_var)).pack(side="left")
+        ttk.Button(controls, text="Browse", command=lambda: self.app.choose_directory(self.urls_target_var)).pack(
+            side="left"
+        )
         ttk.Label(controls, textvariable=self.status_var).pack(side="right")
 
         self.text = ScrolledText(self, wrap="word")
@@ -1095,7 +1197,9 @@ class CompliancePage(BasePage):
         target = Path(self.urls_target_var.get().strip()) if self.urls_target_var.get().strip() else None
         self.app.start_task(
             "compliance-urls",
-            lambda cancel, progress: services.run_compliance_check_no_urls(common=self.app.common_options(), target_path=target),
+            lambda cancel, progress: services.run_compliance_check_no_urls(
+                common=self.app.common_options(), target_path=target
+            ),
             on_result=self.handle_result,
         )
 
@@ -1113,19 +1217,24 @@ class CompliancePage(BasePage):
         self.text.configure(state="disabled")
         self.status_var.set(line)
 
+
 class TranscribeUiApp:
     """Tkinter application shell for `transcribe`."""
 
     def __init__(self, root: tk.Tk, *, packaged_runtime: bool | None = None) -> None:
         self.root = root
-        self.root.title("transcribe UI")
+        self.root.title("Transcribe; the offline therapy session note taker")
         self.root.geometry("980x680")
         self.root.minsize(900, 620)
         self.controller = UiTaskController()
         self._active_binding: TaskBinding | None = None
         self._log_lines: list[str] = []
         self._devices: tuple[DeviceInfo, ...] = ()
-        runtime_mode = detect_runtime_mode() if packaged_runtime is None else (RuntimeMode.PACKAGED if packaged_runtime else RuntimeMode.DEVELOPMENT)
+        runtime_mode = (
+            detect_runtime_mode()
+            if packaged_runtime is None
+            else (RuntimeMode.PACKAGED if packaged_runtime else RuntimeMode.DEVELOPMENT)
+        )
         self.packaged_runtime = runtime_mode == RuntimeMode.PACKAGED
         self.preferences = load_ui_preferences()
         set_network_access_allowed(self.preferences.allow_network)
@@ -1196,8 +1305,12 @@ class TranscribeUiApp:
         self.global_advanced_frame.columnconfigure(1, weight=1)
         ttk.Label(self.global_advanced_frame, text="Runtime Config").grid(row=0, column=0, sticky="w")
         self.config_path_var = tk.StringVar(value="")
-        ttk.Entry(self.global_advanced_frame, textvariable=self.config_path_var).grid(row=0, column=1, sticky="ew", padx=(8, 6))
-        ttk.Button(self.global_advanced_frame, text="Browse", command=lambda: self.choose_file(self.config_path_var)).grid(row=0, column=2, sticky="ew")
+        ttk.Entry(self.global_advanced_frame, textvariable=self.config_path_var).grid(
+            row=0, column=1, sticky="ew", padx=(8, 6)
+        )
+        ttk.Button(
+            self.global_advanced_frame, text="Browse", command=lambda: self.choose_file(self.config_path_var)
+        ).grid(row=0, column=2, sticky="ew")
         ttk.Label(self.global_advanced_frame, text="Log Level").grid(row=0, column=3, sticky="w", padx=(12, 0))
         self.log_level_var = tk.StringVar(value=services.DEFAULT_LOG_LEVEL)
         self.log_level_combo = StableCombobox(
@@ -1231,10 +1344,12 @@ class TranscribeUiApp:
         ]
         if not self.packaged_runtime:
             page_specs.append(("bench", BenchPage))
-        page_specs.extend([
-            ("compliance", CompliancePage),
-            ("logs", LogsPage),
-        ])
+        page_specs.extend(
+            [
+                ("compliance", CompliancePage),
+                ("logs", LogsPage),
+            ]
+        )
         for row, (page_id, page_type) in enumerate(page_specs):
             page = page_type(self.page_container, self)
             page.grid(row=0, column=0, sticky="nsew")
@@ -1244,7 +1359,9 @@ class TranscribeUiApp:
             self.nav_buttons[page_id] = button
 
         ttk.Separator(self.nav, orient="horizontal").grid(row=len(page_specs), column=0, sticky="ew", pady=(10, 10))
-        self.cancel_button = ttk.Button(self.nav, text="Stop Active Task", command=self.cancel_active_task, state="disabled")
+        self.cancel_button = ttk.Button(
+            self.nav, text="Stop Active Task", command=self.cancel_active_task, state="disabled"
+        )
         self.cancel_button.grid(row=len(page_specs) + 1, column=0, sticky="ew")
         self._apply_advanced_ui_state()
         self.show_page("session")
@@ -1463,7 +1580,11 @@ class TranscribeUiApp:
 
 def page_order(*, packaged_runtime: bool | None = None) -> tuple[str, ...]:
     """Return the visible UI page order for tests and packaged-mode checks."""
-    runtime_mode = detect_runtime_mode() if packaged_runtime is None else (RuntimeMode.PACKAGED if packaged_runtime else RuntimeMode.DEVELOPMENT)
+    runtime_mode = (
+        detect_runtime_mode()
+        if packaged_runtime is None
+        else (RuntimeMode.PACKAGED if packaged_runtime else RuntimeMode.DEVELOPMENT)
+    )
     pages = ["session", "capture", "notes", "models"]
     if runtime_mode != RuntimeMode.PACKAGED:
         pages.append("bench")
@@ -1481,5 +1602,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
