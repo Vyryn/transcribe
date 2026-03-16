@@ -39,7 +39,7 @@ from transcribe.runtime_env import PACKAGED_ACCURACY_TRANSCRIPTION_MODEL  # noqa
 APP_NAME = "Transcribe"
 MAIN_PATH = REPO_ROOT / "main.py"
 PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
-PROMPT_SOURCE_PATH = REPO_ROOT / "clinical note synthesis llm prompt.md"
+PROMPT_SOURCE_PATH = REPO_ROOT / "clinical_note_synthesis_llm_prompt.md"
 RELEASES_DIR = REPO_ROOT / "releases"
 WINDOWS_PACKAGING_DIR = REPO_ROOT / "packaging" / "windows"
 INSTALLER_TEMPLATE_PATH = WINDOWS_PACKAGING_DIR / "transcribe_installer.iss"

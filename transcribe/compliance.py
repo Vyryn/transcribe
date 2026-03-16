@@ -16,7 +16,7 @@ _EXCLUDED_FILENAMES = {
     "README.md",
     "REGULATORY_CHECKLIST.md",
     "REGULATOR_COMPLIANCE_POLICY.md",
-    "clinical note synthesis llm prompt.md",
+    "clinical_note_synthesis_llm_prompt.md",
     "uv.lock",
 }
 # Build without embedding literal URL tokens in source.

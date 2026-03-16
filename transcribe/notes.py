@@ -327,7 +327,7 @@ def default_notes_prompt_path() -> Path:
     runtime_paths = resolve_app_runtime_paths()
     if runtime_paths.mode == RuntimeMode.PACKAGED:
         return runtime_paths.notes_prompt_path
-    return Path(__file__).resolve().parent.parent / "clinical note synthesis llm prompt.md"
+    return Path(__file__).resolve().parent.parent / "clinical_note_synthesis_llm_prompt.md"
 
 
 def load_session_note_prompt(prompt_path: Path | None = None) -> str:
