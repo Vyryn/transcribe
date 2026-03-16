@@ -60,6 +60,8 @@ class FakeRuntimeFactory:
 def test_build_clean_transcript_prompt_embeds_rough_transcript() -> None:
     prompt = build_clean_transcript_prompt("rough transcript")
     assert "rough transcript" in prompt
+    assert "repairing a rough ASR transcript into a readable transcript" in prompt
+    assert "Remove only text that is clearly ASR garbage" in prompt
     assert "Return only the cleaned transcript text" in prompt
 
 

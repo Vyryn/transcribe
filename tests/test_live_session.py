@@ -98,7 +98,8 @@ def test_cli_parser_uses_larger_default_session_model() -> None:
         ]
     )
     assert args.transcription_model == "nvidia/parakeet-tdt-0.6b-v3"
-    assert args.chunk_overlap_sec == 0.75
+    assert args.chunk_overlap_sec == 1.0
+    assert args.chunk_sec == 6.0
     assert args.stitch_overlap_text is True
     assert args.partial_interval_sec == 0.0
 

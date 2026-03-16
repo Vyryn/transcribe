@@ -329,7 +329,7 @@ def build_parser(*, packaged_runtime: bool = False) -> argparse.ArgumentParser:
     session_run.add_argument(
         "--chunk-overlap-sec",
         type=float,
-        default=0.75,
+        default=1.0,
         help="Audio overlap carried into the next finalized chunk to reduce clipped boundaries",
     )
     session_run.add_argument(
@@ -344,7 +344,7 @@ def build_parser(*, packaged_runtime: bool = False) -> argparse.ArgumentParser:
         default=AudioSourceMode.BOTH,
         help="Source mode: mic, speakers, or both (default: both)",
     )
-    session_run.add_argument("--chunk-sec", type=float, default=4.0, help="Finalization chunk size in seconds")
+    session_run.add_argument("--chunk-sec", type=float, default=6.0, help="Finalization chunk size in seconds")
     session_run.add_argument(
         "--partial-interval-sec",
         type=float,

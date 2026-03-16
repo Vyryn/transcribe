@@ -82,10 +82,10 @@ class SessionRequest:
     common: UiCommonOptions
     transcription_model: str = DEFAULT_LIVE_TRANSCRIPTION_MODEL
     duration_sec: float = 0.0
-    chunk_overlap_sec: float = 0.75
+    chunk_overlap_sec: float = 1.0
     stitch_overlap_text: bool = True
     mode: AudioSourceMode = AudioSourceMode.BOTH
-    chunk_sec: float = 4.0
+    chunk_sec: float = 6.0
     partial_interval_sec: float = 0.0
     output_root: Path = Path("data/live_sessions")
     session_id: str | None = None

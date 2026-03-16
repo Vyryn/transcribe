@@ -34,19 +34,21 @@ _MODEL_LOADING_RETRY_TIMEOUT_SEC = 120.0
 _MODEL_LOADING_RETRY_INTERVAL_SEC = 0.5
 _EMPTY_MODEL_OUTPUT_RETRY_ATTEMPTS = 2
 _PROMPT_TIMEOUT_SEC = 1_800.0
-_CLEAN_TRANSCRIPT_PROMPT = """You are cleaning a rough ASR transcript of a psychotherapy session.
+_CLEAN_TRANSCRIPT_PROMPT = """You are repairing a rough ASR transcript into a readable transcript.
 
 Return only the cleaned transcript text.
 
 Requirements:
-- Preserve meaning and clinical content exactly.
+- Preserve the original meaning, sequence, and level of detail.
 - Preserve speaker labels exactly when they are already present in the input.
-- Keep each speaker turn or paragraph on its own paragraph line instead of collapsing everything into one block.
+- Keep each completed speaker turn or paragraph on its own paragraph line instead of collapsing everything into one block.
+- Merge adjacent fragments when they clearly belong to the same sentence or speaker turn.
 - Fix obvious punctuation, capitalization, spacing, and transcript chunk-boundary artifacts.
-- Remove only clearly duplicated fragments caused by transcription overlap or ASR repetition.
+- Correct obvious ASR wording mistakes only when the intended phrasing is strongly supported by nearby context.
+- Remove only text that is clearly ASR garbage, such as isolated non-words, impossible fragments, or duplicated overlap text.
+- When a short span is not recoverable, prefer the least-committal readable wording supported by the input instead of inventing specifics.
 - Do not summarize.
-- Do not omit material.
-- Do not add facts, interpretations, or speaker labels that are not directly supported.
+- Do not add facts, interpretations, stage directions, or speaker labels that are not directly supported.
 - Do not include commentary, headings, markdown fences, or explanations.
 
 Rough transcript:

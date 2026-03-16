@@ -34,8 +34,8 @@ class LiveSessionConfig:
     channels: int = 1
     frame_ms: int = 20
     duration_sec: float = 0.0
-    chunk_sec: float = 4.0
-    chunk_overlap_sec: float = 0.75
+    chunk_sec: float = 6.0
+    chunk_overlap_sec: float = 1.0
     stitch_overlap_text: bool = True
     partial_interval_sec: float = 0.0
     source_mode: AudioSourceMode = AudioSourceMode.BOTH

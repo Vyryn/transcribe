@@ -124,14 +124,14 @@ class SessionPage(BasePage):
 
         self.transcription_model_var = tk.StringVar(value=services.DEFAULT_LIVE_TRANSCRIPTION_MODEL)
         self.duration_var = tk.StringVar(value="0")
-        self.chunk_var = tk.StringVar(value="4.0")
+        self.chunk_var = tk.StringVar(value="6.0")
         self.mode_var = tk.StringVar(value=AudioSourceMode.BOTH.value)
         self.output_root_var = tk.StringVar(value=str(default_data_subdir("live_sessions")))
         self.session_id_var = tk.StringVar(value="")
         self.mic_device_var = tk.StringVar(value="Auto")
         self.speaker_device_var = tk.StringVar(value="Auto")
         self.partial_interval_var = tk.StringVar(value="0.0")
-        self.chunk_overlap_var = tk.StringVar(value="0.75")
+        self.chunk_overlap_var = tk.StringVar(value="1.0")
         self.max_model_ram_var = tk.StringVar(value="8.0")
         self.stitch_overlap_var = tk.BooleanVar(value=True)
         self.single_device_var = tk.BooleanVar(value=False)
@@ -444,10 +444,10 @@ class SessionPage(BasePage):
             common=self.app.common_options(),
             transcription_model=self.transcription_model_var.get().strip(),
             duration_sec=float(self.duration_var.get() or 0.0),
-            chunk_overlap_sec=float(self.chunk_overlap_var.get() or 0.75),
+            chunk_overlap_sec=float(self.chunk_overlap_var.get() or 1.0),
             stitch_overlap_text=self.stitch_overlap_var.get(),
             mode=AudioSourceMode(self.mode_var.get()),
-            chunk_sec=float(self.chunk_var.get() or 4.0),
+            chunk_sec=float(self.chunk_var.get() or 6.0),
             partial_interval_sec=float(self.partial_interval_var.get() or 0.0),
             output_root=output_root,
             session_id=session_id,
