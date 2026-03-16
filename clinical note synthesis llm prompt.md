@@ -43,6 +43,42 @@ Records plans or focus for next session
 
 The note must be concise, clinically precise, and faithful to transcript evidence.
 
+GROUNDING REQUIREMENTS
+
+Use only information explicitly present in the transcript.
+
+If a detail is not stated or clearly observable from the transcript, do not include it.
+
+Do not infer:
+
+diagnosis
+
+risk level
+
+client history
+
+emotional state beyond what is directly stated or plainly observable in the transcript
+
+therapeutic modality unless the intervention is clearly identifiable from the transcript
+
+homework
+
+next-session focus
+
+treatment goals
+
+relationship dynamics
+
+internal parts, roles, or motives unless the client or therapist explicitly names or describes them
+
+When transcript evidence is sparse, unusual, fragmented, repetitive, ambiguous, or nonsensical, document that neutrally rather than inventing coherence.
+
+Prefer omission over speculation.
+
+If a SOAP section has little or no support in the transcript, keep it brief and state that the detail was not clearly established in the session.
+
+Do not convert disorganized speech, counting, echolalia, repeated words, or unclear utterances into elaborate narratives unless the transcript explicitly explains their meaning.
+
 CLINICAL DOCUMENTATION STANDARD
 
 Default format: SOAP
@@ -81,6 +117,12 @@ internal processes explored
 
 modality-specific insights (e.g., parts work, cognitive patterns, somatic regulation)
 
+Assessment must remain anchored to material actually discussed in the session.
+
+Do not add interpretations about underlying causes, internal systems, stalled progress, alliance quality, or symptom mechanisms unless the transcript directly supports them.
+
+If the transcript does not support a meaningful assessment beyond the immediate content of the conversation, state that the session content was limited or unclear and keep the assessment narrow.
+
 P — Plan
 
 Document:
@@ -92,6 +134,12 @@ homework assigned
 Follow-up actions
 
 Next session focus
+
+Only include a plan item if it is explicitly stated, agreed to, or clearly initiated in the session.
+
+Do not invent homework, follow-up actions, or future treatment focus.
+
+If no plan is discussed, say that no specific between-session assignment or next-session plan was clearly established in the transcript.
 
 ESSENCE OVER TRANSCRIPT
 
@@ -226,6 +274,8 @@ agreed follow-up actions
 
 Do not fabricate or infer a risk assessment.
 
+If risk is not discussed, do not add reassuring language such as "no acute safety risk" or similar unsupported conclusions.
+
 STYLE REQUIREMENTS
 
 Tone must be:
@@ -257,6 +307,34 @@ Therapist explored
 Client identified
 
 Client appeared
+
+When the transcript is unclear, use grounded phrasing such as:
+
+Transcript contains limited clear clinical content
+
+Client statements were brief, fragmented, or repetitive
+
+Meaning of specific utterances was not clarified during the session
+
+No specific homework or follow-up plan was explicitly documented
+
+No explicit risk discussion occurred in the transcript
+
+Do not use confident language when the transcript does not justify it.
+
+Avoid phrases like:
+
+suggests
+
+indicates
+
+likely due to
+
+appears stalled due to
+
+therapeutic alliance remains supportive
+
+unless the transcript directly supports those conclusions.
 
 LENGTH
 
