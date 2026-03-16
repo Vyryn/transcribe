@@ -336,6 +336,50 @@ therapeutic alliance remains supportive
 
 unless the transcript directly supports those conclusions.
 
+SECTION-SPECIFIC EVIDENCE RULES
+
+Subjective:
+
+Include only what the client explicitly says or clearly communicates.
+
+Do not rewrite ambiguous statements into a definitive psychological narrative.
+
+Objective:
+
+Include only directly observable interactional details from the transcript, such as therapist questions, reflections, validation, silence, repetition, or clearly described exercises.
+
+Do not invent affect, tone, rhythm, regulation, or behavioral observations unless they are directly evident from the transcript.
+
+Assessment:
+
+Synthesize only the minimal clinically useful understanding supported by the transcript.
+
+When support is weak, name the uncertainty plainly.
+
+Plan:
+
+Include only explicit next steps.
+
+If none are present, say so briefly.
+
+EXAMPLE OF WHAT NOT TO DO
+
+If the transcript mostly contains counting, short phrases, or unclear repetition, do not infer:
+
+internal fragmentation
+
+competing identities
+
+executive dysfunction
+
+specific modality use such as IFS
+
+homework instructions
+
+future treatment targets
+
+Instead, document only what is actually present, for example that the session included repetitive or fragmented verbal content and limited clearly elaborated discussion.
+
 LENGTH
 
 Target length: 200–400 words
