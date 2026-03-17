@@ -356,6 +356,45 @@ def test_ui_persists_network_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
         root.destroy()
 
 
+def test_ui_models_result_handler_failure_does_not_freeze_polling(monkeypatch: pytest.MonkeyPatch) -> None:
+    app_module = importlib.import_module("transcribe.ui.app")
+    controller_module = importlib.import_module("transcribe.ui.controller")
+    captured_errors: list[tuple[str, str]] = []
+    scheduled: list[tuple[int, object]] = []
+    monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, body: captured_errors.append((title, body)))
+    try:
+        root = app_module.tk.Tk()
+    except app_module.tk.TclError:
+        pytest.skip("Tk is unavailable in this environment")
+    try:
+        root.withdraw()
+        app = app_module.TranscribeUiApp(root, packaged_runtime=False)
+        monkeypatch.setattr(root, "after", lambda delay, callback: scheduled.append((delay, callback)))
+        models_page = app.pages["models"]
+        app._active_binding = app_module.TaskBinding(
+            task_name="models-install",
+            on_result=models_page.handle_install,
+        )
+        app._set_busy(True, "models-install", cancelable=False)
+        app.controller._messages.put(
+            controller_module.ControllerMessage(kind="result", task_name="models-install", payload=None)
+        )
+        app.controller._messages.put(
+            controller_module.ControllerMessage(kind="finished", task_name="models-install")
+        )
+
+        app._poll_messages()
+
+        assert captured_errors
+        assert "models-install failed while processing its result update" in captured_errors[0][1]
+        assert app.busy_var.get() == "Idle"
+        assert app._active_binding is None
+        assert scheduled and scheduled[-1][0] == app_module.POLL_INTERVAL_MS
+    finally:
+        root.destroy()
+
+
 def test_compliance_page_shows_informative_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     app_module = importlib.import_module("transcribe.ui.app")
     monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())

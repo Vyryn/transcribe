@@ -950,7 +950,10 @@ class ModelsPage(BasePage):
         self.app.start_task("models-list", lambda cancel, progress: services.list_models(), on_result=self.handle_list)
 
     def handle_list(self, result: object) -> None:
-        assert isinstance(result, ModelsListResult)
+        if not isinstance(result, ModelsListResult):
+            raise RuntimeError(
+                f"Models list returned an unexpected result payload: {type(result).__name__}."
+            )
         for item_id in self.tree.get_children():
             self.tree.delete(item_id)
         if result.error:
@@ -991,11 +994,15 @@ class ModelsPage(BasePage):
         )
 
     def handle_progress(self, progress: ServiceProgressEvent) -> None:
-        model_id = progress.fields.get("model_id", "")
+        fields = progress.fields if isinstance(progress.fields, dict) else {}
+        model_id = fields.get("model_id", "")
         self.status_var.set(f"{progress.name.replace('_', ' ')} {model_id}".strip())
 
     def handle_install(self, result: object) -> None:
-        assert isinstance(result, ModelsInstallResultSummary)
+        if not isinstance(result, ModelsInstallResultSummary):
+            raise RuntimeError(
+                f"Model install returned an unexpected result payload: {type(result).__name__}."
+            )
         for model_id in result.installed_model_ids:
             if self.tree.exists(model_id):
                 self.tree.set(model_id, "status", "installed")
@@ -1508,9 +1515,24 @@ class TranscribeUiApp:
 
     def _poll_messages(self) -> None:
         """Drain controller messages on the Tk main thread."""
-        for message in self.controller.drain_messages():
-            self._handle_message(message)
-        self.root.after(POLL_INTERVAL_MS, self._poll_messages)
+        try:
+            for message in self.controller.drain_messages():
+                try:
+                    self._handle_message(message)
+                except Exception as exc:  # noqa: BLE001
+                    self._handle_message_dispatch_failure(message, exc)
+        finally:
+            if self.root.winfo_exists():
+                self.root.after(POLL_INTERVAL_MS, self._poll_messages)
+
+    def _handle_message_dispatch_failure(self, message: ControllerMessage, exc: BaseException) -> None:
+        """Surface UI callback failures without stopping background-task polling."""
+        context = message.kind.replace("_", " ")
+        self.append_log(f"UI callback failed during {message.task_name} {context}: {exc}")
+        messagebox.showerror(
+            "Task failed",
+            f"{message.task_name} failed while processing its {context} update:\n{exc}",
+        )
 
     def _handle_message(self, message: ControllerMessage) -> None:
         binding = self._active_binding
