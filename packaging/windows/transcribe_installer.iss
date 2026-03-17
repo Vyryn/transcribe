@@ -61,6 +61,27 @@ var
 function SetEnvironmentVariableW(lpName, lpValue: string): Boolean;
   external 'SetEnvironmentVariableW@kernel32.dll stdcall';
 
+procedure ConfigureModelCheckBox(
+  CheckBox: TNewCheckBox;
+  const Caption: String;
+  const Top: Integer;
+  const Checked: Boolean
+);
+begin
+  CheckBox.Parent := ModelsPage.Surface;
+  CheckBox.Left := 0;
+  CheckBox.Top := Top;
+  CheckBox.Width := ModelsPage.SurfaceWidth;
+  CheckBox.Height := ScaleY(28);
+  CheckBox.Caption := Caption;
+  CheckBox.Checked := Checked;
+end;
+
+function NextModelCheckBoxTop(PreviousCheckBox: TNewCheckBox): Integer;
+begin
+  Result := PreviousCheckBox.Top + PreviousCheckBox.Height + ScaleY(8);
+end;
+
 function CountSelectedModels(): Integer;
 begin
   Result := 0;
@@ -233,36 +254,36 @@ begin
   );
 
   VoiceParakeetCheckBox := TNewCheckBox.Create(ModelsPage);
-  VoiceParakeetCheckBox.Parent := ModelsPage.Surface;
-  VoiceParakeetCheckBox.Left := 0;
-  VoiceParakeetCheckBox.Top := 8;
-  VoiceParakeetCheckBox.Width := ModelsPage.SurfaceWidth;
-  VoiceParakeetCheckBox.Caption := 'Voice: NVIDIA Parakeet (default)';
-  VoiceParakeetCheckBox.Checked := True;
+  ConfigureModelCheckBox(
+    VoiceParakeetCheckBox,
+    'Voice: NVIDIA Parakeet (default)',
+    ScaleY(8),
+    True
+  );
 
   VoiceCanaryCheckBox := TNewCheckBox.Create(ModelsPage);
-  VoiceCanaryCheckBox.Parent := ModelsPage.Surface;
-  VoiceCanaryCheckBox.Left := 0;
-  VoiceCanaryCheckBox.Top := VoiceParakeetCheckBox.Top + ScaleY(24);
-  VoiceCanaryCheckBox.Width := ModelsPage.SurfaceWidth;
-  VoiceCanaryCheckBox.Caption := 'Voice: NVIDIA Canary-Qwen 2.5B';
-  VoiceCanaryCheckBox.Checked := False;
+  ConfigureModelCheckBox(
+    VoiceCanaryCheckBox,
+    'Voice: NVIDIA Canary-Qwen 2.5B',
+    NextModelCheckBoxTop(VoiceParakeetCheckBox),
+    False
+  );
 
   Notes4BCheckBox := TNewCheckBox.Create(ModelsPage);
-  Notes4BCheckBox.Parent := ModelsPage.Surface;
-  Notes4BCheckBox.Left := 0;
-  Notes4BCheckBox.Top := VoiceCanaryCheckBox.Top + ScaleY(32);
-  Notes4BCheckBox.Width := ModelsPage.SurfaceWidth;
-  Notes4BCheckBox.Caption := 'Notes: Qwen 3.5 4B GGUF (default)';
-  Notes4BCheckBox.Checked := True;
+  ConfigureModelCheckBox(
+    Notes4BCheckBox,
+    'Notes: Qwen 3.5 4B GGUF (default)',
+    NextModelCheckBoxTop(VoiceCanaryCheckBox),
+    True
+  );
 
   Notes2BCheckBox := TNewCheckBox.Create(ModelsPage);
-  Notes2BCheckBox.Parent := ModelsPage.Surface;
-  Notes2BCheckBox.Left := 0;
-  Notes2BCheckBox.Top := Notes4BCheckBox.Top + ScaleY(24);
-  Notes2BCheckBox.Width := ModelsPage.SurfaceWidth;
-  Notes2BCheckBox.Caption := 'Notes: Qwen 3.5 2B GGUF';
-  Notes2BCheckBox.Checked := False;
+  ConfigureModelCheckBox(
+    Notes2BCheckBox,
+    'Notes: Qwen 3.5 2B GGUF',
+    NextModelCheckBoxTop(Notes4BCheckBox),
+    False
+  );
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

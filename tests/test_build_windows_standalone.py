@@ -206,6 +206,8 @@ def test_installer_template_hides_shell_wrapper_and_shows_model_progress() -> No
     assert "CreateOutputProgressPage" in template_text
     assert "Installing model " in template_text
     assert "ExpandConstant('{app}\\Transcribe.exe')" in template_text
+    assert "CheckBox.Height := ScaleY(28);" in template_text
+    assert "PreviousCheckBox.Top + PreviousCheckBox.Height + ScaleY(8)" in template_text
     assert 'Source: "{#SourceDir}\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs' in template_text
 
 
