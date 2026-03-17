@@ -1228,7 +1228,7 @@ class CompliancePage(BasePage):
 class TranscribeUiApp:
     """Tkinter application shell for `transcribe`."""
 
-    def __init__(self, root: tk.Tk, *, packaged_runtime: bool | None = None) -> None:
+    def __init__(self, root: tk.Tk | tk.Toplevel, *, packaged_runtime: bool | None = None) -> None:
         self.root = root
         self.root.title("Transcribe; the offline therapy session note taker")
         self.root.geometry("980x680")
@@ -1237,6 +1237,8 @@ class TranscribeUiApp:
         self._active_binding: TaskBinding | None = None
         self._log_lines: list[str] = []
         self._devices: tuple[DeviceInfo, ...] = ()
+        self._poll_after_id: str | None = None
+        self._closing = False
         runtime_mode = (
             detect_runtime_mode()
             if packaged_runtime is None
@@ -1411,8 +1413,21 @@ class TranscribeUiApp:
 
     def _on_close(self) -> None:
         """Persist UI preferences before closing the application window."""
+        self._closing = True
+        self._cancel_poll_callback()
         self._persist_preferences(show_error=False)
         self.root.destroy()
+
+    def _cancel_poll_callback(self) -> None:
+        """Cancel the pending message-poll callback when the app is closing."""
+        if self._poll_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self._poll_after_id)
+        except tk.TclError:
+            pass
+        finally:
+            self._poll_after_id = None
 
     def _apply_advanced_ui_state(self) -> None:
         """Toggle advanced controls across all workflow pages."""
@@ -1522,8 +1537,9 @@ class TranscribeUiApp:
                 except Exception as exc:  # noqa: BLE001
                     self._handle_message_dispatch_failure(message, exc)
         finally:
-            if self.root.winfo_exists():
-                self.root.after(POLL_INTERVAL_MS, self._poll_messages)
+            self._poll_after_id = None
+            if not self._closing and self.root.winfo_exists():
+                self._poll_after_id = self.root.after(POLL_INTERVAL_MS, self._poll_messages)
 
     def _handle_message_dispatch_failure(self, message: ControllerMessage, exc: BaseException) -> None:
         """Surface UI callback failures without stopping background-task polling."""

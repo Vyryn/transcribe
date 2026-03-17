@@ -305,8 +305,48 @@ def test_ui_preferences_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert loaded.advanced_ui is True
 
 
-def test_ui_loads_persisted_network_preference(monkeypatch: pytest.MonkeyPatch) -> None:
+def _skip_tk_unavailable(error: Exception) -> None:
+    detail = str(error).strip()
+    if detail:
+        pytest.skip(f"Tk is unavailable in this environment: {detail}")
+    pytest.skip("Tk is unavailable in this environment")
+
+
+@pytest.fixture(scope="module")
+def tk_host_root() -> tuple[object, object]:
     app_module = importlib.import_module("transcribe.ui.app")
+    try:
+        root = app_module.tk.Tk()
+    except app_module.tk.TclError as exc:
+        _skip_tk_unavailable(exc)
+    root.withdraw()
+    try:
+        yield app_module, root
+    finally:
+        if root.winfo_exists():
+            root.destroy()
+
+
+def _create_ui_test_window(app_module: object, host_root: object) -> object:
+    try:
+        root = app_module.tk.Toplevel(host_root)
+    except app_module.tk.TclError as exc:
+        _skip_tk_unavailable(exc)
+    root.withdraw()
+    return root
+
+
+def _close_ui_app(app: object | None, root: object) -> None:
+    if app is not None and hasattr(app, "_on_close"):
+        app._on_close()
+        return
+    root.destroy()
+
+
+def test_ui_loads_persisted_network_preference(
+    monkeypatch: pytest.MonkeyPatch, tk_host_root: tuple[object, object]
+) -> None:
+    app_module, host_root = tk_host_root
     observed: list[bool] = []
     monkeypatch.setattr(
         app_module,
@@ -314,34 +354,30 @@ def test_ui_loads_persisted_network_preference(monkeypatch: pytest.MonkeyPatch) 
         lambda: app_module.UiPreferences(advanced_ui=True, allow_network=True),
     )
     monkeypatch.setattr(app_module, "set_network_access_allowed", lambda allowed: observed.append(allowed))
+    app = None
+    root = _create_ui_test_window(app_module, host_root)
     try:
-        root = app_module.tk.Tk()
-    except app_module.tk.TclError:
-        pytest.skip("Tk is unavailable in this environment")
-    try:
-        root.withdraw()
         app = app_module.TranscribeUiApp(root, packaged_runtime=False)
 
         assert app.advanced_ui_var.get() is True
         assert app.allow_network_var.get() is True
         assert observed[-1] is True
     finally:
-        root.destroy()
+        _close_ui_app(app, root)
 
 
-def test_ui_persists_network_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
-    app_module = importlib.import_module("transcribe.ui.app")
+def test_ui_persists_network_toggle(
+    monkeypatch: pytest.MonkeyPatch, tk_host_root: tuple[object, object]
+) -> None:
+    app_module, host_root = tk_host_root
     saved: list[object] = []
     observed_network: list[bool] = []
     monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
     monkeypatch.setattr(app_module, "save_ui_preferences", lambda preferences: saved.append(preferences))
     monkeypatch.setattr(app_module, "set_network_access_allowed", lambda allowed: observed_network.append(allowed))
+    app = None
+    root = _create_ui_test_window(app_module, host_root)
     try:
-        root = app_module.tk.Tk()
-    except app_module.tk.TclError:
-        pytest.skip("Tk is unavailable in this environment")
-    try:
-        root.withdraw()
         app = app_module.TranscribeUiApp(root, packaged_runtime=False)
         app.advanced_ui_var.set(True)
         app._handle_advanced_ui_toggle()
@@ -353,22 +389,21 @@ def test_ui_persists_network_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
         assert saved[-1].allow_network is True
         assert observed_network[-1] is True
     finally:
-        root.destroy()
+        _close_ui_app(app, root)
 
 
-def test_ui_models_result_handler_failure_does_not_freeze_polling(monkeypatch: pytest.MonkeyPatch) -> None:
-    app_module = importlib.import_module("transcribe.ui.app")
+def test_ui_models_result_handler_failure_does_not_freeze_polling(
+    monkeypatch: pytest.MonkeyPatch, tk_host_root: tuple[object, object]
+) -> None:
+    app_module, host_root = tk_host_root
     controller_module = importlib.import_module("transcribe.ui.controller")
     captured_errors: list[tuple[str, str]] = []
     scheduled: list[tuple[int, object]] = []
     monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
     monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, body: captured_errors.append((title, body)))
+    app = None
+    root = _create_ui_test_window(app_module, host_root)
     try:
-        root = app_module.tk.Tk()
-    except app_module.tk.TclError:
-        pytest.skip("Tk is unavailable in this environment")
-    try:
-        root.withdraw()
         app = app_module.TranscribeUiApp(root, packaged_runtime=False)
         monkeypatch.setattr(root, "after", lambda delay, callback: scheduled.append((delay, callback)))
         models_page = app.pages["models"]
@@ -392,18 +427,17 @@ def test_ui_models_result_handler_failure_does_not_freeze_polling(monkeypatch: p
         assert app._active_binding is None
         assert scheduled and scheduled[-1][0] == app_module.POLL_INTERVAL_MS
     finally:
-        root.destroy()
+        _close_ui_app(app, root)
 
 
-def test_compliance_page_shows_informative_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    app_module = importlib.import_module("transcribe.ui.app")
+def test_compliance_page_shows_informative_failure(
+    monkeypatch: pytest.MonkeyPatch, tk_host_root: tuple[object, object]
+) -> None:
+    app_module, host_root = tk_host_root
     monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
+    app = None
+    root = _create_ui_test_window(app_module, host_root)
     try:
-        root = app_module.tk.Tk()
-    except app_module.tk.TclError:
-        pytest.skip("Tk is unavailable in this environment")
-    try:
-        root.withdraw()
         app = app_module.TranscribeUiApp(root, packaged_runtime=False)
         page = app.pages["compliance"]
         assert isinstance(page, app_module.CompliancePage)
@@ -426,18 +460,17 @@ def test_compliance_page_shows_informative_failure(monkeypatch: pytest.MonkeyPat
         assert "disable 'Allow Network Access' and restart" in rendered
         assert page.status_var.get().endswith("Outbound network is currently allowed in this process.")
     finally:
-        root.destroy()
+        _close_ui_app(app, root)
 
 
-def test_ui_smoke_instantiates_when_tk_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    app_module = importlib.import_module("transcribe.ui.app")
+def test_ui_smoke_instantiates_when_tk_available(
+    monkeypatch: pytest.MonkeyPatch, tk_host_root: tuple[object, object]
+) -> None:
+    app_module, host_root = tk_host_root
     monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
+    app = None
+    root = _create_ui_test_window(app_module, host_root)
     try:
-        root = app_module.tk.Tk()
-    except app_module.tk.TclError:
-        pytest.skip("Tk is unavailable in this environment")
-    try:
-        root.withdraw()
         app = app_module.TranscribeUiApp(root, packaged_runtime=False)
         session_page = app.pages["session"]
         capture_page = app.pages["capture"]
@@ -465,4 +498,4 @@ def test_ui_smoke_instantiates_when_tk_available(monkeypatch: pytest.MonkeyPatch
         assert capture_page.advanced_visible is True
         assert app.common_options().allow_network is True
     finally:
-        root.destroy()
+        _close_ui_app(app, root)
