@@ -170,6 +170,30 @@ def test_write_pyinstaller_spec_builds_windowed_launcher(tmp_path: Path) -> None
     spec_text = spec_path.read_text(encoding="utf-8")
 
     assert "console=False" in spec_text
+    assert "exclude_binaries=True" in spec_text
+    assert "COLLECT(" in spec_text
+
+
+def test_stage_built_app_copies_onedir_bundle_contents(tmp_path: Path) -> None:
+    module = _load_build_module()
+    bundle_dir = tmp_path / "dist" / module.APP_NAME
+    bundle_internal_dir = bundle_dir / "_internal"
+    stage_dir = tmp_path / "stage"
+    expected_executable = bundle_dir / f"{module.APP_NAME}.exe"
+    expected_runtime_file = bundle_internal_dir / "python313.dll"
+
+    bundle_internal_dir.mkdir(parents=True)
+    expected_executable.write_text("exe", encoding="utf-8")
+    expected_runtime_file.write_text("dll", encoding="utf-8")
+    (stage_dir / "packaged-assets.json").parent.mkdir(parents=True)
+    (stage_dir / "packaged-assets.json").write_text("manifest", encoding="utf-8")
+
+    staged_executable = module.stage_built_app(bundle_dir, stage_dir)
+
+    assert staged_executable == (stage_dir / f"{module.APP_NAME}.exe").resolve()
+    assert (stage_dir / f"{module.APP_NAME}.exe").read_text(encoding="utf-8") == "exe"
+    assert (stage_dir / "_internal" / "python313.dll").read_text(encoding="utf-8") == "dll"
+    assert (stage_dir / "packaged-assets.json").read_text(encoding="utf-8") == "manifest"
 
 
 def test_installer_template_hides_shell_wrapper_and_shows_model_progress() -> None:
@@ -182,6 +206,7 @@ def test_installer_template_hides_shell_wrapper_and_shows_model_progress() -> No
     assert "CreateOutputProgressPage" in template_text
     assert "Installing model " in template_text
     assert "ExpandConstant('{app}\\Transcribe.exe')" in template_text
+    assert 'Source: "{#SourceDir}\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs' in template_text
 
 
 def test_select_github_asset_falls_back_to_windows_x64_runtime_archive(

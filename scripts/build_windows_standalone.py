@@ -856,6 +856,28 @@ def copy_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination)
 
 
+def copy_directory_contents(source: Path, destination: Path) -> None:
+    """Copy one directory's contents into an existing destination directory.
+
+    Parameters
+    ----------
+    source : Path
+        Source directory whose direct children should be copied.
+    destination : Path
+        Destination directory that receives the copied entries.
+    """
+    resolved_source = source.resolve()
+    if not resolved_source.exists() or not resolved_source.is_dir():
+        raise FileNotFoundError(resolved_source)
+    ensure_directory(destination)
+    for child in resolved_source.iterdir():
+        target = destination / child.name
+        if child.is_dir():
+            copy_tree(child, target)
+        else:
+            copy_file(child, target)
+
+
 def stage_llama_runtime_from_archive(archive_path: Path, destination_dir: Path) -> None:
     """Extract the required llama.cpp runtime files from a downloaded archive.
 
@@ -1080,12 +1102,19 @@ def write_pyinstaller_spec(
                 "exe = EXE(",
                 "    pyz,",
                 "    a.scripts,",
-                "    a.binaries,",
-                "    a.datas,",
                 "    [],",
                 f"    name={APP_NAME!r},",
+                "    exclude_binaries=True,",
                 "    console=False,",
                 "    icon=str(icon_path),",
+                "    upx=False,",
+                ")",
+                "coll = COLLECT(",
+                "    exe,",
+                "    a.binaries,",
+                "    a.datas,",
+                f"    name={APP_NAME!r},",
+                "    strip=False,",
                 "    upx=False,",
                 ")",
                 "",
@@ -1103,7 +1132,7 @@ def build_pyinstaller_bundle(
     distribution_names: Sequence[str],
     icon_path: Path,
 ) -> Path:
-    """Build the frozen application executable with PyInstaller.
+    """Build the frozen application bundle directory with PyInstaller.
 
     Parameters
     ----------
@@ -1119,7 +1148,7 @@ def build_pyinstaller_bundle(
     Returns
     -------
     Path
-        Frozen application executable path.
+        Frozen application bundle directory.
     """
     package_roots = build_pyinstaller_module_roots(distribution_names)
     write_pyinstaller_spec(
@@ -1146,10 +1175,10 @@ def build_pyinstaller_bundle(
             layout.spec_path,
         ]
     )
-    executable_path = layout.pyinstaller_dist_dir / f"{APP_NAME}.exe"
+    executable_path = layout.pyinstaller_dist_dir / APP_NAME / f"{APP_NAME}.exe"
     if not executable_path.exists():
         raise RuntimeError(f"PyInstaller did not produce the expected executable: {executable_path}")
-    return executable_path.resolve()
+    return executable_path.parent.resolve()
 
 
 def stage_runtime_assets(*, layout: BuildLayout, args: argparse.Namespace, icon_path: Path) -> None:
@@ -1179,13 +1208,13 @@ def stage_runtime_assets(*, layout: BuildLayout, args: argparse.Namespace, icon_
     )
 
 
-def stage_built_app(executable_path: Path, stage_dir: Path) -> Path:
-    """Copy the frozen executable into the installer staging directory.
+def stage_built_app(bundle_dir: Path, stage_dir: Path) -> Path:
+    """Copy the frozen application bundle into the installer staging directory.
 
     Parameters
     ----------
-    executable_path : Path
-        PyInstaller-built application executable.
+    bundle_dir : Path
+        PyInstaller-built application bundle directory.
     stage_dir : Path
         Installer staging directory.
 
@@ -1195,7 +1224,9 @@ def stage_built_app(executable_path: Path, stage_dir: Path) -> Path:
         Staged application executable path.
     """
     staged_executable = stage_dir / f"{APP_NAME}.exe"
-    copy_file(executable_path, staged_executable)
+    copy_directory_contents(bundle_dir, stage_dir)
+    if not staged_executable.exists():
+        raise RuntimeError(f"Staged app bundle is missing the expected executable: {staged_executable}")
     return staged_executable.resolve()
 
 
@@ -1412,13 +1443,13 @@ def main(argv: list[str] | None = None) -> int:
     python_executable = resolve_build_python()
     ensure_pyinstaller_available(python_executable)
     stage_runtime_assets(layout=layout, args=args, icon_path=ICON_PATH)
-    executable_path = build_pyinstaller_bundle(
+    bundle_dir = build_pyinstaller_bundle(
         python_executable=python_executable,
         layout=layout,
         distribution_names=distribution_names,
         icon_path=ICON_PATH,
     )
-    staged_executable = stage_built_app(executable_path, layout.stage_dir)
+    staged_executable = stage_built_app(bundle_dir, layout.stage_dir)
     print(f"Staged app: {staged_executable}")
 
     if args.skip_installer:

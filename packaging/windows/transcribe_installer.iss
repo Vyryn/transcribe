@@ -40,11 +40,7 @@ Name: "startmenuicon"; Description: "Create a Start menu shortcut"; Flags: check
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\Transcribe.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceDir}\packaged-assets.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceDir}\transcribe.ico"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceDir}\prompts\*"; DestDir: "{app}\prompts"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#SourceDir}\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
