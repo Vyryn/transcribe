@@ -163,66 +163,23 @@ def _is_parakeet_model_id(transcription_model: str) -> bool:
     return _canonical_transcription_model_id(transcription_model).lower().startswith("nvidia/parakeet-")
 
 
-def _apply_parakeet_runtime_compatibility(model: Any, resolved_model_id: str) -> None:
+def _apply_parakeet_runtime_compatibility(model: Any, resolved_model_id: str) -> bool:
     """Disable NeMo CUDA-graph decoder for Parakeet models in this runtime.
 
     Some NeMo runtime combinations can fail in TDT decoder paths when CUDA-graph
     decoding is enabled. For Parakeet models, force the safer non-CUDA-graph path.
     """
     if not _is_parakeet_model_id(resolved_model_id):
-        return
+        return False
 
     cfg = getattr(model, "cfg", None)
     if cfg is None:
-        return
-    decoding_cfg = getattr(cfg, "decoding", None)
-    if decoding_cfg is None:
-        return
-    greedy_cfg = getattr(decoding_cfg, "greedy", None)
-    if greedy_cfg is None:
-        return
+        cfg = None
+    decoding_cfg = getattr(cfg, "decoding", None) if cfg is not None else None
+    greedy_cfg = getattr(decoding_cfg, "greedy", None) if decoding_cfg is not None else None
 
-    current_value = None
-    if hasattr(greedy_cfg, "get"):
-        try:
-            current_value = greedy_cfg.get("use_cuda_graph_decoder", None)
-        except Exception:  # noqa: BLE001
-            current_value = None
-    if current_value is None:
-        current_value = getattr(greedy_cfg, "use_cuda_graph_decoder", None)
-    if current_value is False:
-        return
-
-    updated = False
-    try:
-        setattr(greedy_cfg, "use_cuda_graph_decoder", False)
-        updated = True
-    except Exception:  # noqa: BLE001
-        updated = False
-    if not updated:
-        try:
-            greedy_cfg["use_cuda_graph_decoder"] = False
-            updated = True
-        except Exception:  # noqa: BLE001
-            updated = False
-    if not updated:
-        try:
-            from omegaconf import open_dict
-
-            with open_dict(greedy_cfg):
-                greedy_cfg["use_cuda_graph_decoder"] = False
-            updated = True
-        except Exception:  # noqa: BLE001
-            updated = False
-    if not updated:
-        LOGGER.warning(
-            "Unable to disable CUDA graph decoder for Parakeet model %s; "
-            "continuing with default decoding configuration.",
-            resolved_model_id,
-        )
-        return
-
-    if hasattr(model, "change_decoding_strategy"):
+    config_updated = _disable_parakeet_cuda_graph_decoder_flag(greedy_cfg)
+    if config_updated and hasattr(model, "change_decoding_strategy"):
         try:
             model.change_decoding_strategy(decoding_cfg, verbose=False)
         except TypeError:
@@ -233,12 +190,121 @@ def _apply_parakeet_runtime_compatibility(model: Any, resolved_model_id: str) ->
                 resolved_model_id,
                 exc,
             )
-            return
+
+    runtime_updated = _disable_parakeet_cuda_graph_runtime_targets(model)
+    if config_updated is None and not runtime_updated:
+        LOGGER.warning(
+            "Unable to disable CUDA graph decoder for Parakeet model %s; "
+            "continuing with default decoding configuration.",
+            resolved_model_id,
+        )
+        return False
+    if not config_updated and not runtime_updated:
+        return False
 
     LOGGER.info(
         "Disabled NeMo CUDA graph decoder for Parakeet model %s for runtime stability.",
         resolved_model_id,
     )
+    return True
+
+
+def _disable_parakeet_cuda_graph_decoder_flag(greedy_cfg: Any) -> bool | None:
+    """Force the Parakeet greedy decoding config to disable CUDA-graph decoding."""
+    if greedy_cfg is None:
+        return None
+
+    current_value = None
+    if hasattr(greedy_cfg, "get"):
+        try:
+            current_value = greedy_cfg.get("use_cuda_graph_decoder", None)
+        except Exception:  # noqa: BLE001
+            current_value = None
+    if current_value is None:
+        current_value = getattr(greedy_cfg, "use_cuda_graph_decoder", None)
+    if current_value is False:
+        return False
+
+    try:
+        setattr(greedy_cfg, "use_cuda_graph_decoder", False)
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        greedy_cfg["use_cuda_graph_decoder"] = False
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from omegaconf import open_dict
+
+        with open_dict(greedy_cfg):
+            greedy_cfg["use_cuda_graph_decoder"] = False
+        return True
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _iter_parakeet_cuda_graph_runtime_targets(model: Any) -> Iterable[Any]:
+    """Yield likely NeMo runtime objects that may expose CUDA-graph decoder hooks."""
+    candidate_attr_names = (
+        "decoding",
+        "decoder",
+        "greedy",
+        "decoding_strategy",
+        "transcribe_decoder",
+        "_decoding",
+        "_decoder",
+        "_greedy_decoder",
+        "rnnt_decoder",
+        "tdt_decoder",
+    )
+    seen_ids: set[int] = set()
+    pending = [model]
+    while pending:
+        candidate = pending.pop(0)
+        if candidate is None:
+            continue
+        candidate_id = id(candidate)
+        if candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        yield candidate
+        for attr_name in candidate_attr_names:
+            try:
+                child = getattr(candidate, attr_name, None)
+            except Exception:  # noqa: BLE001
+                child = None
+            if child is not None:
+                pending.append(child)
+
+
+def _disable_parakeet_cuda_graph_runtime_targets(model: Any) -> bool:
+    """Best-effort disable CUDA-graph decoding on loaded Parakeet runtime objects."""
+    updated = False
+    for candidate in _iter_parakeet_cuda_graph_runtime_targets(model):
+        for hook_name in ("disable_cuda_graphs", "disable_cuda_graph_decoder"):
+            hook = getattr(candidate, hook_name, None)
+            if not callable(hook):
+                continue
+            try:
+                hook()
+                updated = True
+            except Exception:  # noqa: BLE001
+                continue
+        for attr_name in ("use_cuda_graph_decoder", "use_cuda_graphs"):
+            try:
+                current_value = getattr(candidate, attr_name, None)
+            except Exception:  # noqa: BLE001
+                continue
+            if current_value is False:
+                continue
+            try:
+                setattr(candidate, attr_name, False)
+                updated = True
+            except Exception:  # noqa: BLE001
+                continue
+    return updated
 
 
 def _prepare_nemo_model_for_inference(model: Any, resolved_model_id: str) -> None:

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
@@ -26,6 +27,7 @@ _QWEN_ASR_MODEL_CACHE: dict[str, Any] = {}
 _HF_REPO_SNAPSHOT_CACHE: dict[str, str] = {}
 _QWEN_AUDIO_BYTES_PATH_CACHE: dict[str, str] = {}
 _NEMO_AUDIO_BYTES_PATH_CACHE: dict[str, str] = {}
+_NEMO_ASR_MODEL_LOAD_LOCK = threading.Lock()
 _MODEL_RAM_GB_ESTIMATES = {
     "tiny": 0.7,
     "base": 1.0,
@@ -138,66 +140,23 @@ def _is_parakeet_model_id(transcription_model: str) -> bool:
     return _canonical_transcription_model_id(transcription_model).lower().startswith("nvidia/parakeet-")
 
 
-def _apply_parakeet_runtime_compatibility(model: Any, resolved_model_id: str) -> None:
+def _apply_parakeet_runtime_compatibility(model: Any, resolved_model_id: str) -> bool:
     """Disable NeMo CUDA-graph decoder for Parakeet models in this runtime.
 
     Some NeMo runtime combinations can fail in TDT decoder paths when CUDA-graph
     decoding is enabled. For Parakeet models, force the safer non-CUDA-graph path.
     """
     if not _is_parakeet_model_id(resolved_model_id):
-        return
+        return False
 
     cfg = getattr(model, "cfg", None)
     if cfg is None:
-        return
-    decoding_cfg = getattr(cfg, "decoding", None)
-    if decoding_cfg is None:
-        return
-    greedy_cfg = getattr(decoding_cfg, "greedy", None)
-    if greedy_cfg is None:
-        return
+        cfg = None
+    decoding_cfg = getattr(cfg, "decoding", None) if cfg is not None else None
+    greedy_cfg = getattr(decoding_cfg, "greedy", None) if decoding_cfg is not None else None
 
-    current_value = None
-    if hasattr(greedy_cfg, "get"):
-        try:
-            current_value = greedy_cfg.get("use_cuda_graph_decoder", None)
-        except Exception:  # noqa: BLE001
-            current_value = None
-    if current_value is None:
-        current_value = getattr(greedy_cfg, "use_cuda_graph_decoder", None)
-    if current_value is False:
-        return
-
-    updated = False
-    try:
-        setattr(greedy_cfg, "use_cuda_graph_decoder", False)
-        updated = True
-    except Exception:  # noqa: BLE001
-        updated = False
-    if not updated:
-        try:
-            greedy_cfg["use_cuda_graph_decoder"] = False
-            updated = True
-        except Exception:  # noqa: BLE001
-            updated = False
-    if not updated:
-        try:
-            from omegaconf import open_dict
-
-            with open_dict(greedy_cfg):
-                greedy_cfg["use_cuda_graph_decoder"] = False
-            updated = True
-        except Exception:  # noqa: BLE001
-            updated = False
-    if not updated:
-        LOGGER.warning(
-            "Unable to disable CUDA graph decoder for Parakeet model %s; "
-            "continuing with default decoding configuration.",
-            resolved_model_id,
-        )
-        return
-
-    if hasattr(model, "change_decoding_strategy"):
+    config_updated = _disable_parakeet_cuda_graph_decoder_flag(greedy_cfg)
+    if config_updated and hasattr(model, "change_decoding_strategy"):
         try:
             model.change_decoding_strategy(decoding_cfg, verbose=False)
         except TypeError:
@@ -208,12 +167,137 @@ def _apply_parakeet_runtime_compatibility(model: Any, resolved_model_id: str) ->
                 resolved_model_id,
                 exc,
             )
-            return
+
+    runtime_updated = _disable_parakeet_cuda_graph_runtime_targets(model)
+    if config_updated is None and not runtime_updated:
+        LOGGER.warning(
+            "Unable to disable CUDA graph decoder for Parakeet model %s; "
+            "continuing with default decoding configuration.",
+            resolved_model_id,
+        )
+        return False
+    if not config_updated and not runtime_updated:
+        return False
 
     LOGGER.info(
         "Disabled NeMo CUDA graph decoder for Parakeet model %s for runtime stability.",
         resolved_model_id,
     )
+    return True
+
+
+def _disable_parakeet_cuda_graph_decoder_flag(greedy_cfg: Any) -> bool | None:
+    """Force the Parakeet greedy decoding config to disable CUDA-graph decoding."""
+    if greedy_cfg is None:
+        return None
+
+    current_value = None
+    if hasattr(greedy_cfg, "get"):
+        try:
+            current_value = greedy_cfg.get("use_cuda_graph_decoder", None)
+        except Exception:  # noqa: BLE001
+            current_value = None
+    if current_value is None:
+        current_value = getattr(greedy_cfg, "use_cuda_graph_decoder", None)
+    if current_value is False:
+        return False
+
+    try:
+        setattr(greedy_cfg, "use_cuda_graph_decoder", False)
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        greedy_cfg["use_cuda_graph_decoder"] = False
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from omegaconf import open_dict
+
+        with open_dict(greedy_cfg):
+            greedy_cfg["use_cuda_graph_decoder"] = False
+        return True
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _iter_parakeet_cuda_graph_runtime_targets(model: Any) -> Iterable[Any]:
+    """Yield likely NeMo runtime objects that may expose CUDA-graph decoder hooks."""
+    candidate_attr_names = (
+        "decoding",
+        "decoder",
+        "greedy",
+        "decoding_strategy",
+        "transcribe_decoder",
+        "_decoding",
+        "_decoder",
+        "_greedy_decoder",
+        "rnnt_decoder",
+        "tdt_decoder",
+    )
+    seen_ids: set[int] = set()
+    pending = [model]
+    while pending:
+        candidate = pending.pop(0)
+        if candidate is None:
+            continue
+        candidate_id = id(candidate)
+        if candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        yield candidate
+        for attr_name in candidate_attr_names:
+            try:
+                child = getattr(candidate, attr_name, None)
+            except Exception:  # noqa: BLE001
+                child = None
+            if child is not None:
+                pending.append(child)
+
+
+def _disable_parakeet_cuda_graph_runtime_targets(model: Any) -> bool:
+    """Best-effort disable CUDA-graph decoding on loaded Parakeet runtime objects."""
+    updated = False
+    for candidate in _iter_parakeet_cuda_graph_runtime_targets(model):
+        for hook_name in ("disable_cuda_graphs", "disable_cuda_graph_decoder"):
+            hook = getattr(candidate, hook_name, None)
+            if not callable(hook):
+                continue
+            try:
+                hook()
+                updated = True
+            except Exception:  # noqa: BLE001
+                continue
+        for attr_name in ("use_cuda_graph_decoder", "use_cuda_graphs"):
+            try:
+                current_value = getattr(candidate, attr_name, None)
+            except Exception:  # noqa: BLE001
+                continue
+            if current_value is False:
+                continue
+            try:
+                setattr(candidate, attr_name, False)
+                updated = True
+            except Exception:  # noqa: BLE001
+                continue
+    return updated
+
+
+def _is_parakeet_cuda_graph_runtime_error(model_id: str, exc: BaseException) -> bool:
+    """Return True when one Parakeet inference error looks like decoder fast-path failure."""
+    if not _is_parakeet_model_id(model_id):
+        return False
+
+    for item in _iter_exception_chain(exc):
+        message = str(item).lower()
+        if isinstance(item, AttributeError):
+            return True
+        if "cuda graph" in message or "cudagraph" in message:
+            return True
+        if "decoder" in message and any(needle in message for needle in ("parakeet", "tdt", "rnnt", "greedy")):
+            return True
+    return False
 
 
 def _prepare_nemo_model_for_inference(model: Any, resolved_model_id: str) -> None:
@@ -543,74 +627,97 @@ def _get_nemo_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
     _, resolved_model_id = _resolve_transcription_backend(model_id)
     effective_local_files_only = _effective_local_files_only(local_files_only)
     cache_key = f"{resolved_model_id}|local_files_only={effective_local_files_only}"
-    if cache_key in _NEMO_ASR_MODEL_CACHE:
-        model = _NEMO_ASR_MODEL_CACHE[cache_key]
-        _prepare_nemo_model_for_inference(model, resolved_model_id)
-        return model
-    if effective_local_files_only and resolved_model_id in _NEMO_ASR_MODEL_CACHE:
-        model = _NEMO_ASR_MODEL_CACHE[resolved_model_id]
-        _prepare_nemo_model_for_inference(model, resolved_model_id)
-        return model
+    cached_model = _get_cached_nemo_asr_model(
+        cache_key,
+        resolved_model_id,
+        effective_local_files_only=effective_local_files_only,
+    )
+    if cached_model is not None:
+        return cached_model
 
     if effective_local_files_only:
         _enforce_hf_offline_mode()
 
-    snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=effective_local_files_only)
-    try:
-        import nemo.collections.asr as nemo_asr
-    except ImportError as exc:
-        raise RuntimeError(
-            "Transcription runtime for NVIDIA ASR models requires `nemo_toolkit[asr]`."
-        ) from exc
+    with _NEMO_ASR_MODEL_LOAD_LOCK:
+        cached_model = _get_cached_nemo_asr_model(
+            cache_key,
+            resolved_model_id,
+            effective_local_files_only=effective_local_files_only,
+        )
+        if cached_model is not None:
+            return cached_model
 
-    load_errors: list[BaseException] = []
-    model = None
-    snapshot_contains_nemo_archive = _snapshot_contains_nemo_archive(snapshot_dir)
-    nemo_restore_attempts = 2 if snapshot_contains_nemo_archive else 1
-    for attempt_index in range(nemo_restore_attempts):
+        snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=effective_local_files_only)
         try:
-            model = _load_nemo_model_from_snapshot(nemo_asr, resolved_model_id, snapshot_dir)
-            break
-        except Exception as exc:  # noqa: BLE001
-            load_errors.append(exc)
-            if (attempt_index + 1) < nemo_restore_attempts:
-                continue
+            import nemo.collections.asr as nemo_asr
+        except ImportError as exc:
+            raise RuntimeError(
+                "Transcription runtime for NVIDIA ASR models requires `nemo_toolkit[asr]`."
+            ) from exc
 
-    if model is None and not snapshot_contains_nemo_archive:
-        try:
-            model = _load_nemo_speechlm_model_from_snapshot(
-                resolved_model_id,
-                snapshot_dir,
-                local_files_only=effective_local_files_only,
-            )
-        except Exception as exc:  # noqa: BLE001
-            load_errors.append(exc)
+        load_errors: list[BaseException] = []
+        model = None
+        snapshot_contains_nemo_archive = _snapshot_contains_nemo_archive(snapshot_dir)
+        nemo_restore_attempts = 2 if snapshot_contains_nemo_archive else 1
+        for attempt_index in range(nemo_restore_attempts):
+            try:
+                model = _load_nemo_model_from_snapshot(nemo_asr, resolved_model_id, snapshot_dir)
+                break
+            except Exception as exc:  # noqa: BLE001
+                load_errors.append(exc)
+                if (attempt_index + 1) < nemo_restore_attempts:
+                    continue
 
-    if model is None and not effective_local_files_only:
-        try:
-            model = nemo_asr.models.ASRModel.from_pretrained(model_name=resolved_model_id)
-        except Exception as exc:  # noqa: BLE001
-            load_errors.append(exc)
-            model = None
+        if model is None and not snapshot_contains_nemo_archive:
+            try:
+                model = _load_nemo_speechlm_model_from_snapshot(
+                    resolved_model_id,
+                    snapshot_dir,
+                    local_files_only=effective_local_files_only,
+                )
+            except Exception as exc:  # noqa: BLE001
+                load_errors.append(exc)
 
+        if model is None and not effective_local_files_only:
+            try:
+                model = nemo_asr.models.ASRModel.from_pretrained(model_name=resolved_model_id)
+            except Exception as exc:  # noqa: BLE001
+                load_errors.append(exc)
+                model = None
+
+        if model is None:
+            for exc in load_errors:
+                if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
+                    raise _offline_model_error(resolved_model_id) from exc
+            preferred_error = load_errors[-1]
+            if snapshot_contains_nemo_archive:
+                preferred_error = load_errors[0]
+            raise RuntimeError(
+                f"Failed to initialize NeMo ASR model for {resolved_model_id!r} from snapshot "
+                f"{snapshot_dir!r}: {preferred_error}"
+            ) from preferred_error
+
+        _prepare_nemo_model_for_inference(model, resolved_model_id)
+
+        _NEMO_ASR_MODEL_CACHE[cache_key] = model
+        if effective_local_files_only:
+            _NEMO_ASR_MODEL_CACHE[resolved_model_id] = model
+        return model
+
+
+def _get_cached_nemo_asr_model(
+    cache_key: str,
+    resolved_model_id: str,
+    *,
+    effective_local_files_only: bool,
+) -> Any | None:
+    """Return one cached NeMo ASR model if it is already loaded."""
+    model = _NEMO_ASR_MODEL_CACHE.get(cache_key)
+    if model is None and effective_local_files_only:
+        model = _NEMO_ASR_MODEL_CACHE.get(resolved_model_id)
     if model is None:
-        for exc in load_errors:
-            if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
-                raise _offline_model_error(resolved_model_id) from exc
-        preferred_error = load_errors[-1]
-        if snapshot_contains_nemo_archive:
-            preferred_error = load_errors[0]
-        raise RuntimeError(
-            f"Failed to initialize NeMo ASR model for {resolved_model_id!r} from snapshot "
-            f"{snapshot_dir!r}: {preferred_error}"
-        ) from preferred_error
-
-    _apply_parakeet_runtime_compatibility(model, resolved_model_id)
+        return None
     _prepare_nemo_model_for_inference(model, resolved_model_id)
-
-    _NEMO_ASR_MODEL_CACHE[cache_key] = model
-    if effective_local_files_only:
-        _NEMO_ASR_MODEL_CACHE[resolved_model_id] = model
     return model
 
 
@@ -773,12 +880,28 @@ def transcribe_row_with_faster_whisper(row: Mapping[str, object], transcription_
 
 def transcribe_row_with_nemo_asr(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
     """Transcribe one diarized row with NeMo ASR and return text plus latency."""
+    _, resolved_model_id = _resolve_transcription_backend(transcription_model)
     model = _get_nemo_asr_model(transcription_model, local_files_only=True)
     audio_path = _extract_audio_path(row)
 
     started_at = time.perf_counter()
     if hasattr(model, "transcribe"):
-        output = model.transcribe([audio_path])
+        try:
+            output = model.transcribe([audio_path])
+        except Exception as exc:  # noqa: BLE001
+            if not _is_parakeet_cuda_graph_runtime_error(resolved_model_id, exc):
+                raise
+            LOGGER.warning(
+                "Parakeet decoder fast path failed for %s; retrying without CUDA-graph decoding: %s",
+                resolved_model_id,
+                exc,
+            )
+            with _NEMO_ASR_MODEL_LOAD_LOCK:
+                fallback_applied = _apply_parakeet_runtime_compatibility(model, resolved_model_id)
+                _prepare_nemo_model_for_inference(model, resolved_model_id)
+            if not fallback_applied:
+                raise
+            output = model.transcribe([audio_path])
         predicted_text = _transcription_output_to_text(output)
     elif hasattr(model, "generate"):
         audio_locator_tag = getattr(model, "audio_locator_tag", "<|audioplaceholder|>")
@@ -844,10 +967,15 @@ def preload_transcription_model(
 def release_transcription_runtime_resources(transcription_model: str | None = None) -> int:
     """Release cached ASR model instances so later stages can reclaim accelerator memory."""
     caches = _selected_transcription_model_caches(transcription_model)
-    models_to_release = _collect_unique_cached_models(caches)
-
-    for cache in caches:
-        cache.clear()
+    if _NEMO_ASR_MODEL_CACHE in caches:
+        with _NEMO_ASR_MODEL_LOAD_LOCK:
+            models_to_release = _collect_unique_cached_models(caches)
+            for cache in caches:
+                cache.clear()
+    else:
+        models_to_release = _collect_unique_cached_models(caches)
+        for cache in caches:
+            cache.clear()
     for model in models_to_release:
         _release_model_resources(model)
 

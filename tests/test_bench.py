@@ -236,8 +236,8 @@ def test_release_transcription_runtime_resources_clears_selected_backend_cache(
     assert bench_harness._FASTER_WHISPER_MODEL_CACHE == {"medium": faster_model}
     assert bench_harness._NEMO_ASR_MODEL_CACHE == {}
     assert bench_harness._QWEN_ASR_MODEL_CACHE == {"Qwen/Qwen3-ASR-1.7B": qwen_model}
-    assert observed["gc"] == 1
-    assert observed["cache_flush"] == 1
+    assert observed["gc"] == 2
+    assert observed["cache_flush"] == 2
 
 
 def test_cache_transcription_model_uses_nvidia_backend(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -364,18 +364,35 @@ def test_apply_parakeet_runtime_compatibility_disables_cuda_graph_decoder() -> N
         def __init__(self) -> None:
             self.decoding = FakeDecodingCfg()
 
+    class FakeDecoder:
+        def __init__(self) -> None:
+            self.use_cuda_graph_decoder = True
+            self.disable_calls = 0
+
+        def disable_cuda_graphs(self) -> None:
+            self.disable_calls += 1
+            self.use_cuda_graph_decoder = False
+
     class FakeModel:
         def __init__(self) -> None:
             self.cfg = FakeCfg()
+            self.decoding = FakeDecoder()
+            self.disable_calls = 0
             self.change_calls: list[tuple[object, bool]] = []
 
         def change_decoding_strategy(self, decoding_cfg: object, verbose: bool = True) -> None:
             self.change_calls.append((decoding_cfg, verbose))
 
+        def disable_cuda_graphs(self) -> None:
+            self.disable_calls += 1
+
     model = FakeModel()
     _apply_parakeet_runtime_compatibility(model, "nvidia/parakeet-tdt-0.6b-v3")
 
     assert model.cfg.decoding.greedy.use_cuda_graph_decoder is False
+    assert model.decoding.use_cuda_graph_decoder is False
+    assert model.disable_calls == 1
+    assert model.decoding.disable_calls == 1
     assert len(model.change_calls) == 1
     assert model.change_calls[0][0] is model.cfg.decoding
     assert model.change_calls[0][1] is False
