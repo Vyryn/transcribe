@@ -172,6 +172,18 @@ def test_write_pyinstaller_spec_builds_windowed_launcher(tmp_path: Path) -> None
     assert "console=False" in spec_text
 
 
+def test_installer_template_hides_shell_wrapper_and_shows_model_progress() -> None:
+    template_path = Path(__file__).resolve().parent.parent / "packaging" / "windows" / "transcribe_installer.iss"
+    template_text = template_path.read_text(encoding="utf-8")
+
+    assert "ExpandConstant('{cmd}')" not in template_text
+    assert 'set "TRANSCRIBE_ALLOW_NETWORK=1"' not in template_text
+    assert "SetEnvironmentVariableW@kernel32.dll" in template_text
+    assert "CreateOutputProgressPage" in template_text
+    assert "Installing model " in template_text
+    assert "ExpandConstant('{app}\\Transcribe.exe')" in template_text
+
+
 def test_select_github_asset_falls_back_to_windows_x64_runtime_archive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

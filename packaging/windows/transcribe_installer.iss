@@ -60,48 +60,56 @@ var
   VoiceCanaryCheckBox: TNewCheckBox;
   Notes4BCheckBox: TNewCheckBox;
   Notes2BCheckBox: TNewCheckBox;
+  ModelInstallProgressPage: TOutputProgressWizardPage;
 
-function BuildSelectedModelArguments(): String;
+function SetEnvironmentVariableW(lpName, lpValue: string): Boolean;
+  external 'SetEnvironmentVariableW@kernel32.dll stdcall';
+
+function CountSelectedModels(): Integer;
 begin
-  Result := '';
+  Result := 0;
   if VoiceParakeetCheckBox.Checked then
-    Result := Result + ' --model nvidia/parakeet-tdt-0.6b-v3';
+    Result := Result + 1;
   if VoiceCanaryCheckBox.Checked then
-    Result := Result + ' --model nvidia/canary-qwen-2.5b';
+    Result := Result + 1;
   if Notes4BCheckBox.Checked then
-    Result := Result + ' --model qwen3.5:4b-q4_K_M';
+    Result := Result + 1;
   if Notes2BCheckBox.Checked then
-    Result := Result + ' --model qwen3.5:2b-q4_K_M';
+    Result := Result + 1;
 end;
 
-function InstallSelectedModels(): Boolean;
+procedure UpdateModelInstallProgress(const CurrentIndex, TotalCount: Integer; const ModelLabel: String);
+begin
+  ModelInstallProgressPage.SetText(
+    'Downloading the selected transcription and notes models.',
+    'Installing model ' + IntToStr(CurrentIndex) + ' of ' + IntToStr(TotalCount) + ': ' + ModelLabel
+  );
+  ModelInstallProgressPage.SetProgress(CurrentIndex - 1, TotalCount);
+  WizardForm.StatusLabel.Caption :=
+    'Installing model ' + IntToStr(CurrentIndex) + ' of ' + IntToStr(TotalCount) + ': ' + ModelLabel;
+end;
+
+function InstallSelectedModel(
+  const ModelId, ModelLabel: String;
+  const CurrentIndex, TotalCount: Integer
+): Boolean;
 var
-  ModelArguments: String;
-  CommandLine: String;
   ResultCode: Integer;
 begin
   Result := True;
-  ModelArguments := BuildSelectedModelArguments();
-  if ModelArguments = '' then
-    Exit;
-
-  WizardForm.StatusLabel.Caption :=
-    'Downloading the selected transcription and notes models. This can take several minutes.';
-  CommandLine :=
-    '/C set "TRANSCRIBE_ALLOW_NETWORK=1" && "' + ExpandConstant('{app}\Transcribe.exe') +
-    '" models install' + ModelArguments;
+  UpdateModelInstallProgress(CurrentIndex, TotalCount, ModelLabel);
 
   if not Exec(
-    ExpandConstant('{cmd}'),
-    CommandLine,
-    '',
-    SW_SHOW,
+    ExpandConstant('{app}\Transcribe.exe'),
+    'models install --model ' + ModelId,
+    ExpandConstant('{app}'),
+    SW_HIDE,
     ewWaitUntilTerminated,
     ResultCode
   ) then
   begin
     MsgBox(
-      'The installer could not launch the bundled model downloader. ' +
+      'The installer could not launch the bundled model downloader for ' + ModelLabel + '. ' +
       'You can retry later from the installed application.',
       mbError,
       MB_OK
@@ -113,17 +121,115 @@ begin
   if ResultCode <> 0 then
   begin
     MsgBox(
-      'The installer could not download the selected models. ' +
+      'The installer could not download ' + ModelLabel + '. ' +
       'You can retry later from the installed application.',
       mbError,
       MB_OK
     );
     Result := False;
+    Exit;
+  end;
+
+  ModelInstallProgressPage.SetProgress(CurrentIndex, TotalCount);
+end;
+
+function InstallSelectedModels(): Boolean;
+var
+  OriginalNetworkValue: String;
+  CurrentIndex: Integer;
+  TotalCount: Integer;
+begin
+  Result := True;
+  TotalCount := CountSelectedModels();
+  if TotalCount = 0 then
+    Exit;
+
+  OriginalNetworkValue := GetEnv('TRANSCRIBE_ALLOW_NETWORK');
+  WizardForm.StatusLabel.Caption :=
+    'Downloading the selected transcription and notes models. This can take several minutes.';
+  ModelInstallProgressPage.SetText(
+    'Downloading the selected transcription and notes models.',
+    'Preparing model downloads...'
+  );
+  ModelInstallProgressPage.SetProgress(0, TotalCount);
+  ModelInstallProgressPage.Show;
+  SetEnvironmentVariableW('TRANSCRIBE_ALLOW_NETWORK', '1');
+
+  try
+    CurrentIndex := 0;
+
+    if VoiceParakeetCheckBox.Checked then
+    begin
+      CurrentIndex := CurrentIndex + 1;
+      if not InstallSelectedModel(
+        'nvidia/parakeet-tdt-0.6b-v3',
+        'Voice: NVIDIA Parakeet',
+        CurrentIndex,
+        TotalCount
+      ) then
+      begin
+        Result := False;
+        Exit;
+      end;
+    end;
+
+    if VoiceCanaryCheckBox.Checked then
+    begin
+      CurrentIndex := CurrentIndex + 1;
+      if not InstallSelectedModel(
+        'nvidia/canary-qwen-2.5b',
+        'Voice: NVIDIA Canary-Qwen 2.5B',
+        CurrentIndex,
+        TotalCount
+      ) then
+      begin
+        Result := False;
+        Exit;
+      end;
+    end;
+
+    if Notes4BCheckBox.Checked then
+    begin
+      CurrentIndex := CurrentIndex + 1;
+      if not InstallSelectedModel(
+        'qwen3.5:4b-q4_K_M',
+        'Notes: Qwen 3.5 4B GGUF',
+        CurrentIndex,
+        TotalCount
+      ) then
+      begin
+        Result := False;
+        Exit;
+      end;
+    end;
+
+    if Notes2BCheckBox.Checked then
+    begin
+      CurrentIndex := CurrentIndex + 1;
+      if not InstallSelectedModel(
+        'qwen3.5:2b-q4_K_M',
+        'Notes: Qwen 3.5 2B GGUF',
+        CurrentIndex,
+        TotalCount
+      ) then
+      begin
+        Result := False;
+        Exit;
+      end;
+    end;
+  finally
+    SetEnvironmentVariableW('TRANSCRIBE_ALLOW_NETWORK', OriginalNetworkValue);
+    ModelInstallProgressPage.Hide;
   end;
 end;
 
 procedure InitializeWizard();
 begin
+  ModelInstallProgressPage := CreateOutputProgressPage(
+    'Installing models',
+    'Downloading the selected transcription and notes models.'
+  );
+
   ModelsPage := CreateCustomPage(
     wpSelectTasks,
     'Model Downloads',
