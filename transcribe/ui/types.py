@@ -99,6 +99,7 @@ class SessionRequest:
     notes_model: str = DEFAULT_SESSION_NOTES_MODEL
     notes_runtime: str = DEFAULT_NOTES_RUNTIME
     notes_allow_reasoning: bool = False
+    notes_max_output_tokens: int | None = None
 
 
 @dataclass(slots=True)
@@ -126,6 +127,7 @@ class NotesRequest:
     notes_model: str = DEFAULT_SESSION_NOTES_MODEL
     notes_runtime: str = DEFAULT_NOTES_RUNTIME
     allow_reasoning: bool = True
+    max_output_tokens: int | None = None
 
 
 @dataclass(slots=True)

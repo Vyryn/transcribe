@@ -333,6 +333,7 @@ def run_session(
                 model=request.notes_model,
                 runtime=request.notes_runtime,
                 allow_reasoning=request.notes_allow_reasoning,
+                notes_max_output_tokens=request.notes_max_output_tokens,
             ),
             progress_callback=progress_callback,
         )
@@ -377,6 +378,7 @@ def run_notes(
             model=request.notes_model,
             runtime=request.notes_runtime,
             allow_reasoning=request.allow_reasoning,
+            notes_max_output_tokens=request.max_output_tokens,
         ),
         progress_callback=progress_callback,
     )

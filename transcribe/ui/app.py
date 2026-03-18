@@ -48,6 +48,20 @@ POLL_INTERVAL_MS = 75
 LOG_LEVEL_OPTIONS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
+def _parse_optional_positive_int(raw_value: str, *, field_name: str) -> int | None:
+    """Parse one optional positive integer from a text field."""
+    stripped = raw_value.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = int(stripped)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a whole number.") from exc
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be greater than 0.")
+    return parsed
+
+
 class StableCombobox(ttk.Combobox):
     """Combobox variant that normalizes Tk state values into plain strings."""
 
@@ -141,6 +155,7 @@ class SessionPage(BasePage):
         self.notes_model_var = tk.StringVar(value=services.DEFAULT_SESSION_NOTES_MODEL)
         self.notes_runtime_var = tk.StringVar(value=services.DEFAULT_NOTES_RUNTIME)
         self.notes_reasoning_var = tk.BooleanVar(value=False)
+        self.notes_max_output_tokens_var = tk.StringVar(value="")
         self.transcription_model_choices = services.transcription_model_options()
         self.notes_model_choices = services.notes_model_options()
         self.partial_text_var = tk.StringVar(value="")
@@ -292,20 +307,24 @@ class SessionPage(BasePage):
         ttk.Entry(self.advanced_content, textvariable=self.max_model_ram_var).grid(
             row=9, column=0, sticky="ew", padx=(0, 6), pady=(0, 6)
         )
-        ttk.Checkbutton(self.advanced_content, text="Fixture", variable=self.fixture_var).grid(
-            row=9, column=1, sticky="w", pady=(0, 6)
+        ttk.Label(self.advanced_content, text="Notes Max Tokens").grid(row=8, column=1, sticky="w")
+        ttk.Entry(self.advanced_content, textvariable=self.notes_max_output_tokens_var).grid(
+            row=9, column=1, sticky="ew", padx=(0, 6), pady=(0, 6)
         )
-        ttk.Checkbutton(self.advanced_content, text="Single Device/Source", variable=self.single_device_var).grid(
+        ttk.Checkbutton(self.advanced_content, text="Fixture", variable=self.fixture_var).grid(
             row=9, column=2, sticky="w", pady=(0, 6)
         )
-        ttk.Checkbutton(self.advanced_content, text="Strict Sources", variable=self.strict_sources_var).grid(
+        ttk.Checkbutton(self.advanced_content, text="Single Device/Source", variable=self.single_device_var).grid(
             row=9, column=3, sticky="w", pady=(0, 6)
         )
-        ttk.Checkbutton(self.advanced_content, text="Stitch Overlap", variable=self.stitch_overlap_var).grid(
+        ttk.Checkbutton(self.advanced_content, text="Strict Sources", variable=self.strict_sources_var).grid(
             row=10, column=0, sticky="w", pady=(4, 0)
         )
-        ttk.Checkbutton(self.advanced_content, text="Allow Notes Reasoning", variable=self.notes_reasoning_var).grid(
+        ttk.Checkbutton(self.advanced_content, text="Stitch Overlap", variable=self.stitch_overlap_var).grid(
             row=10, column=1, sticky="w", pady=(4, 0)
+        )
+        ttk.Checkbutton(self.advanced_content, text="Allow Notes Reasoning", variable=self.notes_reasoning_var).grid(
+            row=10, column=2, sticky="w", pady=(4, 0)
         )
 
         devices = ttk.LabelFrame(self, text="Available Devices")
@@ -444,6 +463,14 @@ class SessionPage(BasePage):
         self.partial_text_var.set("")
         output_root, session_id, _ = self._prepare_launch_paths()
         self.status_var.set("Starting session...")
+        try:
+            notes_max_output_tokens = _parse_optional_positive_int(
+                self.notes_max_output_tokens_var.get(),
+                field_name="Notes max output tokens",
+            )
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc))
+            return
         request = SessionRequest(
             common=self.app.common_options(),
             transcription_model=self.transcription_model_var.get().strip(),
@@ -465,6 +492,7 @@ class SessionPage(BasePage):
             notes_model=self.notes_model_var.get().strip(),
             notes_runtime=self.notes_runtime_var.get().strip(),
             notes_allow_reasoning=self.notes_reasoning_var.get(),
+            notes_max_output_tokens=notes_max_output_tokens,
         )
         self.app.start_task(
             "session",
@@ -821,15 +849,17 @@ class NotesPage(BasePage):
     def __init__(self, master: ttk.Frame, app: "TranscribeUiApp") -> None:
         super().__init__(master, app)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1)
         self.transcript_var = tk.StringVar(value="")
         self.output_dir_var = tk.StringVar(value="")
         self.model_var = tk.StringVar(value=services.DEFAULT_SESSION_NOTES_MODEL)
         self.model_choices = services.notes_model_options()
         self.runtime_var = tk.StringVar(value=services.DEFAULT_NOTES_RUNTIME)
+        self.max_output_tokens_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Idle")
         self.clean_path_var = tk.StringVar(value="")
         self.notes_path_var = tk.StringVar(value="")
+        self.advanced_visible = False
 
         controls = ttk.LabelFrame(self, text="Transcript Cleanup and Notes")
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 12))
@@ -874,13 +904,22 @@ class NotesPage(BasePage):
             row=6, column=2, sticky="ew"
         )
 
+        self.advanced_frame = ttk.LabelFrame(self, text="Advanced Notes Options")
+        self.advanced_frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        self.advanced_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.advanced_frame, text="Max Output Tokens").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self.advanced_frame, textvariable=self.max_output_tokens_var).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+
         log_frame = ttk.LabelFrame(self, text="Notes Progress")
-        log_frame.grid(row=1, column=0, sticky="nsew")
+        log_frame.grid(row=2, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.progress_text = ScrolledText(log_frame, wrap="word")
         self.progress_text.grid(row=0, column=0, sticky="nsew")
         self.progress_text.configure(state="disabled")
+        self.set_advanced_mode(False)
 
     def start(self) -> None:
         self.progress_text.configure(state="normal")
@@ -888,12 +927,21 @@ class NotesPage(BasePage):
         self.progress_text.configure(state="disabled")
         transcript_path = Path(self.transcript_var.get().strip())
         output_dir = Path(self.output_dir_var.get().strip()) if self.output_dir_var.get().strip() else None
+        try:
+            max_output_tokens = _parse_optional_positive_int(
+                self.max_output_tokens_var.get(),
+                field_name="Notes max output tokens",
+            )
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc))
+            return
         request = NotesRequest(
             common=self.app.common_options(),
             transcript_path=transcript_path,
             output_dir=output_dir,
             notes_model=self.model_var.get().strip(),
             notes_runtime=self.runtime_var.get().strip(),
+            max_output_tokens=max_output_tokens,
         )
         self.status_var.set("Running notes...")
         self.app.start_task(
@@ -902,6 +950,13 @@ class NotesPage(BasePage):
             on_progress=self.handle_progress,
             on_result=self.handle_result,
         )
+
+    def set_advanced_mode(self, advanced: bool) -> None:
+        self.advanced_visible = advanced
+        if advanced:
+            self.advanced_frame.grid()
+        else:
+            self.advanced_frame.grid_remove()
 
     def handle_progress(self, progress: ServiceProgressEvent) -> None:
         self._append_progress(f"{progress.name}: {progress.fields}")

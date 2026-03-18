@@ -15,7 +15,7 @@ from transcribe.audio.runner import run_capture_session
 from transcribe.live.session import LiveSessionConfig, LiveSessionResult, run_live_transcription_session
 from transcribe.models import AudioSourceMode, CaptureConfig
 from transcribe.ui.controller import UiTaskController
-from transcribe.ui.types import ComplianceResultSummary, SessionRequest, UiCommonOptions
+from transcribe.ui.types import ComplianceResultSummary, NotesRequest, SessionRequest, UiCommonOptions
 
 
 def test_run_capture_session_can_cancel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -225,12 +225,52 @@ def test_ui_run_session_passes_notes_reasoning_to_notes_pipeline(
         session_id="live-with-notes",
         notes_enabled=True,
         notes_allow_reasoning=False,
+        notes_max_output_tokens=1536,
     )
 
     result = services_module.run_session(request)
 
     assert result.notes_summary is not None
     assert observed["config"].allow_reasoning is False
+    assert observed["config"].notes_max_output_tokens == 1536
+
+
+def test_ui_run_notes_passes_max_output_tokens_to_notes_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import transcribe.notes as notes_module
+    import transcribe.ui.services as services_module
+
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(services_module, "configure_runtime", lambda common: None)
+
+    def fake_notes(config, *, progress_callback=None):
+        _ = progress_callback
+        observed["config"] = config
+        return notes_module.SessionNotesResult(
+            transcript_path=config.transcript_path,
+            clean_transcript_path=config.output_dir / "clean_transcript.txt",
+            client_notes_path=config.output_dir / "client_notes.txt",
+            model=config.model,
+            cpu_fallback_used=False,
+            clean_duration_sec=0.1,
+            notes_duration_sec=0.2,
+        )
+
+    monkeypatch.setattr(notes_module, "run_post_transcription_notes", fake_notes)
+
+    transcript_path = tmp_path / "transcript.txt"
+    transcript_path.write_text("hello\n", encoding="utf-8")
+    result = services_module.run_notes(
+        NotesRequest(
+            common=UiCommonOptions(),
+            transcript_path=transcript_path,
+            output_dir=tmp_path,
+            max_output_tokens=2048,
+        )
+    )
+
+    assert result.model == observed["config"].model
+    assert observed["config"].notes_max_output_tokens == 2048
 
 
 def test_ui_networked_tasks_require_network_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -548,19 +588,25 @@ def test_ui_smoke_instantiates_when_tk_available(
         assert hasattr(session_page, "transcription_model_combo")
         assert hasattr(session_page, "notes_model_combo")
         assert hasattr(session_page, "notes_reasoning_var")
+        assert hasattr(session_page, "notes_max_output_tokens_var")
         assert hasattr(notes_page, "model_combo")
+        assert hasattr(notes_page, "max_output_tokens_var")
         assert session_page.transcription_model_combo.cget("state") == "readonly"
         assert session_page.notes_model_combo.cget("state") == "readonly"
         assert session_page.notes_reasoning_var.get() is False
+        assert session_page.notes_max_output_tokens_var.get() == ""
         assert notes_page.model_combo.cget("state") == "readonly"
+        assert notes_page.max_output_tokens_var.get() == ""
         assert hasattr(session_page, "advanced_scrollbar")
         assert session_page.advanced_visible is False
         assert capture_page.advanced_visible is False
+        assert notes_page.advanced_visible is False
         app.advanced_ui_var.set(True)
         app.allow_network_var.set(True)
         app._apply_advanced_ui_state()
         assert session_page.advanced_visible is True
         assert capture_page.advanced_visible is True
+        assert notes_page.advanced_visible is True
         assert app.common_options().allow_network is True
     finally:
         _close_ui_app(app, root)
@@ -583,6 +629,7 @@ def test_session_page_start_passes_notes_reasoning_flag(
         session_page.output_root_var.set(str(tmp_path))
         session_page.session_id_var.set("ui-live")
         session_page.notes_reasoning_var.set(False)
+        session_page.notes_max_output_tokens_var.set("1536")
 
         monkeypatch.setattr(
             app_module.services,
@@ -601,5 +648,47 @@ def test_session_page_start_passes_notes_reasoning_flag(
 
         assert observed["task_name"] == "session"
         assert observed["request"].notes_allow_reasoning is False
+        assert observed["request"].notes_max_output_tokens == 1536
+    finally:
+        _close_ui_app(app, root)
+
+
+def test_notes_page_start_passes_max_output_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    tk_host_root: tuple[object, object],
+    tmp_path: Path,
+) -> None:
+    app_module, host_root = tk_host_root
+    monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
+    observed: dict[str, object] = {}
+    app = None
+    root = _create_ui_test_window(app_module, host_root)
+    try:
+        app = app_module.TranscribeUiApp(root, packaged_runtime=False)
+        notes_page = app.pages["notes"]
+        assert isinstance(notes_page, app_module.NotesPage)
+        transcript_path = tmp_path / "transcript.txt"
+        transcript_path.write_text("hello\n", encoding="utf-8")
+        notes_page.transcript_var.set(str(transcript_path))
+        notes_page.output_dir_var.set(str(tmp_path))
+        notes_page.max_output_tokens_var.set("2048")
+
+        monkeypatch.setattr(
+            app_module.services,
+            "run_notes",
+            lambda request, progress_callback=None: observed.setdefault("request", request),
+        )
+
+        def fake_start_task(task_name, runner, **kwargs):
+            _ = kwargs
+            observed["task_name"] = task_name
+            runner(None, None)
+
+        monkeypatch.setattr(app, "start_task", fake_start_task)
+
+        notes_page.start()
+
+        assert observed["task_name"] == "notes"
+        assert observed["request"].max_output_tokens == 2048
     finally:
         _close_ui_app(app, root)

@@ -146,6 +146,7 @@ class SessionNotesConfig:
     prompt_path: Path | None = None
     runtime: str = "auto"
     allow_reasoning: bool = True
+    notes_max_output_tokens: int | None = None
 
 
 @dataclass(slots=True)
@@ -468,11 +469,16 @@ def build_notes_execution_plan(
     model: str,
     transcript_units: list[str],
     prompt_template: str,
+    notes_max_output_tokens: int | None = None,
 ) -> NotesExecutionPlan:
     """Derive chunking and runtime settings for one notes generation request."""
     initial_clean_transcript = _join_transcript_units(transcript_units)
     cleanup_required = not _should_skip_cleanup(transcript_units)
     cleanup_chunk_words = _recommended_cleanup_chunk_words(model)
+    resolved_notes_output_max_tokens = _resolve_notes_output_max_tokens(
+        model,
+        notes_max_output_tokens=notes_max_output_tokens,
+    )
     cleanup_chunks = (
         tuple(build_cleanup_chunks(transcript_units, max_words=cleanup_chunk_words)) if cleanup_required else ()
     )
@@ -486,11 +492,11 @@ def build_notes_execution_plan(
         ),
     )
     notes_request = PromptRequestOptions(
-        max_tokens=_notes_output_max_tokens(model),
+        max_tokens=resolved_notes_output_max_tokens,
         context_tokens=_recommended_context_tokens(
             build_client_notes_prompt(prompt_template, initial_clean_transcript),
             minimum=_MIN_NOTES_CONTEXT_TOKENS,
-            output_max_tokens=_notes_output_max_tokens(model),
+            output_max_tokens=resolved_notes_output_max_tokens,
         ),
     )
     threads, threads_batch = _recommended_llama_cpp_thread_counts()
@@ -616,6 +622,15 @@ def _notes_output_max_tokens(model: str) -> int:
     return _FAST_NOTES_OUTPUT_MAX_TOKENS if _is_fast_notes_model(model) else _DEFAULT_NOTES_OUTPUT_MAX_TOKENS
 
 
+def _resolve_notes_output_max_tokens(model: str, *, notes_max_output_tokens: int | None) -> int:
+    """Resolve the effective notes output budget, preserving model defaults when unset."""
+    if notes_max_output_tokens is None:
+        return _notes_output_max_tokens(model)
+    if notes_max_output_tokens <= 0:
+        raise ValueError("notes_max_output_tokens must be > 0")
+    return notes_max_output_tokens
+
+
 def _is_fast_notes_model(model: str) -> bool:
     """Detect the smaller supported Qwen notes model."""
     lowered = model.strip().lower()
@@ -732,6 +747,7 @@ def run_post_transcription_notes(
         model=config.model,
         transcript_units=transcript_units,
         prompt_template=prompt_template,
+        notes_max_output_tokens=config.notes_max_output_tokens,
     )
     _emit_progress(
         progress_callback,
@@ -915,7 +931,10 @@ def _default_runtime_factory(
             context_tokens=_MIN_CLEANUP_CONTEXT_TOKENS,
         ),
         notes_request=PromptRequestOptions(
-            max_tokens=_notes_output_max_tokens(config.model),
+            max_tokens=_resolve_notes_output_max_tokens(
+                config.model,
+                notes_max_output_tokens=config.notes_max_output_tokens,
+            ),
             context_tokens=_MIN_NOTES_CONTEXT_TOKENS,
         ),
         llama_launch=LlamaCppLaunchConfig(

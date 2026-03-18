@@ -158,6 +158,28 @@ def test_build_notes_execution_plan_skips_cleanup_for_structured_transcript() ->
     assert plan.llama_launch.context_tokens >= 16_384
 
 
+def test_build_notes_execution_plan_uses_configured_notes_max_tokens() -> None:
+    plan = build_notes_execution_plan(
+        model="qwen3.5:4b-q4_K_M",
+        transcript_units=["Client reports improved mood and lower anxiety this week."],
+        prompt_template="WRITE THE NOTE",
+        notes_max_output_tokens=1536,
+    )
+
+    assert plan.notes_request.max_tokens == 1536
+    assert plan.notes_request.context_tokens >= 16_384
+
+
+def test_build_notes_execution_plan_rejects_non_positive_notes_max_tokens() -> None:
+    with pytest.raises(ValueError, match="notes_max_output_tokens"):
+        build_notes_execution_plan(
+            model="qwen3.5:4b-q4_K_M",
+            transcript_units=["Client reports improved mood and lower anxiety this week."],
+            prompt_template="WRITE THE NOTE",
+            notes_max_output_tokens=0,
+        )
+
+
 def test_run_post_transcription_notes_writes_clean_transcript_and_notes(tmp_path: Path) -> None:
     transcript_path = tmp_path / "rough_transcript.txt"
     transcript_path.write_text("um client says things\n", encoding="utf-8")
@@ -186,6 +208,29 @@ def test_run_post_transcription_notes_writes_clean_transcript_and_notes(tmp_path
     assert runtime.request_options[0] == PromptRequestOptions(max_tokens=384, context_tokens=8_192)
     assert runtime.request_options[1] == PromptRequestOptions(max_tokens=1_024, context_tokens=16_384)
     assert runtime_factory.calls == [False]
+
+
+def test_run_post_transcription_notes_uses_configured_notes_max_output_tokens(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "rough_transcript.txt"
+    transcript_path.write_text("um client says things\n", encoding="utf-8")
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("WRITE THE NOTE", encoding="utf-8")
+
+    runtime = FakePromptRuntime(["Clean transcript", "Client note"])
+    runtime_factory = FakeRuntimeFactory({False: [runtime], True: []})
+
+    run_post_transcription_notes(
+        SessionNotesConfig(
+            transcript_path=transcript_path,
+            output_dir=tmp_path / "notes_out",
+            model="qwen3.5:4b-q4_K_M",
+            prompt_path=prompt_path,
+            notes_max_output_tokens=1536,
+        ),
+        runtime_factory=runtime_factory,
+    )
+
+    assert runtime.request_options[1] == PromptRequestOptions(max_tokens=1_536, context_tokens=16_384)
 
 
 def test_run_post_transcription_notes_uses_multiple_cleanup_prompts_for_long_transcript(tmp_path: Path) -> None:
