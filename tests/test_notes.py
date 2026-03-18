@@ -154,7 +154,7 @@ def test_build_notes_execution_plan_skips_cleanup_for_structured_transcript() ->
     assert plan.cleanup_required is False
     assert plan.cleanup_chunks == ()
     assert plan.cleanup_request.max_tokens == 384
-    assert plan.notes_request.max_tokens == 768
+    assert plan.notes_request.max_tokens == 4096
     assert plan.llama_launch.context_tokens >= 16_384
 
 
@@ -206,7 +206,7 @@ def test_run_post_transcription_notes_writes_clean_transcript_and_notes(tmp_path
     assert "WRITE THE NOTE" in runtime.prompts[1]
     assert "Clean transcript" in runtime.prompts[1]
     assert runtime.request_options[0] == PromptRequestOptions(max_tokens=384, context_tokens=8_192)
-    assert runtime.request_options[1] == PromptRequestOptions(max_tokens=1_024, context_tokens=16_384)
+    assert runtime.request_options[1] == PromptRequestOptions(max_tokens=4_096, context_tokens=16_384)
     assert runtime_factory.calls == [False]
 
 
