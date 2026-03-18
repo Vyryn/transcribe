@@ -140,6 +140,7 @@ class SessionPage(BasePage):
         self.notes_enabled_var = tk.BooleanVar(value=True)
         self.notes_model_var = tk.StringVar(value=services.DEFAULT_SESSION_NOTES_MODEL)
         self.notes_runtime_var = tk.StringVar(value=services.DEFAULT_NOTES_RUNTIME)
+        self.notes_reasoning_var = tk.BooleanVar(value=False)
         self.transcription_model_choices = services.transcription_model_options()
         self.notes_model_choices = services.notes_model_options()
         self.partial_text_var = tk.StringVar(value="")
@@ -303,6 +304,9 @@ class SessionPage(BasePage):
         ttk.Checkbutton(self.advanced_content, text="Stitch Overlap", variable=self.stitch_overlap_var).grid(
             row=10, column=0, sticky="w", pady=(4, 0)
         )
+        ttk.Checkbutton(self.advanced_content, text="Allow Notes Reasoning", variable=self.notes_reasoning_var).grid(
+            row=10, column=1, sticky="w", pady=(4, 0)
+        )
 
         devices = ttk.LabelFrame(self, text="Available Devices")
         devices.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
@@ -460,6 +464,7 @@ class SessionPage(BasePage):
             notes_enabled=self.notes_enabled_var.get(),
             notes_model=self.notes_model_var.get().strip(),
             notes_runtime=self.notes_runtime_var.get().strip(),
+            notes_allow_reasoning=self.notes_reasoning_var.get(),
         )
         self.app.start_task(
             "session",

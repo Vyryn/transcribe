@@ -332,6 +332,7 @@ def run_session(
                 output_dir=result.session_dir,
                 model=request.notes_model,
                 runtime=request.notes_runtime,
+                allow_reasoning=request.notes_allow_reasoning,
             ),
             progress_callback=progress_callback,
         )
@@ -375,6 +376,7 @@ def run_notes(
             output_dir=output_dir,
             model=request.notes_model,
             runtime=request.notes_runtime,
+            allow_reasoning=request.allow_reasoning,
         ),
         progress_callback=progress_callback,
     )

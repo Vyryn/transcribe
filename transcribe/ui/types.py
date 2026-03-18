@@ -98,6 +98,7 @@ class SessionRequest:
     notes_enabled: bool = True
     notes_model: str = DEFAULT_SESSION_NOTES_MODEL
     notes_runtime: str = DEFAULT_NOTES_RUNTIME
+    notes_allow_reasoning: bool = False
 
 
 @dataclass(slots=True)
@@ -124,6 +125,7 @@ class NotesRequest:
     output_dir: Path | None = None
     notes_model: str = DEFAULT_SESSION_NOTES_MODEL
     notes_runtime: str = DEFAULT_NOTES_RUNTIME
+    allow_reasoning: bool = True
 
 
 @dataclass(slots=True)

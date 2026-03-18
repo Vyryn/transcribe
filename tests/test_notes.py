@@ -459,7 +459,7 @@ def test_temporary_llama_cpp_runtime_forces_cpu_layers_for_packaged_runtime(
     command = observed["command"]
     assert isinstance(command, list)
     assert "--reasoning" in command
-    assert command[command.index("--reasoning") + 1] == "off"
+    assert command[command.index("--reasoning") + 1] == "on"
     assert "--reasoning-format" in command
     assert command[command.index("--reasoning-format") + 1] == "none"
     assert "--n-gpu-layers" in command
@@ -516,6 +516,49 @@ def test_temporary_llama_cpp_runtime_uses_gpu_layers_when_backend_is_available(
     assert command[command.index("--n-gpu-layers") + 1] == "auto"
 
 
+def test_temporary_llama_cpp_runtime_can_disable_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    observed: dict[str, object] = {}
+
+    class _FakeProcess:
+        stderr = None
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            _ = timeout
+            return 0
+
+    def fake_popen(command, *, env, stdout, stderr, text, encoding, errors, creationflags):
+        _ = (env, stdout, stderr, text, encoding, errors, creationflags)
+        observed["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(notes_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(notes_module, "_loopback_host_for_free_port", lambda: "127.0.0.1:8080")
+    monkeypatch.setattr(notes_module, "_wait_for_llama_cpp_runtime_ready", lambda *, process, host: None)
+
+    with notes_module._temporary_llama_cpp_runtime(
+        executable=Path("llama-server.exe"),
+        model_path=Path("model.gguf"),
+        cpu_only=False,
+        allow_reasoning=False,
+    ):
+        pass
+
+    command = observed["command"]
+    assert isinstance(command, list)
+    assert "--reasoning" in command
+    assert command[command.index("--reasoning") + 1] == "off"
+
+
 def test_shared_llama_cpp_runtime_reuses_warm_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -534,8 +577,15 @@ def test_shared_llama_cpp_runtime_reuses_warm_process(
             _ = timeout
             return 0
 
-    def fake_start_llama_cpp_runtime(*, executable: Path, model_path: Path, cpu_only: bool, launch_config):
-        _ = (executable, model_path, cpu_only, launch_config)
+    def fake_start_llama_cpp_runtime(
+        *,
+        executable: Path,
+        model_path: Path,
+        cpu_only: bool,
+        launch_config,
+        allow_reasoning: bool,
+    ):
+        _ = (executable, model_path, cpu_only, launch_config, allow_reasoning)
         starts.append(1)
         return notes_module.LlamaCppRuntimeSession(
             binary_path=Path("llama-server.exe"),
@@ -559,6 +609,7 @@ def test_shared_llama_cpp_runtime_reuses_warm_process(
         model_path=Path("model.gguf"),
         cpu_only=False,
         launch_config=launch_config,
+        allow_reasoning=True,
     ):
         pass
 
@@ -567,6 +618,7 @@ def test_shared_llama_cpp_runtime_reuses_warm_process(
         model_path=Path("model.gguf"),
         cpu_only=False,
         launch_config=launch_config,
+        allow_reasoning=True,
     ):
         pass
 
@@ -668,8 +720,49 @@ def test_ollama_runtime_uses_http_chat_payload_with_request_options(
     assert observed["path"] == "/api/chat"
     assert observed["method"] == "POST"
     assert observed["payload"]["keep_alive"] == "10m"
-    assert observed["payload"]["think"] is False
+    assert observed["payload"]["think"] is True
     assert observed["payload"]["options"] == {"num_ctx": 12_288, "num_predict": 512}
+
+
+def test_ollama_runtime_can_disable_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    observed: dict[str, object] = {}
+
+    def fake_request(*, host: str, path: str, payload: dict[str, object] | None, timeout_sec: float, method: str = "POST") -> dict[str, object]:
+        observed["payload"] = payload
+        return {"message": {"content": "Client note"}}
+
+    monkeypatch.setattr(notes_module, "_ollama_request", fake_request)
+
+    runtime = notes_module.OllamaRuntimeSession(
+        env={"OLLAMA_HOST": "127.0.0.1:11434"},
+        host="127.0.0.1:11434",
+        allow_reasoning=False,
+    )
+    result = runtime.run_prompt(model="qwen3.5:4b-q4_K_M", prompt="hello")
+
+    assert result == "Client note"
+    assert observed["payload"]["think"] is False
+
+
+def test_ollama_runtime_rejects_reasoning_only_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    def fake_request(*, host: str, path: str, payload: dict[str, object] | None, timeout_sec: float, method: str = "POST") -> dict[str, object]:
+        _ = (host, path, payload, timeout_sec, method)
+        return {"message": {"content": "", "thinking": "reasoning"}}
+
+    monkeypatch.setattr(notes_module, "_ollama_request", fake_request)
+
+    runtime = notes_module.OllamaRuntimeSession(env={"OLLAMA_HOST": "127.0.0.1:11434"}, host="127.0.0.1:11434")
+
+    with pytest.raises(RuntimeError, match="reasoning content without a final answer"):
+        runtime.run_prompt(model="qwen3.5:4b-q4_K_M", prompt="hello")
 
 
 def test_llama_server_stream_request_rejects_reasoning_only_output(
@@ -697,6 +790,32 @@ def test_llama_server_stream_request_rejects_reasoning_only_output(
             path="/v1/chat/completions",
             payload={"stream": True},
             timeout_sec=30.0,
+            on_text_delta=lambda text: None,
+        )
+
+
+def test_ollama_stream_chat_request_rejects_reasoning_only_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    class _FakeResponse:
+        def __iter__(self):
+            yield b'{"message":{"thinking":"reasoning"}}\n'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            _ = (exc_type, exc, tb)
+            return False
+
+    monkeypatch.setattr(notes_module.urllib_request, "urlopen", lambda request, timeout: _FakeResponse())
+
+    with pytest.raises(RuntimeError, match="reasoning content without a final answer"):
+        notes_module._ollama_stream_chat_request(
+            host="127.0.0.1:11434",
+            payload={"stream": True},
             on_text_delta=lambda text: None,
         )
 

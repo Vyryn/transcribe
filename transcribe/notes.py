@@ -110,7 +110,7 @@ _SERVER_UNAVAILABLE_NEEDLES = (
     "timed out",
 )
 
-_SHARED_LLAMA_CPP_RUNTIMES: dict[tuple[str, str, bool, int, int, int], _SharedLlamaCppRuntimeEntry] = {}
+_SHARED_LLAMA_CPP_RUNTIMES: dict[tuple[str, str, bool, bool, int, int, int], _SharedLlamaCppRuntimeEntry] = {}
 _SHARED_LLAMA_CPP_RUNTIMES_LOCK = threading.Lock()
 
 
@@ -145,6 +145,7 @@ class SessionNotesConfig:
     client_notes_filename: str = DEFAULT_CLIENT_NOTES_FILENAME
     prompt_path: Path | None = None
     runtime: str = "auto"
+    allow_reasoning: bool = True
 
 
 @dataclass(slots=True)
@@ -223,6 +224,7 @@ class OllamaRuntimeSession:
 
     env: dict[str, str]
     host: str
+    allow_reasoning: bool = True
     server_process: subprocess.Popen[str] | None = None
 
     def ensure_model_available(self, model: str) -> None:
@@ -258,6 +260,7 @@ class OllamaRuntimeSession:
             prompt=prompt,
             request_options=request_options,
             stream=on_text_delta is not None,
+            allow_reasoning=self.allow_reasoning,
         )
         try:
             if on_text_delta is not None:
@@ -291,6 +294,12 @@ class OllamaRuntimeSession:
         if not isinstance(message, dict):
             raise NotesRuntimeError("Ollama runtime returned no message payload.")
         content = message.get("content")
+        thinking = message.get("thinking")
+        if isinstance(thinking, str) and thinking.strip() and content == "":
+            raise NotesRuntimeError(
+                "Ollama runtime returned reasoning content without a final answer. "
+                "This indicates a runtime/protocol problem rather than an empty note."
+            )
         if not isinstance(content, str):
             raise NotesRuntimeError("Ollama runtime returned non-text content.")
         return content
@@ -303,6 +312,7 @@ class LlamaCppRuntimeSession:
     binary_path: Path
     model_path: Path
     host: str
+    allow_reasoning: bool = True
     server_process: subprocess.Popen[str] | None = None
     launch_config: LlamaCppLaunchConfig | None = None
 
@@ -357,7 +367,7 @@ class LlamaCppRuntimeSession:
         if isinstance(reasoning_content, str) and reasoning_content.strip() and content == "":
             raise NotesRuntimeError(
                 "Bundled notes runtime returned reasoning content without a final answer. "
-                "Reasoning mode should be disabled for notes generation."
+                "This indicates a runtime/protocol problem rather than an empty note."
             )
         if not isinstance(content, str):
             raise NotesRuntimeError("Bundled notes runtime returned non-text content.")
@@ -923,11 +933,13 @@ def _default_runtime_factory(
             preferred_runtime=preferred_runtime,
             alternate_runtime=alternate_runtime,
             launch_config=resolved_execution_plan.llama_launch,
+            allow_reasoning=config.allow_reasoning,
         )
     return _runtime_factory_for_name(
         runtime_name,
         model=config.model,
         launch_config=resolved_execution_plan.llama_launch,
+        allow_reasoning=config.allow_reasoning,
     )
 
 
@@ -936,10 +948,22 @@ def _runtime_factory_for_name(
     *,
     model: str,
     launch_config: LlamaCppLaunchConfig,
+    allow_reasoning: bool,
 ) -> Callable[..., contextlib.AbstractContextManager[PromptRuntime]]:
     """Resolve one explicit runtime name into a context-manager factory."""
     if runtime_name == "ollama":
-        return open_ollama_runtime
+        @contextlib.contextmanager
+        def _factory(*, cpu_only: bool = False) -> Iterator[PromptRuntime]:
+            try:
+                with open_ollama_runtime(cpu_only=cpu_only, allow_reasoning=allow_reasoning) as runtime:
+                    yield runtime
+            except TypeError as exc:
+                if "allow_reasoning" not in str(exc):
+                    raise
+                with open_ollama_runtime(cpu_only=cpu_only) as runtime:
+                    yield runtime
+
+        return _factory
     if runtime_name == "llama_cpp":
 
         @contextlib.contextmanager
@@ -949,10 +973,11 @@ def _runtime_factory_for_name(
                     model=model,
                     cpu_only=cpu_only,
                     launch_config=launch_config,
+                    allow_reasoning=allow_reasoning,
                 ) as runtime:
                     yield runtime
             except TypeError as exc:
-                if "launch_config" not in str(exc):
+                if "launch_config" not in str(exc) and "allow_reasoning" not in str(exc):
                     raise
                 with open_llama_cpp_runtime(model=model, cpu_only=cpu_only) as runtime:
                     yield runtime
@@ -967,6 +992,7 @@ def _open_auto_notes_runtime(
     preferred_runtime: str,
     alternate_runtime: str,
     launch_config: LlamaCppLaunchConfig,
+    allow_reasoning: bool,
 ) -> Callable[..., contextlib.AbstractContextManager[PromptRuntime]]:
     """Build an auto runtime factory that can fall back across local runtimes."""
 
@@ -979,6 +1005,7 @@ def _open_auto_notes_runtime(
                 runtime_name,
                 model=model,
                 launch_config=launch_config,
+                allow_reasoning=allow_reasoning,
             )
             try:
                 with runtime_factory(cpu_only=cpu_only) as runtime:
@@ -1184,6 +1211,7 @@ def open_llama_cpp_runtime(
     model: str,
     cpu_only: bool = False,
     launch_config: LlamaCppLaunchConfig | None = None,
+    allow_reasoning: bool = True,
 ) -> Iterator[PromptRuntime]:
     """Yield a private bundled llama.cpp server runtime."""
     runtime_paths = resolve_app_runtime_paths()
@@ -1206,6 +1234,7 @@ def open_llama_cpp_runtime(
         model_path=model_path,
         cpu_only=cpu_only,
         launch_config=resolved_launch_config,
+        allow_reasoning=allow_reasoning,
     ) as runtime:
         yield runtime
 
@@ -1217,12 +1246,14 @@ def _shared_llama_cpp_runtime(
     model_path: Path,
     cpu_only: bool,
     launch_config: LlamaCppLaunchConfig,
+    allow_reasoning: bool,
 ) -> Iterator[LlamaCppRuntimeSession]:
     """Yield one shared llama.cpp runtime, keeping it warm for nearby notes runs."""
     cache_key = (
         str(executable.resolve()),
         str(model_path.resolve()),
         cpu_only,
+        allow_reasoning,
         launch_config.context_tokens,
         launch_config.threads,
         launch_config.threads_batch,
@@ -1238,6 +1269,7 @@ def _shared_llama_cpp_runtime(
                 model_path=model_path,
                 cpu_only=cpu_only,
                 launch_config=launch_config,
+                allow_reasoning=allow_reasoning,
             )
             _SHARED_LLAMA_CPP_RUNTIMES[cache_key] = cached_entry
         cached_entry.ref_count += 1
@@ -1260,6 +1292,7 @@ def _temporary_llama_cpp_runtime(
     model_path: Path,
     cpu_only: bool,
     launch_config: LlamaCppLaunchConfig | None = None,
+    allow_reasoning: bool = True,
 ) -> Iterator[LlamaCppRuntimeSession]:
     """Run a private llama.cpp server process on a free loopback port."""
     resolved_launch_config = launch_config or LlamaCppLaunchConfig(
@@ -1272,6 +1305,7 @@ def _temporary_llama_cpp_runtime(
         model_path=model_path,
         cpu_only=cpu_only,
         launch_config=resolved_launch_config,
+        allow_reasoning=allow_reasoning,
     )
     try:
         yield runtime
@@ -1281,24 +1315,24 @@ def _temporary_llama_cpp_runtime(
 
 
 @contextlib.contextmanager
-def open_ollama_runtime(*, cpu_only: bool = False) -> Iterator[PromptRuntime]:
+def open_ollama_runtime(*, cpu_only: bool = False, allow_reasoning: bool = True) -> Iterator[PromptRuntime]:
     """Yield a usable local Ollama runtime, starting a private server when needed."""
     default_env = _base_ollama_env(host=DEFAULT_OLLAMA_HOST)
     if cpu_only:
-        with _temporary_ollama_runtime(cpu_only=True) as runtime:
+        with _temporary_ollama_runtime(cpu_only=True, allow_reasoning=allow_reasoning) as runtime:
             yield runtime
         return
 
     if _ollama_runtime_available(host=DEFAULT_OLLAMA_HOST, timeout_sec=20.0):
-        yield OllamaRuntimeSession(env=default_env, host=DEFAULT_OLLAMA_HOST)
+        yield OllamaRuntimeSession(env=default_env, host=DEFAULT_OLLAMA_HOST, allow_reasoning=allow_reasoning)
         return
 
-    with _temporary_ollama_runtime(cpu_only=False) as runtime:
+    with _temporary_ollama_runtime(cpu_only=False, allow_reasoning=allow_reasoning) as runtime:
         yield runtime
 
 
 @contextlib.contextmanager
-def _temporary_ollama_runtime(*, cpu_only: bool) -> Iterator[OllamaRuntimeSession]:
+def _temporary_ollama_runtime(*, cpu_only: bool, allow_reasoning: bool) -> Iterator[OllamaRuntimeSession]:
     """Run a private `ollama serve` instance on a free loopback port."""
     executable = _ollama_executable()
     host = _loopback_host_for_free_port()
@@ -1322,7 +1356,12 @@ def _temporary_ollama_runtime(*, cpu_only: bool) -> Iterator[OllamaRuntimeSessio
     )
     try:
         _wait_for_runtime_ready(process=process, env=env)
-        yield OllamaRuntimeSession(env=env, host=host, server_process=process)
+        yield OllamaRuntimeSession(
+            env=env,
+            host=host,
+            allow_reasoning=allow_reasoning,
+            server_process=process,
+        )
     finally:
         _terminate_process(process)
 
@@ -1385,7 +1424,7 @@ def _cleanup_expired_shared_llama_cpp_runtimes() -> None:
 
 
 def _discard_shared_llama_cpp_runtime(
-    cache_key: tuple[str, str, bool, int, int, int],
+    cache_key: tuple[str, str, bool, bool, int, int, int],
     entry: _SharedLlamaCppRuntimeEntry,
 ) -> None:
     """Remove one cached llama.cpp runtime and terminate its process."""
@@ -1401,6 +1440,7 @@ def _create_shared_llama_cpp_runtime(
     model_path: Path,
     cpu_only: bool,
     launch_config: LlamaCppLaunchConfig,
+    allow_reasoning: bool,
 ) -> _SharedLlamaCppRuntimeEntry:
     """Start and cache one new shared llama.cpp runtime."""
     runtime = _start_llama_cpp_runtime(
@@ -1408,6 +1448,7 @@ def _create_shared_llama_cpp_runtime(
         model_path=model_path,
         cpu_only=cpu_only,
         launch_config=launch_config,
+        allow_reasoning=allow_reasoning,
     )
     LOGGER.info(
         "notes_llama_cpp_runtime_started",
@@ -1415,6 +1456,7 @@ def _create_shared_llama_cpp_runtime(
             "fields": {
                 "model_path": str(model_path),
                 "cpu_only": cpu_only,
+                "allow_reasoning": allow_reasoning,
                 "context_tokens": launch_config.context_tokens,
                 "threads": launch_config.threads,
                 "threads_batch": launch_config.threads_batch,
@@ -1434,6 +1476,7 @@ def _start_llama_cpp_runtime(
     model_path: Path,
     cpu_only: bool,
     launch_config: LlamaCppLaunchConfig,
+    allow_reasoning: bool,
 ) -> LlamaCppRuntimeSession:
     """Start one tuned llama.cpp server and wait for readiness."""
     host = _loopback_host_for_free_port()
@@ -1468,7 +1511,7 @@ def _start_llama_cpp_runtime(
         "--flash-attn",
         launch_config.flash_attention,
         "--reasoning",
-        "off",
+        "on" if allow_reasoning else "off",
         "--reasoning-format",
         "none",
         "--n-gpu-layers",
@@ -1495,6 +1538,7 @@ def _start_llama_cpp_runtime(
             "fields": {
                 "host": host,
                 "cpu_only": cpu_only,
+                "allow_reasoning": allow_reasoning,
                 "context_tokens": launch_config.context_tokens,
                 "threads": launch_config.threads,
                 "threads_batch": launch_config.threads_batch,
@@ -1507,6 +1551,7 @@ def _start_llama_cpp_runtime(
         binary_path=executable,
         model_path=model_path,
         host=host,
+        allow_reasoning=allow_reasoning,
         server_process=process,
         launch_config=launch_config,
     )
@@ -1704,6 +1749,7 @@ def _build_ollama_chat_payload(
     prompt: str,
     request_options: PromptRequestOptions | None,
     stream: bool,
+    allow_reasoning: bool,
 ) -> dict[str, object]:
     """Build one Ollama chat request payload."""
     options: dict[str, object] = {}
@@ -1714,7 +1760,7 @@ def _build_ollama_chat_payload(
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": stream,
-        "think": False,
+        "think": allow_reasoning,
         "keep_alive": DEFAULT_NOTES_MODEL_KEEP_ALIVE,
     }
     if options:
@@ -1789,6 +1835,7 @@ def _ollama_stream_chat_request(
         method="POST",
     )
     content_parts: list[str] = []
+    saw_reasoning_only_output = False
     try:
         with urllib_request.urlopen(request, timeout=_PROMPT_TIMEOUT_SEC) as response:
             for raw_line in response:
@@ -1804,7 +1851,15 @@ def _ollama_stream_chat_request(
                 message = parsed.get("message")
                 if not isinstance(message, dict):
                     continue
+                thinking_delta = message.get("thinking")
                 delta_text = message.get("content")
+                if (
+                    isinstance(thinking_delta, str)
+                    and thinking_delta
+                    and (not isinstance(delta_text, str) or not delta_text)
+                ):
+                    saw_reasoning_only_output = True
+                    continue
                 if not isinstance(delta_text, str) or not delta_text:
                     continue
                 content_parts.append(delta_text)
@@ -1821,6 +1876,11 @@ def _ollama_stream_chat_request(
         raise NotesRuntimeError(f"Unable to contact local Ollama runtime: {detail}") from exc
     except TimeoutError as exc:
         raise NotesRuntimeError("Ollama request timed out.") from exc
+    if not content_parts and saw_reasoning_only_output:
+        raise NotesRuntimeError(
+            "Ollama runtime streamed reasoning content without a final answer. "
+            "This indicates a runtime/protocol problem rather than an empty note."
+        )
     return "".join(content_parts)
 
 

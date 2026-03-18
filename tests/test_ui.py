@@ -170,6 +170,69 @@ def test_ui_run_session_skips_notes_when_no_final_segments(monkeypatch: pytest.M
     assert ("notes_skipped", {"reason": "no_final_segments"}) in progress_events
 
 
+def test_ui_run_session_passes_notes_reasoning_to_notes_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import transcribe.live.session as live_session_module
+    import transcribe.notes as notes_module
+    import transcribe.transcription_runtime as transcription_runtime
+    import transcribe.ui.services as services_module
+
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(services_module, "configure_runtime", lambda common: None)
+    monkeypatch.setattr(services_module, "validate_transcription_model_for_runtime", lambda model: model)
+
+    def fake_runner(config, *, use_fixture: bool = False, debug: bool = False, progress_callback=None, cancel_event=None):
+        _ = (config, use_fixture, debug, progress_callback, cancel_event)
+        return LiveSessionResult(
+            session_dir=tmp_path / "live-with-notes",
+            events_path=tmp_path / "live-with-notes" / "events.jsonl",
+            transcript_json_path=tmp_path / "live-with-notes" / "transcript.json",
+            transcript_txt_path=tmp_path / "live-with-notes" / "transcript.txt",
+            final_segment_count=1,
+            partial_event_count=0,
+            sample_rate_hz=16_000,
+            sample_rate_hz_requested=16_000,
+            total_audio_sec=1.0,
+            total_inference_sec=0.1,
+            source_selection_counts={"mic": 1},
+            interrupted=True,
+        )
+
+    def fake_notes(config, *, progress_callback=None):
+        _ = progress_callback
+        observed["config"] = config
+        return notes_module.SessionNotesResult(
+            transcript_path=config.transcript_path,
+            clean_transcript_path=config.output_dir / "clean_transcript.txt",
+            client_notes_path=config.output_dir / "client_notes.txt",
+            model=config.model,
+            cpu_fallback_used=False,
+            clean_duration_sec=0.1,
+            notes_duration_sec=0.2,
+        )
+
+    monkeypatch.setattr(live_session_module, "run_live_transcription_session", fake_runner)
+    monkeypatch.setattr(notes_module, "run_post_transcription_notes", fake_notes)
+    monkeypatch.setattr(transcription_runtime, "release_transcription_runtime_resources", lambda transcription_model: 0)
+
+    request = SessionRequest(
+        common=UiCommonOptions(),
+        transcription_model="unit-test-model",
+        output_root=tmp_path,
+        session_id="live-with-notes",
+        notes_enabled=True,
+        notes_allow_reasoning=False,
+    )
+
+    result = services_module.run_session(request)
+
+    assert result.notes_summary is not None
+    assert observed["config"].allow_reasoning is False
+
+
 def test_ui_networked_tasks_require_network_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     import transcribe.ui.services as services_module
 
@@ -484,9 +547,11 @@ def test_ui_smoke_instantiates_when_tk_available(
         assert session_page.stop_button.cget("style") == "Danger.TButton"
         assert hasattr(session_page, "transcription_model_combo")
         assert hasattr(session_page, "notes_model_combo")
+        assert hasattr(session_page, "notes_reasoning_var")
         assert hasattr(notes_page, "model_combo")
         assert session_page.transcription_model_combo.cget("state") == "readonly"
         assert session_page.notes_model_combo.cget("state") == "readonly"
+        assert session_page.notes_reasoning_var.get() is False
         assert notes_page.model_combo.cget("state") == "readonly"
         assert hasattr(session_page, "advanced_scrollbar")
         assert session_page.advanced_visible is False
@@ -497,5 +562,44 @@ def test_ui_smoke_instantiates_when_tk_available(
         assert session_page.advanced_visible is True
         assert capture_page.advanced_visible is True
         assert app.common_options().allow_network is True
+    finally:
+        _close_ui_app(app, root)
+
+
+def test_session_page_start_passes_notes_reasoning_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tk_host_root: tuple[object, object],
+    tmp_path: Path,
+) -> None:
+    app_module, host_root = tk_host_root
+    monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
+    observed: dict[str, object] = {}
+    app = None
+    root = _create_ui_test_window(app_module, host_root)
+    try:
+        app = app_module.TranscribeUiApp(root, packaged_runtime=False)
+        session_page = app.pages["session"]
+        assert isinstance(session_page, app_module.SessionPage)
+        session_page.output_root_var.set(str(tmp_path))
+        session_page.session_id_var.set("ui-live")
+        session_page.notes_reasoning_var.set(False)
+
+        monkeypatch.setattr(
+            app_module.services,
+            "run_session",
+            lambda request, cancel_event=None, progress_callback=None: observed.setdefault("request", request),
+        )
+
+        def fake_start_task(task_name, runner, **kwargs):
+            _ = kwargs
+            observed["task_name"] = task_name
+            runner(None, None)
+
+        monkeypatch.setattr(app, "start_task", fake_start_task)
+
+        session_page.start()
+
+        assert observed["task_name"] == "session"
+        assert observed["request"].notes_allow_reasoning is False
     finally:
         _close_ui_app(app, root)
