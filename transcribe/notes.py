@@ -45,6 +45,8 @@ _MIN_NOTES_CONTEXT_TOKENS = 16_384
 _CONTEXT_TOKEN_ROUNDING = 2_048
 _CONTEXT_ESTIMATE_SAFETY_TOKENS = 512
 _ESTIMATED_TOKENS_PER_WORD = 1.45
+_LLAMA_CPP_REASONING_BUDGET_FRACTION = 0.75
+_LLAMA_CPP_REASONING_BUDGET_MESSAGE = "Reasoning budget reached. End thinking and provide the final answer now."
 _MIN_WORDS_FOR_CLEANUP_SKIP = 80
 _CLEANUP_SKIP_MIN_PUNCTUATED_RATIO = 0.75
 _CLEANUP_SKIP_MIN_CAPITALIZED_RATIO = 0.75
@@ -110,7 +112,9 @@ _SERVER_UNAVAILABLE_NEEDLES = (
     "timed out",
 )
 
-_SHARED_LLAMA_CPP_RUNTIMES: dict[tuple[str, str, bool, bool, int, int, int], _SharedLlamaCppRuntimeEntry] = {}
+_SHARED_LLAMA_CPP_RUNTIMES: dict[
+    tuple[str, str, bool, bool, int, int, int, int, str | None], _SharedLlamaCppRuntimeEntry
+] = {}
 _SHARED_LLAMA_CPP_RUNTIMES_LOCK = threading.Lock()
 
 
@@ -179,6 +183,8 @@ class LlamaCppLaunchConfig:
     threads_batch: int
     parallel: int = 1
     flash_attention: str = "auto"
+    reasoning_budget_tokens: int = -1
+    reasoning_budget_message: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -507,6 +513,10 @@ def build_notes_execution_plan(
         ),
         threads=threads,
         threads_batch=threads_batch,
+        reasoning_budget_tokens=_llama_cpp_reasoning_budget_tokens(
+            max(cleanup_request.max_tokens, notes_request.max_tokens)
+        ),
+        reasoning_budget_message=_LLAMA_CPP_REASONING_BUDGET_MESSAGE,
     )
     return NotesExecutionPlan(
         cleanup_required=cleanup_required,
@@ -620,6 +630,13 @@ def _cleanup_output_max_tokens(model: str) -> int:
 def _notes_output_max_tokens(model: str) -> int:
     """Return the output token budget for client note generation."""
     return _FAST_NOTES_OUTPUT_MAX_TOKENS if _is_fast_notes_model(model) else _DEFAULT_NOTES_OUTPUT_MAX_TOKENS
+
+
+def _llama_cpp_reasoning_budget_tokens(max_output_tokens: int) -> int:
+    """Return the llama.cpp reasoning budget derived from one output-token limit."""
+    if max_output_tokens <= 0:
+        raise ValueError("max_output_tokens must be > 0")
+    return max(0, math.floor(max_output_tokens * _LLAMA_CPP_REASONING_BUDGET_FRACTION))
 
 
 def _resolve_notes_output_max_tokens(model: str, *, notes_max_output_tokens: int | None) -> int:
@@ -941,6 +958,13 @@ def _default_runtime_factory(
             context_tokens=_MIN_NOTES_CONTEXT_TOKENS,
             threads=_recommended_llama_cpp_thread_counts()[0],
             threads_batch=_recommended_llama_cpp_thread_counts()[1],
+            reasoning_budget_tokens=_llama_cpp_reasoning_budget_tokens(
+                _resolve_notes_output_max_tokens(
+                    config.model,
+                    notes_max_output_tokens=config.notes_max_output_tokens,
+                )
+            ),
+            reasoning_budget_message=_LLAMA_CPP_REASONING_BUDGET_MESSAGE,
         ),
     )
     runtime_name = (config.runtime or "auto").strip().lower()
@@ -1247,6 +1271,8 @@ def open_llama_cpp_runtime(
         context_tokens=_MIN_NOTES_CONTEXT_TOKENS,
         threads=_recommended_llama_cpp_thread_counts()[0],
         threads_batch=_recommended_llama_cpp_thread_counts()[1],
+        reasoning_budget_tokens=_llama_cpp_reasoning_budget_tokens(_DEFAULT_NOTES_OUTPUT_MAX_TOKENS),
+        reasoning_budget_message=_LLAMA_CPP_REASONING_BUDGET_MESSAGE,
     )
     with _shared_llama_cpp_runtime(
         executable=executable,
@@ -1276,6 +1302,8 @@ def _shared_llama_cpp_runtime(
         launch_config.context_tokens,
         launch_config.threads,
         launch_config.threads_batch,
+        launch_config.reasoning_budget_tokens,
+        launch_config.reasoning_budget_message,
     )
     with _SHARED_LLAMA_CPP_RUNTIMES_LOCK:
         _cleanup_expired_shared_llama_cpp_runtimes()
@@ -1318,6 +1346,8 @@ def _temporary_llama_cpp_runtime(
         context_tokens=_MIN_NOTES_CONTEXT_TOKENS,
         threads=_recommended_llama_cpp_thread_counts()[0],
         threads_batch=_recommended_llama_cpp_thread_counts()[1],
+        reasoning_budget_tokens=_llama_cpp_reasoning_budget_tokens(_DEFAULT_NOTES_OUTPUT_MAX_TOKENS),
+        reasoning_budget_message=_LLAMA_CPP_REASONING_BUDGET_MESSAGE,
     )
     runtime = _start_llama_cpp_runtime(
         executable=executable,
@@ -1443,7 +1473,7 @@ def _cleanup_expired_shared_llama_cpp_runtimes() -> None:
 
 
 def _discard_shared_llama_cpp_runtime(
-    cache_key: tuple[str, str, bool, bool, int, int, int],
+    cache_key: tuple[str, str, bool, bool, int, int, int, int, str | None],
     entry: _SharedLlamaCppRuntimeEntry,
 ) -> None:
     """Remove one cached llama.cpp runtime and terminate its process."""
@@ -1479,6 +1509,7 @@ def _create_shared_llama_cpp_runtime(
                 "context_tokens": launch_config.context_tokens,
                 "threads": launch_config.threads,
                 "threads_batch": launch_config.threads_batch,
+                "reasoning_budget_tokens": launch_config.reasoning_budget_tokens,
                 "host": runtime.host,
             }
         },
@@ -1532,10 +1563,14 @@ def _start_llama_cpp_runtime(
         "--reasoning",
         "on" if allow_reasoning else "off",
         "--reasoning-format",
-        "none",
+        "deepseek",
         "--n-gpu-layers",
         gpu_layers,
     ]
+    if allow_reasoning and launch_config.reasoning_budget_tokens >= 0:
+        command.extend(["--reasoning-budget", str(launch_config.reasoning_budget_tokens)])
+        if launch_config.reasoning_budget_message:
+            command.extend(["--reasoning-budget-message", launch_config.reasoning_budget_message])
     started_at = time.monotonic()
     process = subprocess.Popen(
         command,
@@ -1561,6 +1596,7 @@ def _start_llama_cpp_runtime(
                 "context_tokens": launch_config.context_tokens,
                 "threads": launch_config.threads,
                 "threads_batch": launch_config.threads_batch,
+                "reasoning_budget_tokens": launch_config.reasoning_budget_tokens,
                 "gpu_layers": gpu_layers,
                 "startup_sec": round(startup_sec, 3),
             }

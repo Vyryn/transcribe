@@ -156,6 +156,7 @@ def test_build_notes_execution_plan_skips_cleanup_for_structured_transcript() ->
     assert plan.cleanup_request.max_tokens == 384
     assert plan.notes_request.max_tokens == 4096
     assert plan.llama_launch.context_tokens >= 16_384
+    assert plan.llama_launch.reasoning_budget_tokens == 3072
 
 
 def test_build_notes_execution_plan_uses_configured_notes_max_tokens() -> None:
@@ -168,6 +169,7 @@ def test_build_notes_execution_plan_uses_configured_notes_max_tokens() -> None:
 
     assert plan.notes_request.max_tokens == 1536
     assert plan.notes_request.context_tokens >= 16_384
+    assert plan.llama_launch.reasoning_budget_tokens == 1152
 
 
 def test_build_notes_execution_plan_rejects_non_positive_notes_max_tokens() -> None:
@@ -428,6 +430,35 @@ def test_llama_cpp_runtime_retries_when_model_is_still_loading(
     assert responses == []
 
 
+def test_llama_cpp_runtime_uses_final_content_when_reasoning_is_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    def fake_request(*, host: str, path: str, payload: dict[str, object] | None, timeout_sec: float, method: str = "POST") -> dict[str, object]:
+        _ = (host, path, payload, timeout_sec, method)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "Client note",
+                        "reasoning_content": "thinking",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(notes_module, "_llama_server_request", fake_request)
+
+    runtime = LlamaCppRuntimeSession(
+        binary_path=Path("llama-server.exe"),
+        model_path=Path("model.gguf"),
+        host="127.0.0.1:1234",
+    )
+
+    assert runtime.run_prompt(model="ignored", prompt="hello") == "Client note"
+
+
 def test_llama_cpp_runtime_rejects_reasoning_only_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -506,7 +537,10 @@ def test_temporary_llama_cpp_runtime_forces_cpu_layers_for_packaged_runtime(
     assert "--reasoning" in command
     assert command[command.index("--reasoning") + 1] == "on"
     assert "--reasoning-format" in command
-    assert command[command.index("--reasoning-format") + 1] == "none"
+    assert command[command.index("--reasoning-format") + 1] == "deepseek"
+    assert "--reasoning-budget" in command
+    assert command[command.index("--reasoning-budget") + 1] == "3072"
+    assert "--reasoning-budget-message" in command
     assert "--n-gpu-layers" in command
     assert command[command.index("--n-gpu-layers") + 1] == "0"
     assert observed["encoding"] == "utf-8"
@@ -602,6 +636,8 @@ def test_temporary_llama_cpp_runtime_can_disable_reasoning(
     assert isinstance(command, list)
     assert "--reasoning" in command
     assert command[command.index("--reasoning") + 1] == "off"
+    assert "--reasoning-budget" not in command
+    assert "--reasoning-budget-message" not in command
 
 
 def test_shared_llama_cpp_runtime_reuses_warm_process(
@@ -750,7 +786,7 @@ def test_ollama_runtime_uses_http_chat_payload_with_request_options(
         observed["payload"] = payload
         observed["timeout_sec"] = timeout_sec
         observed["method"] = method
-        return {"message": {"content": "Client note"}}
+        return {"message": {"content": "Client note", "thinking": "reasoning"}}
 
     monkeypatch.setattr(notes_module, "_ollama_request", fake_request)
 
@@ -839,6 +875,41 @@ def test_llama_server_stream_request_rejects_reasoning_only_output(
         )
 
 
+def test_llama_server_stream_request_ignores_reasoning_deltas_when_text_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    emitted: list[str] = []
+
+    class _FakeResponse:
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n'
+            yield b'data: {"choices":[{"delta":{"content":"Client "}}]}\n'
+            yield b'data: {"choices":[{"delta":{"content":"note"}}]}\n'
+            yield b"data: [DONE]\n"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            _ = (exc_type, exc, tb)
+            return False
+
+    monkeypatch.setattr(notes_module.urllib_request, "urlopen", lambda request, timeout: _FakeResponse())
+
+    result = notes_module._llama_server_stream_request_once(
+        host="127.0.0.1:1234",
+        path="/v1/chat/completions",
+        payload={"stream": True},
+        timeout_sec=30.0,
+        on_text_delta=emitted.append,
+    )
+
+    assert result == "Client note"
+    assert emitted == ["Client ", "note"]
+
+
 def test_ollama_stream_chat_request_rejects_reasoning_only_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -863,6 +934,38 @@ def test_ollama_stream_chat_request_rejects_reasoning_only_output(
             payload={"stream": True},
             on_text_delta=lambda text: None,
         )
+
+
+def test_ollama_stream_chat_request_ignores_reasoning_deltas_when_text_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    emitted: list[str] = []
+
+    class _FakeResponse:
+        def __iter__(self):
+            yield b'{"message":{"thinking":"reasoning"}}\n'
+            yield b'{"message":{"content":"Client "}}\n'
+            yield b'{"message":{"content":"note"}}\n'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            _ = (exc_type, exc, tb)
+            return False
+
+    monkeypatch.setattr(notes_module.urllib_request, "urlopen", lambda request, timeout: _FakeResponse())
+
+    result = notes_module._ollama_stream_chat_request(
+        host="127.0.0.1:11434",
+        payload={"stream": True},
+        on_text_delta=emitted.append,
+    )
+
+    assert result == "Client note"
+    assert emitted == ["Client ", "note"]
 
 
 def test_base_ollama_env_limits_parallelism() -> None:
