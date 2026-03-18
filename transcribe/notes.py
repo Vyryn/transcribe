@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import atexit
 import contextlib
 import json
+import logging
+import math
 import os
 import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -24,11 +28,27 @@ from transcribe.runtime_env import (
     resolve_bundled_notes_model_path,
 )
 
+LOGGER = logging.getLogger("transcribe.notes")
+
 DEFAULT_CLEAN_TRANSCRIPT_FILENAME = "clean_transcript.txt"
 DEFAULT_CLIENT_NOTES_FILENAME = "client_notes.txt"
 DEFAULT_OLLAMA_HOST = "127.0.0.1:11434"
 DEFAULT_LLAMA_SERVER_HOST = "127.0.0.1"
-_MAX_CLEAN_TRANSCRIPT_CHUNK_WORDS = 700
+DEFAULT_NOTES_MODEL_KEEP_ALIVE = "10m"
+_DEFAULT_NOTES_OUTPUT_MAX_TOKENS = 1024
+_FAST_NOTES_OUTPUT_MAX_TOKENS = 768
+_DEFAULT_CLEANUP_OUTPUT_MAX_TOKENS = 384
+_DEFAULT_CLEANUP_CHUNK_WORDS = 640
+_FAST_CLEANUP_CHUNK_WORDS = 520
+_MIN_CLEANUP_CONTEXT_TOKENS = 8_192
+_MIN_NOTES_CONTEXT_TOKENS = 16_384
+_CONTEXT_TOKEN_ROUNDING = 2_048
+_CONTEXT_ESTIMATE_SAFETY_TOKENS = 512
+_ESTIMATED_TOKENS_PER_WORD = 1.45
+_MIN_WORDS_FOR_CLEANUP_SKIP = 80
+_CLEANUP_SKIP_MIN_PUNCTUATED_RATIO = 0.75
+_CLEANUP_SKIP_MIN_CAPITALIZED_RATIO = 0.75
+_SHARED_LLAMA_CPP_RUNTIME_IDLE_SEC = 600.0
 _TEMP_SERVER_START_TIMEOUT_SEC = 20.0
 _MODEL_LOADING_RETRY_TIMEOUT_SEC = 120.0
 _MODEL_LOADING_RETRY_INTERVAL_SEC = 0.5
@@ -46,10 +66,8 @@ Requirements:
 - Fix obvious punctuation, capitalization, spacing, and transcript chunk-boundary artifacts.
 - Correct obvious ASR wording mistakes only when the intended phrasing is strongly supported by nearby context.
 - Remove only text that is clearly ASR garbage, such as isolated non-words, impossible fragments, or duplicated overlap text.
-- When a short span is not recoverable, prefer the least-committal readable wording supported by the input instead of inventing specifics.
-- Do not summarize.
-- Do not add facts, interpretations, stage directions, or speaker labels that are not directly supported.
-- Do not include commentary, headings, markdown fences, or explanations.
+- When a short span is not recoverable, use the least-committal readable wording supported by the input.
+- Do not summarize, invent details, add labels, or include commentary.
 
 Rough transcript:
 """
@@ -61,6 +79,9 @@ Cleaned transcript:
 """
 _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 _THINK_BLOCK_RE = re.compile(r"(?is)<think>.*?</think>")
+_DISFLUENCY_TOKEN_RE = re.compile(r"(?i)\b(?:um+|uh+|erm+|hmm+|mm-hmm|mmm+)\b")
+_SENTENCE_END_RE = re.compile(r"""[.!?]["')\]]?$""")
+_GPU_BACKEND_NAME_RE = re.compile(r"(cuda|cublas|vulkan|opencl|hip|rocm|metal|sycl)", re.IGNORECASE)
 _GPU_ERROR_NEEDLES = (
     "cuda",
     "gpu",
@@ -81,6 +102,9 @@ _SERVER_UNAVAILABLE_NEEDLES = (
     "connection reset by peer",
     "timed out",
 )
+
+_SHARED_LLAMA_CPP_RUNTIMES: dict[tuple[str, str, bool, int, int, int], _SharedLlamaCppRuntimeEntry] = {}
+_SHARED_LLAMA_CPP_RUNTIMES_LOCK = threading.Lock()
 
 
 class NotesRuntimeError(RuntimeError):
@@ -129,6 +153,46 @@ class SessionNotesResult:
     notes_duration_sec: float
 
 
+@dataclass(slots=True, frozen=True)
+class PromptRequestOptions:
+    """Token-budget and context settings for one prompt request."""
+
+    max_tokens: int
+    context_tokens: int
+
+
+@dataclass(slots=True, frozen=True)
+class LlamaCppLaunchConfig:
+    """Launch-time tuning values for one llama.cpp server."""
+
+    context_tokens: int
+    threads: int
+    threads_batch: int
+    parallel: int = 1
+    flash_attention: str = "auto"
+
+
+@dataclass(slots=True, frozen=True)
+class NotesExecutionPlan:
+    """Derived runtime and prompt settings for one notes run."""
+
+    cleanup_required: bool
+    cleanup_chunks: tuple[str, ...]
+    initial_clean_transcript: str
+    cleanup_request: PromptRequestOptions
+    notes_request: PromptRequestOptions
+    llama_launch: LlamaCppLaunchConfig
+
+
+@dataclass(slots=True)
+class _SharedLlamaCppRuntimeEntry:
+    """Cached packaged llama.cpp runtime kept warm for nearby notes runs."""
+
+    runtime: LlamaCppRuntimeSession
+    expires_at: float
+    ref_count: int = 0
+
+
 class PromptRuntime(Protocol):
     """Protocol for runtime backends used in notes-generation tests and production."""
 
@@ -141,6 +205,7 @@ class PromptRuntime(Protocol):
         model: str,
         prompt: str,
         on_text_delta: Callable[[str], None] | None = None,
+        request_options: PromptRequestOptions | None = None,
     ) -> str:
         """Run one local prompt and return raw model output."""
 
@@ -154,15 +219,16 @@ class OllamaRuntimeSession:
     server_process: subprocess.Popen[str] | None = None
 
     def ensure_model_available(self, model: str) -> None:
-        result = _run_ollama_command(
-            ["show", model],
-            env=self.env,
-            timeout_sec=30.0,
-        )
-        if result.returncode == 0:
+        try:
+            _ollama_request(
+                host=self.host,
+                path="/api/show",
+                payload={"model": model},
+                timeout_sec=30.0,
+            )
             return
-
-        detail = _command_error_detail(result)
+        except NotesRuntimeError as exc:
+            detail = str(exc)
         if _is_model_missing_error(detail):
             raise NotesRuntimeError(
                 f"Session notes model {model!r} is not installed locally in Ollama. "
@@ -178,22 +244,29 @@ class OllamaRuntimeSession:
         model: str,
         prompt: str,
         on_text_delta: Callable[[str], None] | None = None,
+        request_options: PromptRequestOptions | None = None,
     ) -> str:
-        result = _run_ollama_command(
-            [
-                "run",
-                model,
-                "--hidethinking",
-                "--think=false",
-                "--nowordwrap",
-                "--keepalive=10m",
-            ],
-            env=self.env,
-            input_text=prompt,
-            timeout_sec=_PROMPT_TIMEOUT_SEC,
+        payload = _build_ollama_chat_payload(
+            model=model,
+            prompt=prompt,
+            request_options=request_options,
+            stream=on_text_delta is not None,
         )
-        if result.returncode != 0:
-            detail = _command_error_detail(result)
+        try:
+            if on_text_delta is not None:
+                return _ollama_stream_chat_request(
+                    host=self.host,
+                    payload=payload,
+                    on_text_delta=on_text_delta,
+                )
+            response = _ollama_request(
+                host=self.host,
+                path="/api/chat",
+                payload=payload,
+                timeout_sec=_PROMPT_TIMEOUT_SEC,
+            )
+        except NotesRuntimeError as exc:
+            detail = str(exc)
             if _is_model_missing_error(detail):
                 raise NotesRuntimeError(
                     f"Session notes model {model!r} is not installed locally in Ollama. "
@@ -207,9 +280,13 @@ class OllamaRuntimeSession:
                     "Start `ollama serve` or ensure the local daemon can accept requests."
                 )
             raise NotesRuntimeError(f"Ollama notes generation failed: {detail}")
-        if on_text_delta is not None and result.stdout:
-            on_text_delta(result.stdout)
-        return result.stdout
+        message = response.get("message")
+        if not isinstance(message, dict):
+            raise NotesRuntimeError("Ollama runtime returned no message payload.")
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise NotesRuntimeError("Ollama runtime returned non-text content.")
+        return content
 
 
 @dataclass(slots=True)
@@ -220,6 +297,7 @@ class LlamaCppRuntimeSession:
     model_path: Path
     host: str
     server_process: subprocess.Popen[str] | None = None
+    launch_config: LlamaCppLaunchConfig | None = None
 
     def ensure_model_available(self, model: str) -> None:
         if not self.binary_path.exists():
@@ -237,12 +315,17 @@ class LlamaCppRuntimeSession:
         model: str,
         prompt: str,
         on_text_delta: Callable[[str], None] | None = None,
+        request_options: PromptRequestOptions | None = None,
     ) -> str:
         del model
+        resolved_options = request_options or PromptRequestOptions(
+            max_tokens=_DEFAULT_NOTES_OUTPUT_MAX_TOKENS,
+            context_tokens=self.launch_config.context_tokens if self.launch_config is not None else _MIN_NOTES_CONTEXT_TOKENS,
+        )
         payload = {
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
-            "max_tokens": 2048,
+            "max_tokens": resolved_options.max_tokens,
             "stream": on_text_delta is not None,
         }
         if on_text_delta is not None:
@@ -351,6 +434,57 @@ def build_client_notes_prompt(prompt_template: str, clean_transcript: str) -> st
     return f"{prompt_template.strip()}\n\n{_NOTES_TRANSCRIPT_PREFIX}\n{clean_transcript.strip()}\n"
 
 
+def build_notes_execution_plan(
+    *,
+    model: str,
+    transcript_units: list[str],
+    prompt_template: str,
+) -> NotesExecutionPlan:
+    """Derive chunking and runtime settings for one notes generation request."""
+    initial_clean_transcript = _join_transcript_units(transcript_units)
+    cleanup_required = not _should_skip_cleanup(transcript_units)
+    cleanup_chunk_words = _recommended_cleanup_chunk_words(model)
+    cleanup_chunks = (
+        tuple(build_cleanup_chunks(transcript_units, max_words=cleanup_chunk_words))
+        if cleanup_required
+        else ()
+    )
+
+    cleanup_request = PromptRequestOptions(
+        max_tokens=_cleanup_output_max_tokens(model),
+        context_tokens=_recommended_context_tokens(
+            build_clean_transcript_prompt(max(cleanup_chunks, key=len, default=initial_clean_transcript)),
+            minimum=_MIN_CLEANUP_CONTEXT_TOKENS,
+            output_max_tokens=_cleanup_output_max_tokens(model),
+        ),
+    )
+    notes_request = PromptRequestOptions(
+        max_tokens=_notes_output_max_tokens(model),
+        context_tokens=_recommended_context_tokens(
+            build_client_notes_prompt(prompt_template, initial_clean_transcript),
+            minimum=_MIN_NOTES_CONTEXT_TOKENS,
+            output_max_tokens=_notes_output_max_tokens(model),
+        ),
+    )
+    threads, threads_batch = _recommended_llama_cpp_thread_counts()
+    llama_launch = LlamaCppLaunchConfig(
+        context_tokens=max(
+            notes_request.context_tokens,
+            cleanup_request.context_tokens if cleanup_required else 0,
+        ),
+        threads=threads,
+        threads_batch=threads_batch,
+    )
+    return NotesExecutionPlan(
+        cleanup_required=cleanup_required,
+        cleanup_chunks=cleanup_chunks,
+        initial_clean_transcript=initial_clean_transcript,
+        cleanup_request=cleanup_request,
+        notes_request=notes_request,
+        llama_launch=llama_launch,
+    )
+
+
 def _normalize_model_output(text: str) -> str:
     """Strip auxiliary output so persisted artifacts contain only model content."""
     normalized = _ANSI_ESCAPE_RE.sub("", text).strip()
@@ -375,6 +509,7 @@ def _run_normalized_prompt_with_retries(
     prompt: str,
     attempts: int = _EMPTY_MODEL_OUTPUT_RETRY_ATTEMPTS,
     on_text_delta: Callable[[str], None] | None = None,
+    request_options: PromptRequestOptions | None = None,
 ) -> str:
     """Run one prompt, retrying when the model returns only empty/auxiliary output."""
     last_output = ""
@@ -384,6 +519,7 @@ def _run_normalized_prompt_with_retries(
             model=model,
             prompt=prompt,
             on_text_delta=on_text_delta,
+            request_options=request_options,
         )
         normalized_output = _normalize_model_output(raw_output)
         if normalized_output:
@@ -398,29 +534,138 @@ def _run_runtime_prompt(
     model: str,
     prompt: str,
     on_text_delta: Callable[[str], None] | None = None,
+    request_options: PromptRequestOptions | None = None,
 ) -> str:
     """Call one runtime prompt method while tolerating older non-streaming runtimes."""
-    if on_text_delta is None:
-        return runtime.run_prompt(model=model, prompt=prompt)
-    try:
-        return runtime.run_prompt(
-            model=model,
-            prompt=prompt,
-            on_text_delta=on_text_delta,
-        )
-    except TypeError as exc:
-        if "on_text_delta" not in str(exc):
-            raise
-        result = runtime.run_prompt(model=model, prompt=prompt)
-        if result:
-            on_text_delta(result)
-        return result
+    kwargs: dict[str, object] = {
+        "model": model,
+        "prompt": prompt,
+    }
+    if request_options is not None:
+        kwargs["request_options"] = request_options
+    if on_text_delta is not None:
+        kwargs["on_text_delta"] = on_text_delta
+
+    stripped_kwargs: set[str] = set()
+    while True:
+        try:
+            result = runtime.run_prompt(**kwargs)
+            break
+        except TypeError as exc:
+            removed_any = False
+            detail = str(exc)
+            for optional_name in ("request_options", "on_text_delta"):
+                if optional_name in kwargs and optional_name in detail and optional_name not in stripped_kwargs:
+                    kwargs.pop(optional_name, None)
+                    stripped_kwargs.add(optional_name)
+                    removed_any = True
+            if not removed_any:
+                raise
+
+    if on_text_delta is not None and "on_text_delta" not in kwargs and result:
+        on_text_delta(result)
+    return result
 
 
 def _subprocess_creationflags_no_window() -> int:
     """Return Windows subprocess flags that avoid spawning a console window."""
     create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return int(create_no_window) if os.name == "nt" else 0
+
+
+def _recommended_cleanup_chunk_words(model: str) -> int:
+    """Return a model-aware cleanup chunk size tuned for laptop inference."""
+    return _FAST_CLEANUP_CHUNK_WORDS if _is_fast_notes_model(model) else _DEFAULT_CLEANUP_CHUNK_WORDS
+
+
+def _cleanup_output_max_tokens(model: str) -> int:
+    """Return the output token budget for transcript cleanup."""
+    _ = model
+    return _DEFAULT_CLEANUP_OUTPUT_MAX_TOKENS
+
+
+def _notes_output_max_tokens(model: str) -> int:
+    """Return the output token budget for client note generation."""
+    return _FAST_NOTES_OUTPUT_MAX_TOKENS if _is_fast_notes_model(model) else _DEFAULT_NOTES_OUTPUT_MAX_TOKENS
+
+
+def _is_fast_notes_model(model: str) -> bool:
+    """Detect the smaller supported Qwen notes model."""
+    lowered = model.strip().lower()
+    return ":2b" in lowered or "-2b" in lowered
+
+
+def _recommended_context_tokens(
+    prompt_text: str,
+    *,
+    minimum: int,
+    output_max_tokens: int,
+) -> int:
+    """Estimate a right-sized context window for one prompt."""
+    required_tokens = _estimate_prompt_tokens(prompt_text) + output_max_tokens + _CONTEXT_ESTIMATE_SAFETY_TOKENS
+    rounded_tokens = _round_up_to_multiple(required_tokens, _CONTEXT_TOKEN_ROUNDING)
+    return max(minimum, rounded_tokens)
+
+
+def _recommended_llama_cpp_thread_counts() -> tuple[int, int]:
+    """Choose conservative generation and prefill thread counts for a laptop CPU."""
+    cpu_count = os.process_cpu_count() or os.cpu_count() or 1
+    if cpu_count <= 2:
+        return cpu_count, cpu_count
+    return max(1, cpu_count - 1), cpu_count
+
+
+def _estimate_prompt_tokens(text: str) -> int:
+    """Estimate prompt tokens from rough text length heuristics."""
+    word_based = math.ceil(_word_count(text) * _ESTIMATED_TOKENS_PER_WORD)
+    char_based = math.ceil(len(text) / 4)
+    return max(1, word_based, char_based)
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    """Round one positive integer up to the nearest multiple."""
+    if multiple <= 0:
+        raise ValueError("multiple must be > 0")
+    return int(math.ceil(value / multiple) * multiple)
+
+
+def _join_transcript_units(transcript_units: list[str]) -> str:
+    """Join transcript units into one paragraph-preserving transcript string."""
+    return "\n\n".join(unit.strip() for unit in transcript_units if unit.strip()).strip()
+
+
+def _should_skip_cleanup(transcript_units: list[str]) -> bool:
+    """Return whether transcript cleanup can be skipped safely for already-structured text."""
+    if len(transcript_units) < 2:
+        return False
+
+    total_words = sum(_word_count(unit) for unit in transcript_units)
+    if total_words < _MIN_WORDS_FOR_CLEANUP_SKIP:
+        return False
+
+    punctuated_ratio = sum(1 for unit in transcript_units if _SENTENCE_END_RE.search(unit.strip())) / len(transcript_units)
+    capitalized_ratio = sum(1 for unit in transcript_units if _looks_capitalized_unit(unit)) / len(transcript_units)
+    disfluency_ratio = _count_disfluency_tokens(_join_transcript_units(transcript_units)) / max(1, total_words)
+    return (
+        punctuated_ratio >= _CLEANUP_SKIP_MIN_PUNCTUATED_RATIO
+        and capitalized_ratio >= _CLEANUP_SKIP_MIN_CAPITALIZED_RATIO
+        and disfluency_ratio <= 0.015
+    )
+
+
+def _looks_capitalized_unit(unit: str) -> bool:
+    """Return whether a transcript unit already looks sentence-cased."""
+    stripped = unit.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("Speaker "):
+        return True
+    return stripped[0].isupper()
+
+
+def _count_disfluency_tokens(text: str) -> int:
+    """Count simple filler/disfluency tokens used by cleanup-skipping heuristics."""
+    return len(_DISFLUENCY_TOKEN_RE.findall(text))
 
 
 def run_post_transcription_notes(
@@ -433,71 +678,86 @@ def run_post_transcription_notes(
     transcript_units = load_transcript_units(config.transcript_path)
     if not transcript_units:
         raise NotesRuntimeError(f"Transcript is empty: {config.transcript_path}")
-    cleanup_chunks = build_cleanup_chunks(transcript_units, max_words=_MAX_CLEAN_TRANSCRIPT_CHUNK_WORDS)
+    prompt_template = load_session_note_prompt(config.prompt_path)
+    execution_plan = build_notes_execution_plan(
+        model=config.model,
+        transcript_units=transcript_units,
+        prompt_template=prompt_template,
+    )
     _emit_progress(
         progress_callback,
         "notes_started",
         model=config.model,
-        cleanup_chunk_count=len(cleanup_chunks),
+        cleanup_chunk_count=len(execution_plan.cleanup_chunks),
     )
 
-    prompt_template = load_session_note_prompt(config.prompt_path)
     clean_transcript_path = config.output_dir / config.clean_transcript_filename
     client_notes_path = config.output_dir / config.client_notes_filename
-    factory = runtime_factory or _default_runtime_factory(config)
+    factory = runtime_factory or _default_runtime_factory(config, execution_plan=execution_plan)
 
     def _generate_once(*, cpu_only: bool) -> tuple[str, str, float, float]:
         with factory(cpu_only=cpu_only) as runtime:
             runtime.ensure_model_available(config.model)
 
-            _emit_progress(
-                progress_callback,
-                "clean_transcript_started",
-                chunk_count=len(cleanup_chunks),
-                cpu_only=cpu_only,
-            )
-            clean_started = time.monotonic()
-            cleaned_chunks: list[str] = []
-            for chunk_index, cleanup_chunk in enumerate(cleanup_chunks, start=1):
+            if execution_plan.cleanup_required:
                 _emit_progress(
                     progress_callback,
-                    "clean_transcript_chunk_started",
-                    chunk_index=chunk_index,
-                    chunk_count=len(cleanup_chunks),
+                    "clean_transcript_started",
+                    chunk_count=len(execution_plan.cleanup_chunks),
                     cpu_only=cpu_only,
                 )
-                cleaned_chunk = _run_normalized_prompt_with_retries(
-                    runtime=runtime,
-                    model=config.model,
-                    prompt=build_clean_transcript_prompt(cleanup_chunk),
-                )
-                if not cleaned_chunk:
-                    cleaned_chunk = cleanup_chunk.strip()
+                clean_started = time.monotonic()
+                cleaned_chunks: list[str] = []
+                for chunk_index, cleanup_chunk in enumerate(execution_plan.cleanup_chunks, start=1):
                     _emit_progress(
                         progress_callback,
-                        "clean_transcript_chunk_fallback",
+                        "clean_transcript_chunk_started",
                         chunk_index=chunk_index,
-                        chunk_count=len(cleanup_chunks),
+                        chunk_count=len(execution_plan.cleanup_chunks),
                         cpu_only=cpu_only,
                     )
+                    cleaned_chunk = _run_normalized_prompt_with_retries(
+                        runtime=runtime,
+                        model=config.model,
+                        prompt=build_clean_transcript_prompt(cleanup_chunk),
+                        request_options=execution_plan.cleanup_request,
+                    )
+                    if not cleaned_chunk:
+                        cleaned_chunk = cleanup_chunk.strip()
+                        _emit_progress(
+                            progress_callback,
+                            "clean_transcript_chunk_fallback",
+                            chunk_index=chunk_index,
+                            chunk_count=len(execution_plan.cleanup_chunks),
+                            cpu_only=cpu_only,
+                        )
+                    _emit_progress(
+                        progress_callback,
+                        "clean_transcript_chunk_ready",
+                        chunk_index=chunk_index,
+                        chunk_count=len(execution_plan.cleanup_chunks),
+                        cpu_only=cpu_only,
+                        text=cleaned_chunk,
+                    )
+                    cleaned_chunks.append(cleaned_chunk)
+                clean_transcript = "\n\n".join(chunk.strip() for chunk in cleaned_chunks if chunk.strip()).strip()
+                clean_duration_sec = time.monotonic() - clean_started
+            else:
+                clean_transcript = execution_plan.initial_clean_transcript
+                clean_duration_sec = 0.0
                 _emit_progress(
                     progress_callback,
-                    "clean_transcript_chunk_ready",
-                    chunk_index=chunk_index,
-                    chunk_count=len(cleanup_chunks),
+                    "clean_transcript_skipped",
                     cpu_only=cpu_only,
-                    text=cleaned_chunk,
                 )
-                cleaned_chunks.append(cleaned_chunk)
-            clean_transcript = "\n\n".join(chunk.strip() for chunk in cleaned_chunks if chunk.strip()).strip()
-            clean_duration_sec = time.monotonic() - clean_started
             if not clean_transcript:
                 raise NotesRuntimeError("Clean transcript generation returned no content.")
             _emit_progress(
                 progress_callback,
                 "clean_transcript_ready",
-                chunk_count=len(cleanup_chunks),
+                chunk_count=len(execution_plan.cleanup_chunks),
                 cpu_only=cpu_only,
+                skipped=not execution_plan.cleanup_required,
             )
 
             _emit_progress(
@@ -525,6 +785,7 @@ def run_post_transcription_notes(
                 model=config.model,
                 prompt=build_client_notes_prompt(prompt_template, clean_transcript),
                 on_text_delta=_emit_notes_delta,
+                request_options=execution_plan.notes_request,
             )
             notes_duration_sec = time.monotonic() - notes_started
             if not client_notes:
@@ -573,8 +834,28 @@ def _emit_progress(
 
 def _default_runtime_factory(
     config: SessionNotesConfig,
+    *,
+    execution_plan: NotesExecutionPlan | None = None,
 ) -> Callable[..., contextlib.AbstractContextManager[PromptRuntime]]:
     """Resolve the default notes runtime factory for one request."""
+    resolved_execution_plan = execution_plan or NotesExecutionPlan(
+        cleanup_required=True,
+        cleanup_chunks=(),
+        initial_clean_transcript="",
+        cleanup_request=PromptRequestOptions(
+            max_tokens=_cleanup_output_max_tokens(config.model),
+            context_tokens=_MIN_CLEANUP_CONTEXT_TOKENS,
+        ),
+        notes_request=PromptRequestOptions(
+            max_tokens=_notes_output_max_tokens(config.model),
+            context_tokens=_MIN_NOTES_CONTEXT_TOKENS,
+        ),
+        llama_launch=LlamaCppLaunchConfig(
+            context_tokens=_MIN_NOTES_CONTEXT_TOKENS,
+            threads=_recommended_llama_cpp_thread_counts()[0],
+            threads_batch=_recommended_llama_cpp_thread_counts()[1],
+        ),
+    )
     runtime_name = (config.runtime or "auto").strip().lower()
     if runtime_name in {"", "auto"}:
         preferred_runtime = default_notes_runtime()
@@ -583,20 +864,41 @@ def _default_runtime_factory(
             model=config.model,
             preferred_runtime=preferred_runtime,
             alternate_runtime=alternate_runtime,
+            launch_config=resolved_execution_plan.llama_launch,
         )
-    return _runtime_factory_for_name(runtime_name, model=config.model)
+    return _runtime_factory_for_name(
+        runtime_name,
+        model=config.model,
+        launch_config=resolved_execution_plan.llama_launch,
+    )
 
 
 def _runtime_factory_for_name(
     runtime_name: str,
     *,
     model: str,
+    launch_config: LlamaCppLaunchConfig,
 ) -> Callable[..., contextlib.AbstractContextManager[PromptRuntime]]:
     """Resolve one explicit runtime name into a context-manager factory."""
     if runtime_name == "ollama":
         return open_ollama_runtime
     if runtime_name == "llama_cpp":
-        return lambda *, cpu_only=False: open_llama_cpp_runtime(model=model, cpu_only=cpu_only)
+        @contextlib.contextmanager
+        def _factory(*, cpu_only: bool = False) -> Iterator[PromptRuntime]:
+            try:
+                with open_llama_cpp_runtime(
+                    model=model,
+                    cpu_only=cpu_only,
+                    launch_config=launch_config,
+                ) as runtime:
+                    yield runtime
+            except TypeError as exc:
+                if "launch_config" not in str(exc):
+                    raise
+                with open_llama_cpp_runtime(model=model, cpu_only=cpu_only) as runtime:
+                    yield runtime
+
+        return _factory
     raise NotesRuntimeError(f"Unsupported notes runtime {runtime_name!r}. Use 'auto', 'ollama', or 'llama_cpp'.")
 
 
@@ -605,6 +907,7 @@ def _open_auto_notes_runtime(
     model: str,
     preferred_runtime: str,
     alternate_runtime: str,
+    launch_config: LlamaCppLaunchConfig,
 ) -> Callable[..., contextlib.AbstractContextManager[PromptRuntime]]:
     """Build an auto runtime factory that can fall back across local runtimes."""
 
@@ -613,7 +916,11 @@ def _open_auto_notes_runtime(
         last_error: NotesRuntimeError | None = None
         attempted_messages: list[str] = []
         for runtime_name in (preferred_runtime, alternate_runtime):
-            runtime_factory = _runtime_factory_for_name(runtime_name, model=model)
+            runtime_factory = _runtime_factory_for_name(
+                runtime_name,
+                model=model,
+                launch_config=launch_config,
+            )
             try:
                 with runtime_factory(cpu_only=cpu_only) as runtime:
                     yield runtime
@@ -783,11 +1090,46 @@ def _word_count(text: str) -> int:
     return len(text.split())
 
 
+def _resolve_llama_cpp_executable(runtime_paths) -> Path | None:
+    """Resolve the best available llama-server binary for notes generation."""
+    primary_candidate = runtime_paths.notes_runtime_binary
+    candidates: list[Path] = [primary_candidate]
+
+    executable_name = primary_candidate.name
+    install_root = runtime_paths.install_root
+    candidates.extend(
+        (
+            install_root / "_internal" / "runtime" / "llm" / executable_name,
+            install_root.parent / "runtime" / "llm" / executable_name,
+        )
+    )
+
+    staged_runtime_candidates = sorted(
+        (install_root / "build" / "windows_standalone").glob(f"*/stage/runtime/llm/{executable_name}"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+        reverse=True,
+    )
+    candidates.extend(staged_runtime_candidates)
+
+    seen_paths: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        if resolved.exists():
+            return resolved.resolve()
+
+    path_lookup = shutil.which("llama-server")
+    return Path(path_lookup).resolve() if path_lookup is not None else None
+
+
 @contextlib.contextmanager
 def open_llama_cpp_runtime(
     *,
     model: str,
     cpu_only: bool = False,
+    launch_config: LlamaCppLaunchConfig | None = None,
 ) -> Iterator[PromptRuntime]:
     """Yield a private bundled llama.cpp server runtime."""
     runtime_paths = resolve_app_runtime_paths()
@@ -795,20 +1137,66 @@ def open_llama_cpp_runtime(
         model_path = resolve_bundled_notes_model_path(model, runtime_paths=runtime_paths)
     except ValueError as exc:
         raise NotesRuntimeError(str(exc)) from exc
-    executable = runtime_paths.notes_runtime_binary
-    if not executable.exists():
-        path_lookup = shutil.which("llama-server")
-        if path_lookup is None:
-            raise NotesRuntimeError(
-                "Session notes generation requires bundled llama-server or a local `llama-server` on PATH."
-            )
-        executable = Path(path_lookup)
-    with _temporary_llama_cpp_runtime(
+    executable = _resolve_llama_cpp_executable(runtime_paths)
+    if executable is None:
+        raise NotesRuntimeError(
+            "Session notes generation requires bundled llama-server or a local `llama-server` on PATH."
+        )
+    resolved_launch_config = launch_config or LlamaCppLaunchConfig(
+        context_tokens=_MIN_NOTES_CONTEXT_TOKENS,
+        threads=_recommended_llama_cpp_thread_counts()[0],
+        threads_batch=_recommended_llama_cpp_thread_counts()[1],
+    )
+    with _shared_llama_cpp_runtime(
         executable=executable,
         model_path=model_path,
         cpu_only=cpu_only,
+        launch_config=resolved_launch_config,
     ) as runtime:
         yield runtime
+
+
+@contextlib.contextmanager
+def _shared_llama_cpp_runtime(
+    *,
+    executable: Path,
+    model_path: Path,
+    cpu_only: bool,
+    launch_config: LlamaCppLaunchConfig,
+) -> Iterator[LlamaCppRuntimeSession]:
+    """Yield one shared llama.cpp runtime, keeping it warm for nearby notes runs."""
+    cache_key = (
+        str(executable.resolve()),
+        str(model_path.resolve()),
+        cpu_only,
+        launch_config.context_tokens,
+        launch_config.threads,
+        launch_config.threads_batch,
+    )
+    with _SHARED_LLAMA_CPP_RUNTIMES_LOCK:
+        _cleanup_expired_shared_llama_cpp_runtimes()
+        cached_entry = _SHARED_LLAMA_CPP_RUNTIMES.get(cache_key)
+        if cached_entry is None or not _shared_llama_cpp_runtime_healthy(cached_entry):
+            if cached_entry is not None:
+                _discard_shared_llama_cpp_runtime(cache_key, cached_entry)
+            cached_entry = _create_shared_llama_cpp_runtime(
+                executable=executable,
+                model_path=model_path,
+                cpu_only=cpu_only,
+                launch_config=launch_config,
+            )
+            _SHARED_LLAMA_CPP_RUNTIMES[cache_key] = cached_entry
+        cached_entry.ref_count += 1
+
+    try:
+        yield cached_entry.runtime
+    finally:
+        with _SHARED_LLAMA_CPP_RUNTIMES_LOCK:
+            active_entry = _SHARED_LLAMA_CPP_RUNTIMES.get(cache_key)
+            if active_entry is None:
+                return
+            active_entry.ref_count = max(0, active_entry.ref_count - 1)
+            active_entry.expires_at = time.monotonic() + _SHARED_LLAMA_CPP_RUNTIME_IDLE_SEC
 
 
 @contextlib.contextmanager
@@ -817,49 +1205,25 @@ def _temporary_llama_cpp_runtime(
     executable: Path,
     model_path: Path,
     cpu_only: bool,
+    launch_config: LlamaCppLaunchConfig | None = None,
 ) -> Iterator[LlamaCppRuntimeSession]:
     """Run a private llama.cpp server process on a free loopback port."""
-    host = _loopback_host_for_free_port()
-    host_name, port = _split_host_port(host)
-    env = os.environ.copy()
-    if cpu_only:
-        env.update(
-            {
-                "CUDA_VISIBLE_DEVICES": "-1",
-                "HIP_VISIBLE_DEVICES": "-1",
-                "ROCR_VISIBLE_DEVICES": "-1",
-                "GPU_DEVICE_ORDINAL": "-1",
-            }
-        )
-    command = [
-        str(executable),
-        "-m",
-        str(model_path),
-        "--host",
-        host_name or DEFAULT_LLAMA_SERVER_HOST,
-        "--port",
-        str(port),
-        "--n-gpu-layers",
-        "0",
-    ]
-    process = subprocess.Popen(
-        command,
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        **_subprocess_text_mode_kwargs(),
-        creationflags=_subprocess_creationflags_no_window(),
+    resolved_launch_config = launch_config or LlamaCppLaunchConfig(
+        context_tokens=_MIN_NOTES_CONTEXT_TOKENS,
+        threads=_recommended_llama_cpp_thread_counts()[0],
+        threads_batch=_recommended_llama_cpp_thread_counts()[1],
+    )
+    runtime = _start_llama_cpp_runtime(
+        executable=executable,
+        model_path=model_path,
+        cpu_only=cpu_only,
+        launch_config=resolved_launch_config,
     )
     try:
-        _wait_for_llama_cpp_runtime_ready(process=process, host=host)
-        yield LlamaCppRuntimeSession(
-            binary_path=executable,
-            model_path=model_path,
-            host=host,
-            server_process=process,
-        )
+        yield runtime
     finally:
-        _terminate_process(process)
+        if runtime.server_process is not None:
+            _terminate_process(runtime.server_process)
 
 
 @contextlib.contextmanager
@@ -871,19 +1235,12 @@ def open_ollama_runtime(*, cpu_only: bool = False) -> Iterator[PromptRuntime]:
             yield runtime
         return
 
-    availability = _run_ollama_command(["list"], env=default_env, timeout_sec=20.0)
-    if availability.returncode == 0:
+    if _ollama_runtime_available(host=DEFAULT_OLLAMA_HOST, timeout_sec=20.0):
         yield OllamaRuntimeSession(env=default_env, host=DEFAULT_OLLAMA_HOST)
         return
 
-    detail = _command_error_detail(availability)
-    if _is_gpu_runtime_error(detail):
-        raise NotesGpuRuntimeError(detail)
-    if _is_server_unavailable_error(detail):
-        with _temporary_ollama_runtime(cpu_only=False) as runtime:
-            yield runtime
-        return
-    raise NotesRuntimeError(f"Unable to initialize local Ollama runtime: {detail}")
+    with _temporary_ollama_runtime(cpu_only=False) as runtime:
+        yield runtime
 
 
 @contextlib.contextmanager
@@ -921,6 +1278,8 @@ def _base_ollama_env(*, host: str) -> dict[str, str]:
     env = os.environ.copy()
     env["OLLAMA_HOST"] = host
     env["OLLAMA_NOHISTORY"] = "1"
+    env["OLLAMA_KEEP_ALIVE"] = DEFAULT_NOTES_MODEL_KEEP_ALIVE
+    env["OLLAMA_NUM_PARALLEL"] = "1"
     return env
 
 
@@ -952,6 +1311,171 @@ def _loopback_host_for_free_port() -> str:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     return f"127.0.0.1:{port}"
+
+
+def _shared_llama_cpp_runtime_healthy(entry: _SharedLlamaCppRuntimeEntry) -> bool:
+    """Return whether one cached llama.cpp runtime can still be reused."""
+    process = entry.runtime.server_process
+    return process is not None and process.poll() is None
+
+
+def _cleanup_expired_shared_llama_cpp_runtimes() -> None:
+    """Terminate expired cached llama.cpp runtimes."""
+    now = time.monotonic()
+    for cache_key, entry in list(_SHARED_LLAMA_CPP_RUNTIMES.items()):
+        if entry.ref_count > 0:
+            continue
+        if entry.expires_at > now and _shared_llama_cpp_runtime_healthy(entry):
+            continue
+        _discard_shared_llama_cpp_runtime(cache_key, entry)
+
+
+def _discard_shared_llama_cpp_runtime(
+    cache_key: tuple[str, str, bool, int, int, int],
+    entry: _SharedLlamaCppRuntimeEntry,
+) -> None:
+    """Remove one cached llama.cpp runtime and terminate its process."""
+    _SHARED_LLAMA_CPP_RUNTIMES.pop(cache_key, None)
+    process = entry.runtime.server_process
+    if process is not None:
+        _terminate_process(process)
+
+
+def _create_shared_llama_cpp_runtime(
+    *,
+    executable: Path,
+    model_path: Path,
+    cpu_only: bool,
+    launch_config: LlamaCppLaunchConfig,
+) -> _SharedLlamaCppRuntimeEntry:
+    """Start and cache one new shared llama.cpp runtime."""
+    runtime = _start_llama_cpp_runtime(
+        executable=executable,
+        model_path=model_path,
+        cpu_only=cpu_only,
+        launch_config=launch_config,
+    )
+    LOGGER.info(
+        "notes_llama_cpp_runtime_started",
+        extra={
+            "fields": {
+                "model_path": str(model_path),
+                "cpu_only": cpu_only,
+                "context_tokens": launch_config.context_tokens,
+                "threads": launch_config.threads,
+                "threads_batch": launch_config.threads_batch,
+                "host": runtime.host,
+            }
+        },
+    )
+    return _SharedLlamaCppRuntimeEntry(
+        runtime=runtime,
+        expires_at=time.monotonic() + _SHARED_LLAMA_CPP_RUNTIME_IDLE_SEC,
+    )
+
+
+def _start_llama_cpp_runtime(
+    *,
+    executable: Path,
+    model_path: Path,
+    cpu_only: bool,
+    launch_config: LlamaCppLaunchConfig,
+) -> LlamaCppRuntimeSession:
+    """Start one tuned llama.cpp server and wait for readiness."""
+    host = _loopback_host_for_free_port()
+    host_name, port = _split_host_port(host)
+    env = os.environ.copy()
+    if cpu_only:
+        env.update(
+            {
+                "CUDA_VISIBLE_DEVICES": "-1",
+                "HIP_VISIBLE_DEVICES": "-1",
+                "ROCR_VISIBLE_DEVICES": "-1",
+                "GPU_DEVICE_ORDINAL": "-1",
+            }
+        )
+    gpu_layers = "0" if cpu_only or not _llama_cpp_gpu_backend_available(executable.parent) else "auto"
+    command = [
+        str(executable),
+        "-m",
+        str(model_path),
+        "--host",
+        host_name or DEFAULT_LLAMA_SERVER_HOST,
+        "--port",
+        str(port),
+        "--ctx-size",
+        str(launch_config.context_tokens),
+        "--threads",
+        str(launch_config.threads),
+        "--threads-batch",
+        str(launch_config.threads_batch),
+        "--parallel",
+        str(launch_config.parallel),
+        "--flash-attn",
+        launch_config.flash_attention,
+        "--n-gpu-layers",
+        gpu_layers,
+    ]
+    started_at = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        **_subprocess_text_mode_kwargs(),
+        creationflags=_subprocess_creationflags_no_window(),
+    )
+    try:
+        _wait_for_llama_cpp_runtime_ready(process=process, host=host)
+    except Exception:
+        _terminate_process(process)
+        raise
+    startup_sec = time.monotonic() - started_at
+    LOGGER.info(
+        "notes_llama_cpp_runtime_ready",
+        extra={
+            "fields": {
+                "host": host,
+                "cpu_only": cpu_only,
+                "context_tokens": launch_config.context_tokens,
+                "threads": launch_config.threads,
+                "threads_batch": launch_config.threads_batch,
+                "gpu_layers": gpu_layers,
+                "startup_sec": round(startup_sec, 3),
+            }
+        },
+    )
+    return LlamaCppRuntimeSession(
+        binary_path=executable,
+        model_path=model_path,
+        host=host,
+        server_process=process,
+        launch_config=launch_config,
+    )
+
+
+def _llama_cpp_gpu_backend_available(runtime_dir: Path) -> bool:
+    """Detect whether the staged llama.cpp runtime includes a GPU backend."""
+    try:
+        candidates = list(runtime_dir.iterdir())
+    except OSError:
+        return False
+    return any(_GPU_BACKEND_NAME_RE.search(candidate.name) for candidate in candidates if candidate.is_file())
+
+
+def _ollama_runtime_available(*, host: str, timeout_sec: float) -> bool:
+    """Return whether one Ollama server is reachable."""
+    try:
+        _ollama_request(
+            host=host,
+            path="/api/version",
+            payload=None,
+            timeout_sec=timeout_sec,
+            method="GET",
+        )
+        return True
+    except NotesRuntimeError:
+        return False
 
 
 def _wait_for_llama_cpp_runtime_ready(*, process: subprocess.Popen[str], host: str) -> None:
@@ -988,6 +1512,7 @@ def _wait_for_llama_cpp_runtime_ready(*, process: subprocess.Popen[str], host: s
 def _wait_for_runtime_ready(*, process: subprocess.Popen[str], env: dict[str, str]) -> None:
     """Poll until a private Ollama server is ready to accept requests."""
     deadline = time.monotonic() + _TEMP_SERVER_START_TIMEOUT_SEC
+    host = env.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
     while time.monotonic() < deadline:
         if process.poll() is not None:
             stderr = ""
@@ -998,8 +1523,7 @@ def _wait_for_runtime_ready(*, process: subprocess.Popen[str], env: dict[str, st
             detail = stderr or "temporary Ollama server exited before becoming ready"
             raise NotesRuntimeError(f"Unable to start local Ollama runtime: {detail}")
 
-        probe = _run_ollama_command(["list"], env=env, timeout_sec=5.0)
-        if probe.returncode == 0:
+        if _ollama_runtime_available(host=host, timeout_sec=5.0):
             return
         time.sleep(0.25)
 
@@ -1106,7 +1630,133 @@ def _llama_server_stream_request_once(
             raise NotesRuntimeError(detail) from exc
         raise NotesRuntimeError(f"Unable to contact bundled llama.cpp runtime: {detail}") from exc
     except TimeoutError as exc:
-        raise NotesRuntimeError("Bundled llama.cpp request timed out.") from exc
+                    raise NotesRuntimeError("Bundled llama.cpp request timed out.") from exc
+    return "".join(content_parts)
+
+
+def _build_ollama_chat_payload(
+    *,
+    model: str,
+    prompt: str,
+    request_options: PromptRequestOptions | None,
+    stream: bool,
+) -> dict[str, object]:
+    """Build one Ollama chat request payload."""
+    options: dict[str, object] = {}
+    if request_options is not None:
+        options["num_ctx"] = request_options.context_tokens
+        options["num_predict"] = request_options.max_tokens
+    payload: dict[str, object] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": stream,
+        "think": False,
+        "keep_alive": DEFAULT_NOTES_MODEL_KEEP_ALIVE,
+    }
+    if options:
+        payload["options"] = options
+    return payload
+
+
+def _ollama_request(
+    *,
+    host: str,
+    path: str,
+    payload: dict[str, object] | None,
+    timeout_sec: float,
+    method: str = "POST",
+) -> dict[str, object]:
+    """Call one Ollama HTTP endpoint and decode JSON."""
+    data: bytes | None = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    runtime_url = urllib_parse.urlunsplit(("http", host, path, "", ""))
+    request = urllib_request.Request(
+        runtime_url,
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_sec) as response:
+            body = response.read().decode("utf-8").strip()
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        if _is_gpu_runtime_error(detail):
+            raise NotesGpuRuntimeError(detail) from exc
+        raise NotesRuntimeError(detail or f"Ollama server returned HTTP {exc.code}") from exc
+    except urllib_error.URLError as exc:
+        detail = str(exc.reason or exc).strip()
+        if _is_server_unavailable_error(detail):
+            raise NotesRuntimeError(detail) from exc
+        raise NotesRuntimeError(f"Unable to contact local Ollama runtime: {detail}") from exc
+    except TimeoutError as exc:
+        raise NotesRuntimeError("Ollama request timed out.") from exc
+
+    if not body:
+        return {}
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise NotesRuntimeError("Ollama runtime returned invalid JSON.") from exc
+    if not isinstance(parsed, dict):
+        raise NotesRuntimeError("Ollama runtime returned an unexpected JSON payload.")
+    return parsed
+
+
+def _ollama_stream_chat_request(
+    *,
+    host: str,
+    payload: dict[str, object],
+    on_text_delta: Callable[[str], None],
+) -> str:
+    """Stream one Ollama chat response and emit text deltas as they arrive."""
+    data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    runtime_url = urllib_parse.urlunsplit(("http", host, "/api/chat", "", ""))
+    request = urllib_request.Request(
+        runtime_url,
+        data=data,
+        headers={
+            "Accept": "application/x-ndjson",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    content_parts: list[str] = []
+    try:
+        with urllib_request.urlopen(request, timeout=_PROMPT_TIMEOUT_SEC) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise NotesRuntimeError("Ollama runtime returned invalid stream JSON.") from exc
+                if not isinstance(parsed, dict):
+                    raise NotesRuntimeError("Ollama runtime returned an unexpected stream payload.")
+                message = parsed.get("message")
+                if not isinstance(message, dict):
+                    continue
+                delta_text = message.get("content")
+                if not isinstance(delta_text, str) or not delta_text:
+                    continue
+                content_parts.append(delta_text)
+                on_text_delta(delta_text)
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        if _is_gpu_runtime_error(detail):
+            raise NotesGpuRuntimeError(detail) from exc
+        raise NotesRuntimeError(detail or f"Ollama server returned HTTP {exc.code}") from exc
+    except urllib_error.URLError as exc:
+        detail = str(exc.reason or exc).strip()
+        if _is_server_unavailable_error(detail):
+            raise NotesRuntimeError(detail) from exc
+        raise NotesRuntimeError(f"Unable to contact local Ollama runtime: {detail}") from exc
+    except TimeoutError as exc:
+        raise NotesRuntimeError("Ollama request timed out.") from exc
     return "".join(content_parts)
 
 
@@ -1220,3 +1870,13 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5.0)
+
+
+def _shutdown_shared_llama_cpp_runtimes() -> None:
+    """Terminate any cached llama.cpp runtimes during interpreter shutdown."""
+    with _SHARED_LLAMA_CPP_RUNTIMES_LOCK:
+        for cache_key, entry in list(_SHARED_LLAMA_CPP_RUNTIMES.items()):
+            _discard_shared_llama_cpp_runtime(cache_key, entry)
+
+
+atexit.register(_shutdown_shared_llama_cpp_runtimes)

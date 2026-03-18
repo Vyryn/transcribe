@@ -216,6 +216,9 @@ def _build_notes_progress_reporter() -> Callable[[str, dict[str, object]], None]
             if chunk_count > 1:
                 print(f"Cleanup pass {chunk_index}/{chunk_count}...")
             return
+        if event == "clean_transcript_skipped":
+            print("Clean transcript already looks structured; skipping cleanup pass.")
+            return
         if event == "clean_transcript_ready":
             print("Clean transcript ready.")
             return

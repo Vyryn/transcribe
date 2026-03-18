@@ -4,15 +4,18 @@ import argparse
 import contextlib
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from transcribe.notes import (
     LlamaCppRuntimeSession,
     NotesGpuRuntimeError,
+    PromptRequestOptions,
     SessionNotesConfig,
     SessionNotesResult,
     _default_runtime_factory,
+    build_notes_execution_plan,
     build_cleanup_chunks,
     build_clean_transcript_prompt,
     build_client_notes_prompt,
@@ -30,17 +33,29 @@ class FakePromptRuntime:
         self._responses = list(responses)
         self.checked_models: list[str] = []
         self.prompts: list[str] = []
+        self.request_options: list[PromptRequestOptions | None] = []
 
     def ensure_model_available(self, model: str) -> None:
         self.checked_models.append(model)
 
-    def run_prompt(self, *, model: str, prompt: str) -> str:
+    def run_prompt(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        on_text_delta=None,
+        request_options: PromptRequestOptions | None = None,
+    ) -> str:
         self.checked_models.append(model)
         self.prompts.append(prompt)
+        self.request_options.append(request_options)
         response = self._responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return str(response)
+        text = str(response)
+        if on_text_delta is not None and text:
+            on_text_delta(text)
+        return text
 
 
 class FakeRuntimeFactory:
@@ -111,6 +126,38 @@ def test_build_cleanup_chunks_splits_long_transcripts_by_word_budget() -> None:
     assert any("Speaker B: short reply" in chunk for chunk in chunks)
 
 
+def test_build_notes_execution_plan_skips_cleanup_for_structured_transcript() -> None:
+    transcript_units = [
+        "Speaker A: Client reports improved sleep and lower anxiety after taking time off. "
+        "Client says morning routines, reduced overtime, and clearer boundaries have helped noticeably. "
+        "Client also reports fewer early-morning awakenings and steadier energy during the day.",
+        "Speaker B: Therapist reflected the improvement and asked what helped most. "
+        "Therapist also reviewed how the client handled work stress during the week. "
+        "Therapist highlighted the difference between this week and the prior month.",
+        "Speaker A: Client identified boundaries at work and daily walks as the main changes. "
+        "Client describes fewer spirals, better rest, and more patience at home. "
+        "Client says evening routines felt calmer and less rushed this week.",
+        "Speaker B: Therapist reinforced the observed progress and asked how the client wants to maintain it. "
+        "Therapist summarized the practical habits that seemed most effective. "
+        "Therapist also reflected the client's growing confidence in using those habits.",
+        "Speaker A: Client reports the session felt clarifying and says the plan is to continue the same routines. "
+        "Client adds that communication with their partner felt calmer this week. "
+        "Client reports feeling more hopeful about sustaining the recent changes.",
+    ]
+
+    plan = build_notes_execution_plan(
+        model="qwen3.5:2b-q4_K_M",
+        transcript_units=transcript_units,
+        prompt_template="WRITE THE NOTE",
+    )
+
+    assert plan.cleanup_required is False
+    assert plan.cleanup_chunks == ()
+    assert plan.cleanup_request.max_tokens == 384
+    assert plan.notes_request.max_tokens == 768
+    assert plan.llama_launch.context_tokens >= 16_384
+
+
 def test_run_post_transcription_notes_writes_clean_transcript_and_notes(tmp_path: Path) -> None:
     transcript_path = tmp_path / "rough_transcript.txt"
     transcript_path.write_text("um client says things\n", encoding="utf-8")
@@ -136,6 +183,8 @@ def test_run_post_transcription_notes_writes_clean_transcript_and_notes(tmp_path
     assert "um client says things" in runtime.prompts[0]
     assert "WRITE THE NOTE" in runtime.prompts[1]
     assert "Clean transcript" in runtime.prompts[1]
+    assert runtime.request_options[0] == PromptRequestOptions(max_tokens=384, context_tokens=8_192)
+    assert runtime.request_options[1] == PromptRequestOptions(max_tokens=1_024, context_tokens=16_384)
     assert runtime_factory.calls == [False]
 
 
@@ -358,6 +407,145 @@ def test_temporary_llama_cpp_runtime_forces_cpu_layers_for_packaged_runtime(
     assert observed["creationflags"] == notes_module._subprocess_creationflags_no_window()
 
 
+def test_temporary_llama_cpp_runtime_uses_gpu_layers_when_backend_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import transcribe.notes as notes_module
+
+    observed: dict[str, object] = {}
+
+    runtime_dir = tmp_path / "llm"
+    runtime_dir.mkdir()
+    executable = runtime_dir / "llama-server.exe"
+    executable.write_text("", encoding="utf-8")
+    (runtime_dir / "ggml-cuda.dll").write_text("", encoding="utf-8")
+
+    class _FakeProcess:
+        stderr = None
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            _ = timeout
+            return 0
+
+    def fake_popen(command, *, env, stdout, stderr, text, encoding, errors, creationflags):
+        observed["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(notes_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(notes_module, "_loopback_host_for_free_port", lambda: "127.0.0.1:8080")
+    monkeypatch.setattr(notes_module, "_wait_for_llama_cpp_runtime_ready", lambda *, process, host: None)
+
+    with notes_module._temporary_llama_cpp_runtime(
+        executable=executable,
+        model_path=Path("model.gguf"),
+        cpu_only=False,
+    ):
+        pass
+
+    command = observed["command"]
+    assert "--n-gpu-layers" in command
+    assert command[command.index("--n-gpu-layers") + 1] == "auto"
+
+
+def test_shared_llama_cpp_runtime_reuses_warm_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    starts: list[int] = []
+
+    class _FakeProcess:
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            _ = timeout
+            return 0
+
+    def fake_start_llama_cpp_runtime(*, executable: Path, model_path: Path, cpu_only: bool, launch_config):
+        _ = (executable, model_path, cpu_only, launch_config)
+        starts.append(1)
+        return notes_module.LlamaCppRuntimeSession(
+            binary_path=Path("llama-server.exe"),
+            model_path=Path("model.gguf"),
+            host="127.0.0.1:8080",
+            server_process=_FakeProcess(),
+            launch_config=launch_config,
+        )
+
+    monkeypatch.setattr(notes_module, "_start_llama_cpp_runtime", fake_start_llama_cpp_runtime)
+    notes_module._shutdown_shared_llama_cpp_runtimes()
+
+    launch_config = notes_module.LlamaCppLaunchConfig(
+        context_tokens=16_384,
+        threads=4,
+        threads_batch=4,
+    )
+
+    with notes_module._shared_llama_cpp_runtime(
+        executable=Path("llama-server.exe"),
+        model_path=Path("model.gguf"),
+        cpu_only=False,
+        launch_config=launch_config,
+    ):
+        pass
+
+    with notes_module._shared_llama_cpp_runtime(
+        executable=Path("llama-server.exe"),
+        model_path=Path("model.gguf"),
+        cpu_only=False,
+        launch_config=launch_config,
+    ):
+        pass
+
+    assert len(starts) == 1
+    notes_module._shutdown_shared_llama_cpp_runtimes()
+
+
+def test_resolve_llama_cpp_executable_prefers_existing_primary_path(tmp_path: Path) -> None:
+    from transcribe.notes import _resolve_llama_cpp_executable
+
+    install_root = tmp_path / "app"
+    runtime_dir = install_root / "runtime" / "llm"
+    runtime_dir.mkdir(parents=True)
+    primary_binary = runtime_dir / "llama-server.exe"
+    primary_binary.write_text("", encoding="utf-8")
+
+    runtime_paths = SimpleNamespace(
+        install_root=install_root,
+        notes_runtime_binary=primary_binary,
+    )
+
+    assert _resolve_llama_cpp_executable(runtime_paths) == primary_binary.resolve()
+
+
+def test_resolve_llama_cpp_executable_falls_back_to_staged_runtime(tmp_path: Path) -> None:
+    from transcribe.notes import _resolve_llama_cpp_executable
+
+    install_root = tmp_path / "repo"
+    staged_runtime_dir = install_root / "build" / "windows_standalone" / "0.2.2" / "stage" / "runtime" / "llm"
+    staged_runtime_dir.mkdir(parents=True)
+    staged_binary = staged_runtime_dir / "llama-server.exe"
+    staged_binary.write_text("", encoding="utf-8")
+
+    runtime_paths = SimpleNamespace(
+        install_root=install_root,
+        notes_runtime_binary=install_root / "runtime" / "llm" / "llama-server.exe",
+    )
+
+    assert _resolve_llama_cpp_executable(runtime_paths) == staged_binary.resolve()
+
+
 def test_run_ollama_command_uses_replace_for_text_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
     import transcribe.notes as notes_module
 
@@ -388,6 +576,48 @@ def test_run_ollama_command_uses_replace_for_text_decoding(monkeypatch: pytest.M
     assert observed["text"] is True
     assert observed["encoding"] == "utf-8"
     assert observed["errors"] == "replace"
+
+
+def test_ollama_runtime_uses_http_chat_payload_with_request_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    observed: dict[str, object] = {}
+
+    def fake_request(*, host: str, path: str, payload: dict[str, object] | None, timeout_sec: float, method: str = "POST") -> dict[str, object]:
+        observed["host"] = host
+        observed["path"] = path
+        observed["payload"] = payload
+        observed["timeout_sec"] = timeout_sec
+        observed["method"] = method
+        return {"message": {"content": "Client note"}}
+
+    monkeypatch.setattr(notes_module, "_ollama_request", fake_request)
+
+    runtime = notes_module.OllamaRuntimeSession(env={"OLLAMA_HOST": "127.0.0.1:11434"}, host="127.0.0.1:11434")
+    result = runtime.run_prompt(
+        model="qwen3.5:4b-q4_K_M",
+        prompt="hello",
+        request_options=PromptRequestOptions(max_tokens=512, context_tokens=12_288),
+    )
+
+    assert result == "Client note"
+    assert observed["path"] == "/api/chat"
+    assert observed["method"] == "POST"
+    assert observed["payload"]["keep_alive"] == "10m"
+    assert observed["payload"]["think"] is False
+    assert observed["payload"]["options"] == {"num_ctx": 12_288, "num_predict": 512}
+
+
+def test_base_ollama_env_limits_parallelism() -> None:
+    import transcribe.notes as notes_module
+
+    env = notes_module._base_ollama_env(host="127.0.0.1:11434")
+
+    assert env["OLLAMA_HOST"] == "127.0.0.1:11434"
+    assert env["OLLAMA_NUM_PARALLEL"] == "1"
+    assert env["OLLAMA_KEEP_ALIVE"] == "10m"
 
 
 def test_wait_for_llama_cpp_runtime_ready_retries_while_model_is_loading(
