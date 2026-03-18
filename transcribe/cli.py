@@ -225,6 +225,12 @@ def _build_notes_progress_reporter() -> Callable[[str, dict[str, object]], None]
         if event == "client_notes_started":
             print("Writing client notes...")
             return
+        if event == "client_notes_retrying":
+            print("Client notes returned no text; retrying with sparse-transcript prompt...")
+            return
+        if event == "client_notes_fallback":
+            print("Client notes model returned no text; using limited-content fallback note.")
+            return
         if event == "notes_cpu_fallback":
             print("Notes runtime: retrying on CPU...")
 

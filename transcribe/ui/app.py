@@ -562,6 +562,12 @@ class SessionPage(BasePage):
             self._notes_stream_started = False
             self._append_transcript_line("Client notes generation")
             self._append_transcript_line("")
+        elif name == "client_notes_retrying":
+            self.status_var.set("Retrying notes generation")
+            self._append_transcript_line("Client notes returned no text; retrying with sparse-transcript prompt")
+        elif name == "client_notes_fallback":
+            self.status_var.set("Using limited-content fallback note")
+            self._append_transcript_line("Client notes model returned no text; using limited-content fallback note")
         elif name == "client_notes_ready":
             self.status_var.set("Client notes ready")
             text = str(fields.get("text", ""))

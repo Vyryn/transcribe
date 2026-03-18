@@ -313,6 +313,34 @@ def test_run_post_transcription_notes_falls_back_to_raw_cleanup_chunk_when_model
     assert any(event == "clean_transcript_chunk_fallback" for event, _fields in progress_events)
 
 
+def test_run_post_transcription_notes_uses_limited_content_fallback_note_when_model_returns_empty(
+    tmp_path: Path,
+) -> None:
+    transcript_path = tmp_path / "rough_transcript.txt"
+    transcript_path.write_text("One, two, three.\nBrief fragment.\n", encoding="utf-8")
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("WRITE THE NOTE", encoding="utf-8")
+
+    runtime = FakePromptRuntime(["", "", "", "", "", ""])
+    runtime_factory = FakeRuntimeFactory({False: [runtime], True: []})
+    progress_events: list[tuple[str, dict[str, object]]] = []
+
+    result = run_post_transcription_notes(
+        SessionNotesConfig(
+            transcript_path=transcript_path,
+            output_dir=tmp_path / "notes_out",
+            prompt_path=prompt_path,
+        ),
+        runtime_factory=runtime_factory,
+        progress_callback=lambda event, fields: progress_events.append((event, fields)),
+    )
+
+    note_text = result.client_notes_path.read_text(encoding="utf-8")
+    assert "Transcript contained limited clear client-reported clinical content" in note_text
+    assert any(event == "client_notes_retrying" for event, _fields in progress_events)
+    assert any(event == "client_notes_fallback" for event, _fields in progress_events)
+
+
 def test_llama_cpp_runtime_retries_when_model_is_still_loading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -353,6 +381,36 @@ def test_llama_cpp_runtime_retries_when_model_is_still_loading(
 
     assert result == "Client note"
     assert responses == []
+
+
+def test_llama_cpp_runtime_rejects_reasoning_only_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    def fake_request(*, host: str, path: str, payload: dict[str, object] | None, timeout_sec: float, method: str = "POST") -> dict[str, object]:
+        _ = (host, path, payload, timeout_sec, method)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "thinking",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(notes_module, "_llama_server_request", fake_request)
+
+    runtime = LlamaCppRuntimeSession(
+        binary_path=Path("llama-server.exe"),
+        model_path=Path("model.gguf"),
+        host="127.0.0.1:1234",
+    )
+
+    with pytest.raises(RuntimeError, match="reasoning content without a final answer"):
+        runtime.run_prompt(model="ignored", prompt="hello")
 
 
 def test_temporary_llama_cpp_runtime_forces_cpu_layers_for_packaged_runtime(
@@ -400,6 +458,10 @@ def test_temporary_llama_cpp_runtime_forces_cpu_layers_for_packaged_runtime(
 
     command = observed["command"]
     assert isinstance(command, list)
+    assert "--reasoning" in command
+    assert command[command.index("--reasoning") + 1] == "off"
+    assert "--reasoning-format" in command
+    assert command[command.index("--reasoning-format") + 1] == "none"
     assert "--n-gpu-layers" in command
     assert command[command.index("--n-gpu-layers") + 1] == "0"
     assert observed["encoding"] == "utf-8"
@@ -608,6 +670,35 @@ def test_ollama_runtime_uses_http_chat_payload_with_request_options(
     assert observed["payload"]["keep_alive"] == "10m"
     assert observed["payload"]["think"] is False
     assert observed["payload"]["options"] == {"num_ctx": 12_288, "num_predict": 512}
+
+
+def test_llama_server_stream_request_rejects_reasoning_only_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transcribe.notes as notes_module
+
+    class _FakeResponse:
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n'
+            yield b"data: [DONE]\n"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            _ = (exc_type, exc, tb)
+            return False
+
+    monkeypatch.setattr(notes_module.urllib_request, "urlopen", lambda request, timeout: _FakeResponse())
+
+    with pytest.raises(RuntimeError, match="reasoning content without a final answer"):
+        notes_module._llama_server_stream_request_once(
+            host="127.0.0.1:1234",
+            path="/v1/chat/completions",
+            payload={"stream": True},
+            timeout_sec=30.0,
+            on_text_delta=lambda text: None,
+        )
 
 
 def test_base_ollama_env_limits_parallelism() -> None:

@@ -77,6 +77,13 @@ Output only the finished client note.
 
 Cleaned transcript:
 """
+_CLIENT_NOTES_EMPTY_RETRY_SUFFIX = """
+
+Important:
+- Never return an empty response.
+- If the transcript contains limited, fragmented, repetitive, or unclear clinical content, still return a brief SOAP note that says so plainly.
+- If evidence is weak, keep the note narrow and factual rather than omitting the note entirely.
+"""
 _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 _THINK_BLOCK_RE = re.compile(r"(?is)<think>.*?</think>")
 _DISFLUENCY_TOKEN_RE = re.compile(r"(?i)\b(?:um+|uh+|erm+|hmm+|mm-hmm|mmm+)\b")
@@ -301,13 +308,9 @@ class LlamaCppRuntimeSession:
 
     def ensure_model_available(self, model: str) -> None:
         if not self.binary_path.exists():
-            raise NotesRuntimeError(
-                f"Bundled notes runtime is missing llama-server binary: {self.binary_path}"
-            )
+            raise NotesRuntimeError(f"Bundled notes runtime is missing llama-server binary: {self.binary_path}")
         if not self.model_path.exists():
-            raise NotesRuntimeError(
-                f"Bundled notes model for {model!r} is missing: {self.model_path}"
-            )
+            raise NotesRuntimeError(f"Bundled notes model for {model!r} is missing: {self.model_path}")
 
     def run_prompt(
         self,
@@ -320,7 +323,9 @@ class LlamaCppRuntimeSession:
         del model
         resolved_options = request_options or PromptRequestOptions(
             max_tokens=_DEFAULT_NOTES_OUTPUT_MAX_TOKENS,
-            context_tokens=self.launch_config.context_tokens if self.launch_config is not None else _MIN_NOTES_CONTEXT_TOKENS,
+            context_tokens=self.launch_config.context_tokens
+            if self.launch_config is not None
+            else _MIN_NOTES_CONTEXT_TOKENS,
         )
         payload = {
             "messages": [{"role": "user", "content": prompt}],
@@ -348,6 +353,12 @@ class LlamaCppRuntimeSession:
         if not isinstance(message, dict):
             raise NotesRuntimeError("Bundled notes runtime returned no message content.")
         content = message.get("content")
+        reasoning_content = message.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content.strip() and content == "":
+            raise NotesRuntimeError(
+                "Bundled notes runtime returned reasoning content without a final answer. "
+                "Reasoning mode should be disabled for notes generation."
+            )
         if not isinstance(content, str):
             raise NotesRuntimeError("Bundled notes runtime returned non-text content.")
         return content
@@ -434,6 +445,14 @@ def build_client_notes_prompt(prompt_template: str, clean_transcript: str) -> st
     return f"{prompt_template.strip()}\n\n{_NOTES_TRANSCRIPT_PREFIX}\n{clean_transcript.strip()}\n"
 
 
+def build_client_notes_retry_prompt(prompt_template: str, clean_transcript: str) -> str:
+    """Build a stricter retry prompt for cases where the model returned no note."""
+    return (
+        f"{prompt_template.strip()}\n{_CLIENT_NOTES_EMPTY_RETRY_SUFFIX.strip()}\n\n"
+        f"{_NOTES_TRANSCRIPT_PREFIX}\n{clean_transcript.strip()}\n"
+    )
+
+
 def build_notes_execution_plan(
     *,
     model: str,
@@ -445,9 +464,7 @@ def build_notes_execution_plan(
     cleanup_required = not _should_skip_cleanup(transcript_units)
     cleanup_chunk_words = _recommended_cleanup_chunk_words(model)
     cleanup_chunks = (
-        tuple(build_cleanup_chunks(transcript_units, max_words=cleanup_chunk_words))
-        if cleanup_required
-        else ()
+        tuple(build_cleanup_chunks(transcript_units, max_words=cleanup_chunk_words)) if cleanup_required else ()
     )
 
     cleanup_request = PromptRequestOptions(
@@ -634,6 +651,26 @@ def _join_transcript_units(transcript_units: list[str]) -> str:
     return "\n\n".join(unit.strip() for unit in transcript_units if unit.strip()).strip()
 
 
+def _should_use_limited_client_note_fallback(clean_transcript: str) -> bool:
+    """Return whether a deterministic limited-content note is safer than a hard failure."""
+    nonempty_lines = [line.strip() for line in clean_transcript.splitlines() if line.strip()]
+    word_count = _word_count(clean_transcript)
+    return word_count <= 160 or len(nonempty_lines) <= 6
+
+
+def build_limited_client_note_fallback(clean_transcript: str) -> str:
+    """Build a minimal SOAP note for sparse transcripts when the model returns nothing."""
+    _ = clean_transcript
+    return (
+        "S: Transcript contained limited clear client-reported clinical content. "
+        "Available speech was brief, fragmentary, or repetitive.\n\n"
+        "O: The transcript provided limited observable therapeutic interaction, and specific interventions "
+        "were not clearly established from the available content.\n\n"
+        "A: Session themes could not be determined reliably from the available transcript alone.\n\n"
+        "P: No specific homework, follow-up actions, or next-session plan were clearly established in the transcript."
+    )
+
+
 def _should_skip_cleanup(transcript_units: list[str]) -> bool:
     """Return whether transcript cleanup can be skipped safely for already-structured text."""
     if len(transcript_units) < 2:
@@ -643,7 +680,9 @@ def _should_skip_cleanup(transcript_units: list[str]) -> bool:
     if total_words < _MIN_WORDS_FOR_CLEANUP_SKIP:
         return False
 
-    punctuated_ratio = sum(1 for unit in transcript_units if _SENTENCE_END_RE.search(unit.strip())) / len(transcript_units)
+    punctuated_ratio = sum(1 for unit in transcript_units if _SENTENCE_END_RE.search(unit.strip())) / len(
+        transcript_units
+    )
     capitalized_ratio = sum(1 for unit in transcript_units if _looks_capitalized_unit(unit)) / len(transcript_units)
     disfluency_ratio = _count_disfluency_tokens(_join_transcript_units(transcript_units)) / max(1, total_words)
     return (
@@ -787,6 +826,25 @@ def run_post_transcription_notes(
                 on_text_delta=_emit_notes_delta,
                 request_options=execution_plan.notes_request,
             )
+            if not client_notes:
+                _emit_progress(
+                    progress_callback,
+                    "client_notes_retrying",
+                    cpu_only=cpu_only,
+                )
+                client_notes = _run_normalized_prompt_with_retries(
+                    runtime=runtime,
+                    model=config.model,
+                    prompt=build_client_notes_retry_prompt(prompt_template, clean_transcript),
+                    request_options=execution_plan.notes_request,
+                )
+            if not client_notes and _should_use_limited_client_note_fallback(clean_transcript):
+                client_notes = build_limited_client_note_fallback(clean_transcript)
+                _emit_progress(
+                    progress_callback,
+                    "client_notes_fallback",
+                    cpu_only=cpu_only,
+                )
             notes_duration_sec = time.monotonic() - notes_started
             if not client_notes:
                 raise NotesRuntimeError("Client notes generation returned no content.")
@@ -883,6 +941,7 @@ def _runtime_factory_for_name(
     if runtime_name == "ollama":
         return open_ollama_runtime
     if runtime_name == "llama_cpp":
+
         @contextlib.contextmanager
         def _factory(*, cpu_only: bool = False) -> Iterator[PromptRuntime]:
             try:
@@ -934,9 +993,7 @@ def _open_auto_notes_runtime(
 
         detail = "; ".join(attempted_messages) if attempted_messages else "no runtime candidates attempted"
         if last_error is not None:
-            raise NotesRuntimeError(
-                f"Unable to initialize any local notes runtime. Tried {detail}"
-            ) from last_error
+            raise NotesRuntimeError(f"Unable to initialize any local notes runtime. Tried {detail}") from last_error
         raise NotesRuntimeError("Unable to initialize any local notes runtime.")
 
     return _factory
@@ -1017,10 +1074,7 @@ def _load_structured_session_units(transcript_path: Path) -> list[str]:
         if source is None or source in ordered_sources:
             continue
         ordered_sources.append(source)
-    source_labels = {
-        source: f"Speaker {chr(ord('A') + index)}"
-        for index, source in enumerate(ordered_sources)
-    }
+    source_labels = {source: f"Speaker {chr(ord('A') + index)}" for index, source in enumerate(ordered_sources)}
 
     if len(source_labels) <= 1:
         return [text for _, text in segments]
@@ -1413,6 +1467,10 @@ def _start_llama_cpp_runtime(
         str(launch_config.parallel),
         "--flash-attn",
         launch_config.flash_attention,
+        "--reasoning",
+        "off",
+        "--reasoning-format",
+        "none",
         "--n-gpu-layers",
         gpu_layers,
     ]
@@ -1599,6 +1657,7 @@ def _llama_server_stream_request_once(
         method="POST",
     )
     content_parts: list[str] = []
+    saw_reasoning_only_output = False
     try:
         with urllib_request.urlopen(request, timeout=timeout_sec) as response:
             for raw_line in response:
@@ -1615,6 +1674,9 @@ def _llama_server_stream_request_once(
                 if not isinstance(parsed, dict):
                     raise NotesRuntimeError("Bundled llama.cpp runtime returned an unexpected stream payload.")
                 delta_text = _extract_llama_stream_delta(parsed)
+                if not delta_text and _extract_llama_stream_reasoning_delta(parsed):
+                    saw_reasoning_only_output = True
+                    continue
                 if not delta_text:
                     continue
                 content_parts.append(delta_text)
@@ -1630,7 +1692,9 @@ def _llama_server_stream_request_once(
             raise NotesRuntimeError(detail) from exc
         raise NotesRuntimeError(f"Unable to contact bundled llama.cpp runtime: {detail}") from exc
     except TimeoutError as exc:
-                    raise NotesRuntimeError("Bundled llama.cpp request timed out.") from exc
+        raise NotesRuntimeError("Bundled llama.cpp request timed out.") from exc
+    if not content_parts and saw_reasoning_only_output:
+        raise NotesRuntimeError("Bundled notes runtime streamed reasoning content without a final answer. ")
     return "".join(content_parts)
 
 
@@ -1778,6 +1842,27 @@ def _extract_llama_stream_delta(payload: dict[str, object]) -> str:
         content = message.get("content")
         if isinstance(content, str):
             return content
+    return ""
+
+
+def _extract_llama_stream_reasoning_delta(payload: dict[str, object]) -> str:
+    """Extract streamed reasoning-only text when llama.cpp separates it from content."""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return ""
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        reasoning_content = delta.get("reasoning_content")
+        if isinstance(reasoning_content, str):
+            return reasoning_content
+    message = choice.get("message")
+    if isinstance(message, dict):
+        reasoning_content = message.get("reasoning_content")
+        if isinstance(reasoning_content, str):
+            return reasoning_content
     return ""
 
 
