@@ -40,6 +40,23 @@ def _build_manifest(tmp_path: Path) -> tuple[PackagedAssetsManifest, dict[tuple[
     (canary_dir / "LICENSES").write_text("license", encoding="utf-8")
     (canary_dir / "model.safetensors").write_bytes(b"canary")
 
+    granite_dir = source_root / "granite"
+    granite_dir.mkdir()
+    (granite_dir / "config.json").write_text("{}", encoding="utf-8")
+    (granite_dir / "processor_config.json").write_text("{}", encoding="utf-8")
+    (granite_dir / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+    (granite_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (granite_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (granite_dir / "special_tokens_map.json").write_text("{}", encoding="utf-8")
+    (granite_dir / "added_tokens.json").write_text("{}", encoding="utf-8")
+    (granite_dir / "vocab.json").write_text("{}", encoding="utf-8")
+    (granite_dir / "merges.txt").write_text("merge", encoding="utf-8")
+    (granite_dir / "chat_template.jinja").write_text("USER: {{ message }}", encoding="utf-8")
+    (granite_dir / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
+    (granite_dir / "model-00001-of-00003.safetensors").write_bytes(b"granite-1")
+    (granite_dir / "model-00002-of-00003.safetensors").write_bytes(b"granite-2")
+    (granite_dir / "model-00003-of-00003.safetensors").write_bytes(b"granite-3")
+
     manifest = PackagedAssetsManifest(
         schema_version=PACKAGED_ASSET_SCHEMA_VERSION,
         assets=(
@@ -83,6 +100,31 @@ def _build_manifest(tmp_path: Path) -> tuple[PackagedAssetsManifest, dict[tuple[
                 required_files=("config.json", "LICENSES", "model.safetensors"),
                 default_install=False,
             ),
+            build_directory_asset(
+                model_id="ibm-granite/granite-4.0-1b-speech",
+                kind="transcription",
+                relative_path="asr/ibm-granite/granite-4.0-1b-speech",
+                repo_id="ibm-granite/granite-4.0-1b-speech",
+                revision="rev-granite",
+                source_root=granite_dir,
+                required_files=(
+                    "added_tokens.json",
+                    "chat_template.jinja",
+                    "config.json",
+                    "merges.txt",
+                    "model-00001-of-00003.safetensors",
+                    "model-00002-of-00003.safetensors",
+                    "model-00003-of-00003.safetensors",
+                    "model.safetensors.index.json",
+                    "preprocessor_config.json",
+                    "processor_config.json",
+                    "special_tokens_map.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "vocab.json",
+                ),
+                default_install=False,
+            ),
         ),
     )
     repo_files = {
@@ -92,6 +134,20 @@ def _build_manifest(tmp_path: Path) -> tuple[PackagedAssetsManifest, dict[tuple[
         ("nvidia/canary-qwen-2.5b", "rev-canary", "config.json"): canary_dir / "config.json",
         ("nvidia/canary-qwen-2.5b", "rev-canary", "LICENSES"): canary_dir / "LICENSES",
         ("nvidia/canary-qwen-2.5b", "rev-canary", "model.safetensors"): canary_dir / "model.safetensors",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "added_tokens.json"): granite_dir / "added_tokens.json",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "chat_template.jinja"): granite_dir / "chat_template.jinja",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "config.json"): granite_dir / "config.json",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "merges.txt"): granite_dir / "merges.txt",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "model-00001-of-00003.safetensors"): granite_dir / "model-00001-of-00003.safetensors",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "model-00002-of-00003.safetensors"): granite_dir / "model-00002-of-00003.safetensors",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "model-00003-of-00003.safetensors"): granite_dir / "model-00003-of-00003.safetensors",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "model.safetensors.index.json"): granite_dir / "model.safetensors.index.json",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "preprocessor_config.json"): granite_dir / "preprocessor_config.json",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "processor_config.json"): granite_dir / "processor_config.json",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "special_tokens_map.json"): granite_dir / "special_tokens_map.json",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "tokenizer.json"): granite_dir / "tokenizer.json",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "tokenizer_config.json"): granite_dir / "tokenizer_config.json",
+        ("ibm-granite/granite-4.0-1b-speech", "rev-granite", "vocab.json"): granite_dir / "vocab.json",
     }
     return manifest, repo_files
 
@@ -106,6 +162,9 @@ def test_manifest_round_trip_and_selection(tmp_path: Path) -> None:
     assert [asset.model_id for asset in select_packaged_model_assets(loaded, default_only=True)] == [
         "qwen3.5:4b-q4_K_M",
         "nvidia/parakeet-tdt-0.6b-v3",
+    ]
+    assert [asset.model_id for asset in select_packaged_model_assets(loaded, model_ids=["ibm-granite/granite-4.0-1b-speech"])] == [
+        "ibm-granite/granite-4.0-1b-speech"
     ]
     with pytest.raises(ValueError, match="unknown model ids"):
         select_packaged_model_assets(loaded, model_ids=["missing-model"])
@@ -285,5 +344,4 @@ def test_install_packaged_model_assets_supports_remote_only_manifest_metadata(
     assert [result.model_id for result in results] == ["qwen3.5:4b-q4_K_M", "nvidia/parakeet-tdt-0.6b-v3"]
     assert verify_installed_asset(manifest.assets[0], models_root=tmp_path / "installed-models") is True
     assert verify_installed_asset(manifest.assets[1], models_root=tmp_path / "installed-models") is True
-
 

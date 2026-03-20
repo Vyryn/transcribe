@@ -42,6 +42,7 @@ def test_build_packaged_assets_manifest_defaults() -> None:
     manifest = module.build_packaged_assets_manifest()
     defaults = {asset.model_id for asset in manifest.assets if asset.default_install}
     canary_asset = next(asset for asset in manifest.assets if asset.model_id == "nvidia/canary-qwen-2.5b")
+    granite_asset = next(asset for asset in manifest.assets if asset.model_id == "ibm-granite/granite-4.0-1b-speech")
 
     assert manifest.schema_version == "transcribe-packaged-assets-v1"
     assert defaults == {
@@ -54,6 +55,22 @@ def test_build_packaged_assets_manifest_defaults() -> None:
         "LICENSES",
         "model.safetensors",
         "tokenizer.model",
+    )
+    assert tuple(file_entry.path for file_entry in granite_asset.required_files) == (
+        "added_tokens.json",
+        "chat_template.jinja",
+        "config.json",
+        "merges.txt",
+        "model-00001-of-00003.safetensors",
+        "model-00002-of-00003.safetensors",
+        "model-00003-of-00003.safetensors",
+        "model.safetensors.index.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
     )
 
 
@@ -206,6 +223,8 @@ def test_installer_template_hides_shell_wrapper_and_shows_model_progress() -> No
     assert "CreateOutputProgressPage" in template_text
     assert "Installing model " in template_text
     assert "ExpandConstant('{app}\\Transcribe.exe')" in template_text
+    assert "Voice: IBM Granite 4.0 1B Speech" in template_text
+    assert "ibm-granite/granite-4.0-1b-speech" in template_text
     assert "CheckBox.Height := ScaleY(28);" in template_text
     assert "PreviousCheckBox.Top + PreviousCheckBox.Height + ScaleY(8)" in template_text
     assert 'Source: "{#SourceDir}\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs' in template_text

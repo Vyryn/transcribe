@@ -23,6 +23,7 @@ DATA_ROOT_ENV = "TRANSCRIBE_DATA_DIR"
 ALLOW_NETWORK_ENV = "TRANSCRIBE_ALLOW_NETWORK"
 
 PACKAGED_ACCURACY_TRANSCRIPTION_MODEL = "nvidia/canary-qwen-2.5b"
+PACKAGED_GRANITE_TRANSCRIPTION_MODEL = "ibm-granite/granite-4.0-1b-speech"
 
 
 class RuntimeMode(StrEnum):
@@ -168,6 +169,10 @@ def bundled_transcription_model_specs() -> tuple[BundledModelSpec, ...]:
         BundledModelSpec(
             PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
             Path("asr/nvidia/canary-qwen-2.5b"),
+        ),
+        BundledModelSpec(
+            PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
+            Path("asr/ibm-granite/granite-4.0-1b-speech"),
         ),
     )
 

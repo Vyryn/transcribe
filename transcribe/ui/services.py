@@ -12,6 +12,7 @@ from transcribe.models import AudioSourceMode, CaptureConfig
 from transcribe.network_guard import install_outbound_network_guard, outbound_network_guard_installed
 from transcribe.runtime_env import (
     PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
+    PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
     RuntimeMode,
     resolve_app_runtime_paths,
     set_network_access_allowed,
@@ -51,6 +52,15 @@ from transcribe.ui.types import (
 
 LOGGER = logging.getLogger("transcribe.ui")
 ProgressCallback = Callable[[str, dict[str, object]], None]
+_REEXPORTED_DEFAULTS = (
+    DEFAULT_BENCH_CONFIG,
+    DEFAULT_BENCH_DATASET,
+    DEFAULT_BENCH_LIMIT,
+    DEFAULT_BENCH_MODEL,
+    DEFAULT_BENCH_SPLIT,
+    DEFAULT_LOG_LEVEL,
+    DEFAULT_NOTES_RUNTIME,
+)
 
 
 def _release_transcription_resources_in_background(
@@ -106,6 +116,7 @@ def transcription_model_options() -> tuple[str, ...]:
             (
                 DEFAULT_LIVE_TRANSCRIPTION_MODEL,
                 PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
+                PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
                 "faster-whisper-medium",
                 "whisper-small",
                 "whisper-large-v3",
@@ -561,5 +572,3 @@ def run_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResultSummary:
 def wrap_progress(event: str, fields: dict[str, object]) -> ServiceProgressEvent:
     """Build a typed progress wrapper for controller and UI consumers."""
     return ServiceProgressEvent(name=event, fields=dict(fields))
-
-

@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,14 +20,17 @@ LOGGER = logging.getLogger("transcribe.transcription_runtime")
 
 DEFAULT_MAX_MODEL_RAM_GB = 8.0
 HfSegmentTranscriber = Callable[[Mapping[str, object], str], tuple[str, float]]
-TranscriptionBackend = Literal["faster_whisper", "nemo_asr", "qwen_asr"]
+TranscriptionBackend = Literal["faster_whisper", "granite_asr", "nemo_asr", "qwen_asr"]
 
 _FASTER_WHISPER_MODEL_CACHE: dict[str, Any] = {}
+_GRANITE_ASR_MODEL_CACHE: dict[str, Any] = {}
 _NEMO_ASR_MODEL_CACHE: dict[str, Any] = {}
 _QWEN_ASR_MODEL_CACHE: dict[str, Any] = {}
 _HF_REPO_SNAPSHOT_CACHE: dict[str, str] = {}
+_GRANITE_AUDIO_BYTES_PATH_CACHE: dict[str, str] = {}
 _QWEN_AUDIO_BYTES_PATH_CACHE: dict[str, str] = {}
 _NEMO_AUDIO_BYTES_PATH_CACHE: dict[str, str] = {}
+_GRANITE_ASR_MODEL_LOAD_LOCK = threading.Lock()
 _NEMO_ASR_MODEL_LOAD_LOCK = threading.Lock()
 _MODEL_RAM_GB_ESTIMATES = {
     "tiny": 0.7,
@@ -39,6 +43,18 @@ _MODEL_RAM_GB_ESTIMATES = {
     "large-v3-turbo": 9.0,
     "turbo": 9.0,
 }
+_GRANITE_ASR_TRANSCRIPTION_PROMPT = "USER: <|audio|>\nTranscribe the following speech.\nASSISTANT:"
+_GRANITE_ASR_SAMPLE_RATE = 16_000
+
+
+@dataclass(slots=True)
+class GraniteAsrRuntime:
+    """Loaded Granite speech model plus processor and prompt settings."""
+
+    model: Any
+    processor: Any
+    device: str
+    prompt: str
 
 
 class HfOfflineDatasetUnavailableError(RuntimeError):
@@ -127,6 +143,8 @@ def _canonical_transcription_model_id(transcription_model: str) -> str:
     if not normalized:
         return normalized
     aliases = {
+        "granite-4.0-1b-speech": "ibm-granite/granite-4.0-1b-speech",
+        "ibm-granite/granite-4.0-1b-speech": "ibm-granite/granite-4.0-1b-speech",
         "parakeet-tdt-0.6b-v3": "nvidia/parakeet-tdt-0.6b-v3",
         "nvidia/parakeet-tdt-0.6b-v3": "nvidia/parakeet-tdt-0.6b-v3",
         "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B",
@@ -319,6 +337,8 @@ def _resolve_transcription_backend(transcription_model: str) -> tuple[Transcript
     """Resolve backend type and normalized model id."""
     canonical = _canonical_transcription_model_id(transcription_model)
     canonical_lower = canonical.lower()
+    if canonical_lower.startswith("ibm-granite/"):
+        return "granite_asr", canonical
     if canonical_lower.startswith("nvidia/"):
         return "nemo_asr", canonical
     if canonical_lower.startswith("qwen/"):
@@ -762,6 +782,191 @@ def _get_qwen_asr_model(model_id: str, *, local_files_only: bool = True) -> Any:
     ) from load_errors[-1]
 
 
+def _prepare_torch_model_for_inference(model: Any, resolved_model_id: str) -> None:
+    """Ensure one Torch-backed ASR model is in eval mode with gradients disabled."""
+    if hasattr(model, "eval"):
+        try:
+            model.eval()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to set Torch ASR model %s to eval mode: %s", resolved_model_id, exc)
+    if hasattr(model, "requires_grad_"):
+        try:
+            model.requires_grad_(False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _get_cached_granite_asr_model(
+    cache_key: str,
+    resolved_model_id: str,
+    *,
+    effective_local_files_only: bool,
+) -> GraniteAsrRuntime | None:
+    """Return one cached Granite ASR runtime when available."""
+    cached_runtime = _GRANITE_ASR_MODEL_CACHE.get(cache_key)
+    if cached_runtime is None and effective_local_files_only:
+        cached_runtime = _GRANITE_ASR_MODEL_CACHE.get(resolved_model_id)
+    if not isinstance(cached_runtime, GraniteAsrRuntime):
+        return None
+    _prepare_torch_model_for_inference(cached_runtime.model, resolved_model_id)
+    return cached_runtime
+
+
+def _get_granite_asr_model(model_id: str, *, local_files_only: bool = True) -> GraniteAsrRuntime:
+    """Return cached Granite speech runtime for local transcription."""
+    _, resolved_model_id = _resolve_transcription_backend(model_id)
+    effective_local_files_only = _effective_local_files_only(local_files_only)
+    cache_key = f"{resolved_model_id}|local_files_only={effective_local_files_only}"
+    cached_runtime = _get_cached_granite_asr_model(
+        cache_key,
+        resolved_model_id,
+        effective_local_files_only=effective_local_files_only,
+    )
+    if cached_runtime is not None:
+        return cached_runtime
+
+    if effective_local_files_only:
+        _enforce_hf_offline_mode()
+
+    with _GRANITE_ASR_MODEL_LOAD_LOCK:
+        cached_runtime = _get_cached_granite_asr_model(
+            cache_key,
+            resolved_model_id,
+            effective_local_files_only=effective_local_files_only,
+        )
+        if cached_runtime is not None:
+            return cached_runtime
+
+        snapshot_dir = _get_hf_repo_snapshot(resolved_model_id, local_files_only=effective_local_files_only)
+        try:
+            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+        except ImportError as exc:
+            raise RuntimeError(
+                "Transcription runtime for Granite ASR models requires `transformers` and `torchaudio`."
+            ) from exc
+
+        load_errors: list[BaseException] = []
+        load_sources: list[str] = [snapshot_dir]
+        if not effective_local_files_only:
+            load_sources.append(resolved_model_id)
+
+        for load_source in load_sources:
+            try:
+                processor = AutoProcessor.from_pretrained(
+                    load_source,
+                    local_files_only=effective_local_files_only,
+                    trust_remote_code=False,
+                )
+                model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                    load_source,
+                    local_files_only=effective_local_files_only,
+                    trust_remote_code=False,
+                    dtype="float32",
+                )
+                _prepare_torch_model_for_inference(model, resolved_model_id)
+                runtime = GraniteAsrRuntime(
+                    model=model,
+                    processor=processor,
+                    device="cpu",
+                    prompt=_GRANITE_ASR_TRANSCRIPTION_PROMPT,
+                )
+                _GRANITE_ASR_MODEL_CACHE[cache_key] = runtime
+                if effective_local_files_only:
+                    _GRANITE_ASR_MODEL_CACHE[resolved_model_id] = runtime
+                return runtime
+            except Exception as exc:  # noqa: BLE001
+                load_errors.append(exc)
+                continue
+
+    for exc in load_errors:
+        if _is_model_cache_miss_error(exc) or _is_hf_offline_network_error(exc):
+            raise _offline_model_error(resolved_model_id) from exc
+    raise RuntimeError(
+        f"Failed to initialize Granite ASR model for {resolved_model_id!r}: {load_errors[-1]}"
+    ) from load_errors[-1]
+
+
+def _materialize_audio_bytes_path(
+    payload_bytes: bytes,
+    *,
+    cache: dict[str, str],
+    temp_dir_name: str,
+    path_hint: str | None = None,
+) -> str:
+    """Persist one byte payload to a stable temp path keyed by its content hash."""
+    cache_key = hashlib.sha1(payload_bytes).hexdigest()
+    cached_path = cache.get(cache_key)
+    if cached_path and Path(cached_path).exists():
+        return cached_path
+
+    suffix = ".wav"
+    if path_hint:
+        path_suffix = Path(path_hint).suffix
+        if path_suffix:
+            suffix = path_suffix
+    temp_dir = Path(tempfile.gettempdir()) / temp_dir_name
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / f"{cache_key}{suffix}"
+    if not temp_path.exists():
+        temp_path.write_bytes(payload_bytes)
+    materialized_path = str(temp_path)
+    cache[cache_key] = materialized_path
+    return materialized_path
+
+
+def _extract_granite_audio_waveform(row: Mapping[str, object]) -> Any:
+    """Extract one Granite-compatible mono waveform tensor from a dataset row."""
+    try:
+        import torch
+        import torchaudio
+    except ImportError as exc:
+        raise RuntimeError(
+            "Granite ASR transcription requires `torchaudio` in addition to `transformers`."
+        ) from exc
+
+    waveform: Any | None = None
+    sampling_rate = _GRANITE_ASR_SAMPLE_RATE
+    audio = row.get("audio")
+    if isinstance(audio, str) and audio:
+        waveform, sampling_rate = torchaudio.load(audio)
+    elif isinstance(audio, Mapping):
+        payload = audio.get("bytes")
+        path = audio.get("path")
+        if isinstance(payload, (bytes, bytearray)):
+            audio_path = _materialize_audio_bytes_path(
+                bytes(payload),
+                cache=_GRANITE_AUDIO_BYTES_PATH_CACHE,
+                temp_dir_name="transcribe-granite-audio",
+                path_hint=path if isinstance(path, str) else None,
+            )
+            waveform, sampling_rate = torchaudio.load(audio_path)
+        elif isinstance(path, str) and path:
+            waveform, sampling_rate = torchaudio.load(path)
+        else:
+            array = audio.get("array")
+            if array is not None:
+                waveform = torch.as_tensor(array)
+                sampling_rate = int(_to_float(audio.get("sampling_rate"), default=_GRANITE_ASR_SAMPLE_RATE))
+                sampling_rate = sampling_rate if sampling_rate > 0 else _GRANITE_ASR_SAMPLE_RATE
+    if waveform is None:
+        raise ValueError("Dataset row does not include Granite-compatible audio content")
+
+    waveform_tensor = torch.as_tensor(waveform)
+    if waveform_tensor.ndim == 0:
+        waveform_tensor = waveform_tensor.unsqueeze(0)
+    if waveform_tensor.ndim > 1:
+        waveform_tensor = waveform_tensor.reshape(-1, waveform_tensor.shape[-1]).mean(dim=0)
+    waveform_tensor = waveform_tensor.to(dtype=torch.float32).contiguous()
+
+    if sampling_rate != _GRANITE_ASR_SAMPLE_RATE:
+        waveform_tensor = torchaudio.functional.resample(
+            waveform_tensor.unsqueeze(0),
+            sampling_rate,
+            _GRANITE_ASR_SAMPLE_RATE,
+        ).squeeze(0)
+    return waveform_tensor
+
+
 def _extract_audio_path(row: Mapping[str, object]) -> str:
     """Extract local audio path from a dataset row."""
     audio = row.get("audio")
@@ -936,9 +1141,70 @@ def transcribe_row_with_qwen_asr(row: Mapping[str, object], transcription_model:
     return predicted_text, elapsed_ms
 
 
+def _strip_granite_generated_text(decoded_text: str) -> str:
+    """Remove prompt framing from one decoded Granite response."""
+    normalized = decoded_text.strip()
+    if not normalized:
+        return ""
+    if "ASSISTANT:" in normalized:
+        return normalized.split("ASSISTANT:", 1)[1].strip()
+    if normalized.startswith("USER:"):
+        user_prefix, _, assistant_suffix = normalized.partition("\nASSISTANT:")
+        if assistant_suffix:
+            return assistant_suffix.strip()
+        normalized = user_prefix.removeprefix("USER:").strip()
+    for prefix in (
+        "Transcribe the following speech.",
+        "Transcribe the following speech:",
+    ):
+        if normalized.startswith(prefix):
+            return normalized[len(prefix) :].strip(" \n:-")
+    return normalized
+
+
+def transcribe_row_with_granite_asr(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
+    """Transcribe one diarized row with Granite ASR and return text plus latency."""
+    runtime = _get_granite_asr_model(transcription_model, local_files_only=True)
+    waveform = _extract_granite_audio_waveform(row)
+
+    started_at = time.perf_counter()
+    inputs = runtime.processor(
+        runtime.prompt,
+        waveform,
+        device=runtime.device,
+        return_tensors="pt",
+    )
+    to_method = getattr(inputs, "to", None)
+    if callable(to_method):
+        inputs = to_method(runtime.device)
+
+    output_ids = runtime.model.generate(
+        **inputs,
+        max_new_tokens=256,
+        do_sample=False,
+    )
+    generated_ids = output_ids
+    input_ids = inputs.get("input_ids") if isinstance(inputs, Mapping) else None
+    if input_ids is not None and hasattr(output_ids, "shape") and len(output_ids.shape) >= 2:
+        prompt_token_count = int(input_ids.shape[-1]) if hasattr(input_ids, "shape") else 0
+        if prompt_token_count > 0 and output_ids.shape[-1] >= prompt_token_count:
+            generated_ids = output_ids[:, prompt_token_count:]
+
+    decoded_output = runtime.processor.batch_decode(generated_ids, skip_special_tokens=True)
+    predicted_text = _transcription_output_to_text(decoded_output)
+    if not predicted_text:
+        decoded_output = runtime.processor.batch_decode(output_ids, skip_special_tokens=True)
+        predicted_text = _strip_granite_generated_text(_transcription_output_to_text(decoded_output))
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    return predicted_text, elapsed_ms
+
+
 def _default_hf_segment_transcriber(transcription_model: str) -> HfSegmentTranscriber:
     """Resolve the default segment transcriber for a model identifier."""
     backend, _ = _resolve_transcription_backend(transcription_model)
+    if backend == "granite_asr":
+        return transcribe_row_with_granite_asr
     if backend == "nemo_asr":
         return transcribe_row_with_nemo_asr
     if backend == "qwen_asr":
@@ -955,6 +1221,9 @@ def preload_transcription_model(
     _enforce_model_ram_limit(transcription_model, max_model_ram_gb)
     backend, resolved_model_id = _resolve_transcription_backend(transcription_model)
 
+    if backend == "granite_asr":
+        _get_granite_asr_model(resolved_model_id, local_files_only=True)
+        return
     if backend == "nemo_asr":
         _get_nemo_asr_model(resolved_model_id, local_files_only=True)
         return
@@ -988,11 +1257,14 @@ def _selected_transcription_model_caches(transcription_model: str | None) -> lis
     if transcription_model is None:
         return [
             _FASTER_WHISPER_MODEL_CACHE,
+            _GRANITE_ASR_MODEL_CACHE,
             _NEMO_ASR_MODEL_CACHE,
             _QWEN_ASR_MODEL_CACHE,
         ]
 
     backend, _ = _resolve_transcription_backend(transcription_model)
+    if backend == "granite_asr":
+        return [_GRANITE_ASR_MODEL_CACHE]
     if backend == "nemo_asr":
         return [_NEMO_ASR_MODEL_CACHE]
     if backend == "qwen_asr":
@@ -1153,4 +1425,3 @@ def _to_float(value: object, default: float = 0.0) -> float:
         except ValueError:
             return default
     return default
-

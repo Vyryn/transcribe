@@ -282,6 +282,21 @@ def test_ui_networked_tasks_require_network_opt_in(monkeypatch: pytest.MonkeyPat
         services_module.ensure_network_downloads_available("Benchmark cache initialization", common=common)
 
 
+def test_transcription_model_options_include_granite_in_development(monkeypatch: pytest.MonkeyPatch) -> None:
+    import transcribe.runtime_env as runtime_env
+    import transcribe.ui.services as services_module
+
+    monkeypatch.setattr(
+        services_module,
+        "resolve_app_runtime_paths",
+        lambda: SimpleNamespace(mode=runtime_env.RuntimeMode.DEVELOPMENT, transcription_models={}),
+    )
+
+    options = services_module.transcription_model_options()
+
+    assert runtime_env.PACKAGED_GRANITE_TRANSCRIPTION_MODEL in options
+
+
 
 def test_ui_networked_tasks_require_fresh_process_after_guard_install(monkeypatch: pytest.MonkeyPatch) -> None:
     import transcribe.ui.services as services_module

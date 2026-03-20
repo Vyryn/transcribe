@@ -34,7 +34,10 @@ from transcribe.runtime_defaults import (  # noqa: E402
     DEFAULT_LIVE_TRANSCRIPTION_MODEL,
     DEFAULT_SESSION_NOTES_MODEL,
 )
-from transcribe.runtime_env import PACKAGED_ACCURACY_TRANSCRIPTION_MODEL  # noqa: E402
+from transcribe.runtime_env import (  # noqa: E402
+    PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
+    PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
+)
 
 APP_NAME = "Transcribe"
 MAIN_PATH = REPO_ROOT / "main.py"
@@ -65,6 +68,24 @@ DEFAULT_CANARY_REQUIRED_FILES = (
     "LICENSES",
     "model.safetensors",
     "tokenizer.model",
+)
+DEFAULT_GRANITE_MODEL_REPO = "ibm-granite/granite-4.0-1b-speech"
+DEFAULT_GRANITE_MODEL_REVISION = "4eaf14d77837c989d00f59c26262b6b9d10a9091"
+DEFAULT_GRANITE_REQUIRED_FILES = (
+    "added_tokens.json",
+    "chat_template.jinja",
+    "config.json",
+    "merges.txt",
+    "model-00001-of-00003.safetensors",
+    "model-00002-of-00003.safetensors",
+    "model-00003-of-00003.safetensors",
+    "model.safetensors.index.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
 )
 DEFAULT_GITHUB_API_ACCEPT = "application/vnd.github+json"
 DEFAULT_GITHUB_USER_AGENT = "transcribe-windows-builder"
@@ -99,6 +120,7 @@ PYINSTALLER_EXTRA_MODULES = (
     "sounddevice",
     "tokenizers",
     "torch",
+    "torchaudio",
     "torchcodec",
     "transformers",
     "transcribe",
@@ -1031,6 +1053,19 @@ def build_packaged_assets_manifest() -> PackagedAssetsManifest:
                 revision=DEFAULT_CANARY_MODEL_REVISION,
                 filename=None,
                 required_files=tuple(zero_file(path) for path in DEFAULT_CANARY_REQUIRED_FILES),
+                sha256=UNKNOWN_PACKAGED_ASSET_SHA256,
+                size_bytes=UNKNOWN_PACKAGED_ASSET_SIZE_BYTES,
+                default_install=False,
+            ),
+            PackagedModelAsset(
+                model_id=PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
+                kind="transcription",
+                relative_path="asr/ibm-granite/granite-4.0-1b-speech",
+                source_type="huggingface_snapshot",
+                repo_id=DEFAULT_GRANITE_MODEL_REPO,
+                revision=DEFAULT_GRANITE_MODEL_REVISION,
+                filename=None,
+                required_files=tuple(zero_file(path) for path in DEFAULT_GRANITE_REQUIRED_FILES),
                 sha256=UNKNOWN_PACKAGED_ASSET_SHA256,
                 size_bytes=UNKNOWN_PACKAGED_ASSET_SIZE_BYTES,
                 default_install=False,

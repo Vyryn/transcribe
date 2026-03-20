@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import transcribe.transcription_runtime as transcription_runtime
 
@@ -197,3 +198,55 @@ def test_get_nemo_asr_model_serializes_concurrent_loads(
     assert errors == []
     assert results == [sentinel_model, sentinel_model]
     assert observed["calls"] == 1
+
+
+def test_transcribe_row_with_granite_asr_decodes_generated_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    class FakeBatch(dict[str, object]):
+        def to(self, device: str) -> "FakeBatch":
+            observed["batch_device"] = device
+            return self
+
+    class FakeProcessor:
+        def __call__(self, prompt: str, waveform: object, *, device: str, return_tensors: str) -> FakeBatch:
+            observed["prompt"] = prompt
+            observed["waveform"] = waveform
+            observed["processor_device"] = device
+            observed["return_tensors"] = return_tensors
+            return FakeBatch({"input_ids": torch.tensor([[11, 12]])})
+
+        def batch_decode(self, token_ids: torch.Tensor, skip_special_tokens: bool = True) -> list[str]:
+            observed["decoded_ids"] = token_ids.tolist()
+            observed["skip_special_tokens"] = skip_special_tokens
+            return ["granite transcript"]
+
+    class FakeModel:
+        def generate(self, **kwargs: object) -> torch.Tensor:
+            observed["generate_kwargs"] = kwargs
+            return torch.tensor([[11, 12, 21, 22]])
+
+    runtime = transcription_runtime.GraniteAsrRuntime(
+        model=FakeModel(),
+        processor=FakeProcessor(),
+        device="cpu",
+        prompt="USER: <|audio|>\nTranscribe the following speech.\nASSISTANT:",
+    )
+
+    monkeypatch.setattr(transcription_runtime, "_get_granite_asr_model", lambda *args, **kwargs: runtime)
+    monkeypatch.setattr(transcription_runtime, "_extract_granite_audio_waveform", lambda row: "waveform")
+
+    text, latency_ms = transcription_runtime.transcribe_row_with_granite_asr(
+        {"audio": {"bytes": b"fake-wav", "path": "chunk.wav"}},
+        "ibm-granite/granite-4.0-1b-speech",
+    )
+
+    assert text == "granite transcript"
+    assert latency_ms >= 0.0
+    assert observed["prompt"] == "USER: <|audio|>\nTranscribe the following speech.\nASSISTANT:"
+    assert observed["waveform"] == "waveform"
+    assert observed["processor_device"] == "cpu"
+    assert observed["batch_device"] == "cpu"
+    assert observed["return_tensors"] == "pt"
+    assert observed["decoded_ids"] == [[21, 22]]
+    assert observed["skip_special_tokens"] is True

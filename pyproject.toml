@@ -14,9 +14,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+granite-asr = [
+  "torchaudio>=2.10.0",
+  "transformers>=4.57.6,<5",
+]
 nemo-asr = ["nemo_toolkit[asr]"]
 qwen-asr = ["qwen-asr"]
 asr-backends = [
+  "torchaudio>=2.10.0",
+  "transformers>=4.57.6,<5",
   "nemo_toolkit[asr]",
   "qwen-asr",
 ]

@@ -28,6 +28,7 @@ from transcribe.bench.harness import (
     run_capture_sync_benchmark,
     run_hf_diarized_transcription_benchmark,
     transcribe_row_with_faster_whisper,
+    transcribe_row_with_granite_asr,
     transcribe_row_with_nemo_asr,
     transcribe_row_with_qwen_asr,
 )
@@ -187,6 +188,7 @@ def test_run_hf_diarized_transcription_benchmark_rejects_large_model() -> None:
 def test_normalize_transcription_model_id_supports_backend_aliases() -> None:
     assert _normalize_transcription_model_id("whisper-small") == "small"
     assert _normalize_transcription_model_id("faster-whisper-medium") == "medium"
+    assert _normalize_transcription_model_id("granite-4.0-1b-speech") == "ibm-granite/granite-4.0-1b-speech"
     assert _normalize_transcription_model_id("parakeet-tdt-0.6b-v3") == "nvidia/parakeet-tdt-0.6b-v3"
     assert _normalize_transcription_model_id("nvidia/canary-1b") == "nvidia/canary-1b"
     assert _normalize_transcription_model_id("qwen/qwen3-asr-1.7b") == "Qwen/Qwen3-ASR-1.7B"
@@ -195,6 +197,7 @@ def test_normalize_transcription_model_id_supports_backend_aliases() -> None:
 
 def test_default_hf_segment_transcriber_routes_by_model_slug_prefix() -> None:
     assert _default_hf_segment_transcriber("whisper-small") is transcribe_row_with_faster_whisper
+    assert _default_hf_segment_transcriber("ibm-granite/granite-4.0-1b-speech") is transcribe_row_with_granite_asr
     assert _default_hf_segment_transcriber("nvidia/parakeet-tdt-0.6b-v3") is transcribe_row_with_nemo_asr
     assert _default_hf_segment_transcriber("nvidia/canary-1b") is transcribe_row_with_nemo_asr
     assert _default_hf_segment_transcriber("Qwen/Qwen3-ASR-1.7B") is transcribe_row_with_qwen_asr
@@ -212,10 +215,16 @@ def test_release_transcription_runtime_resources_clears_selected_backend_cache(
             self.devices.append(device)
 
     faster_model = FakeModel()
+    granite_model = FakeModel()
     nemo_model = FakeModel()
     qwen_model = FakeModel()
 
     monkeypatch.setattr(bench_harness, "_FASTER_WHISPER_MODEL_CACHE", {"medium": faster_model})
+    monkeypatch.setattr(
+        bench_harness,
+        "_GRANITE_ASR_MODEL_CACHE",
+        {"ibm-granite/granite-4.0-1b-speech": granite_model},
+    )
     monkeypatch.setattr(bench_harness, "_NEMO_ASR_MODEL_CACHE", {"nvidia/parakeet-tdt-0.6b-v3": nemo_model})
     monkeypatch.setattr(bench_harness, "_QWEN_ASR_MODEL_CACHE", {"Qwen/Qwen3-ASR-1.7B": qwen_model})
 
@@ -231,9 +240,11 @@ def test_release_transcription_runtime_resources_clears_selected_backend_cache(
 
     assert released == 1
     assert faster_model.devices == []
+    assert granite_model.devices == []
     assert nemo_model.devices == ["cpu"]
     assert qwen_model.devices == []
     assert bench_harness._FASTER_WHISPER_MODEL_CACHE == {"medium": faster_model}
+    assert bench_harness._GRANITE_ASR_MODEL_CACHE == {"ibm-granite/granite-4.0-1b-speech": granite_model}
     assert bench_harness._NEMO_ASR_MODEL_CACHE == {}
     assert bench_harness._QWEN_ASR_MODEL_CACHE == {"Qwen/Qwen3-ASR-1.7B": qwen_model}
     assert observed["gc"] == 2
@@ -266,6 +277,35 @@ def test_cache_transcription_model_uses_nvidia_backend(monkeypatch: pytest.Monke
     assert observed["loader_local_files_only"] is False
     assert result["model_cache_source"] == "nemo_toolkit_asr"
     assert result["model_cache_dir"] == "/tmp/fake-nvidia-model"
+
+
+def test_cache_transcription_model_uses_granite_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_snapshot(repo_id: str, *, local_files_only: bool) -> str:
+        observed["repo_id"] = repo_id
+        observed["local_files_only"] = local_files_only
+        return "/tmp/fake-granite-model"
+
+    def fake_get_granite_model(model_id: str, *, local_files_only: bool) -> object:
+        observed["model_id"] = model_id
+        observed["loader_local_files_only"] = local_files_only
+        return object()
+
+    monkeypatch.setattr(bench_harness, "_get_hf_repo_snapshot", fake_snapshot)
+    monkeypatch.setattr(bench_harness, "_get_granite_asr_model", fake_get_granite_model)
+    result = bench_harness.cache_transcription_model(
+        transcription_model="ibm-granite/granite-4.0-1b-speech",
+        max_model_ram_gb=16.0,
+    )
+
+    assert observed["repo_id"] == "ibm-granite/granite-4.0-1b-speech"
+    assert observed["local_files_only"] is False
+    assert observed["model_id"] == "ibm-granite/granite-4.0-1b-speech"
+    assert observed["loader_local_files_only"] is False
+    assert result["model_cache_source"] == "transformers"
+    assert result["model_cache_dir"] == "/tmp/fake-granite-model"
+    assert result["normalized_model_id"] == "ibm-granite/granite-4.0-1b-speech"
 
 
 def test_cache_transcription_model_uses_qwen_backend(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -81,6 +81,25 @@ def _write_manifest(app_root: Path) -> None:
                 "size_bytes": 1,
                 "default_install": False,
             },
+            {
+                "model_id": runtime_env.PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
+                "kind": "transcription",
+                "relative_path": "asr/ibm-granite/granite-4.0-1b-speech",
+                "source_type": "huggingface_snapshot",
+                "repo_id": runtime_env.PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
+                "revision": "rev-granite",
+                "filename": None,
+                "required_files": [
+                    {
+                        "path": "config.json",
+                        "sha256": "6" * 64,
+                        "size_bytes": 1,
+                    }
+                ],
+                "sha256": "7" * 64,
+                "size_bytes": 1,
+                "default_install": False,
+            },
         ],
     }
     (app_root / runtime_env.PACKAGED_ASSET_MANIFEST_FILENAME).write_text(
@@ -100,6 +119,12 @@ def test_detect_runtime_mode_honors_packaged_env(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv(runtime_env.PACKAGED_RUNTIME_ENV, "1")
 
     assert runtime_env.detect_runtime_mode() == runtime_env.RuntimeMode.PACKAGED
+
+
+def test_bundled_transcription_model_specs_include_granite() -> None:
+    specs = runtime_env.bundled_transcription_model_specs()
+
+    assert runtime_env.PACKAGED_GRANITE_TRANSCRIPTION_MODEL in {spec.model_id for spec in specs}
 
 
 def test_resolve_app_runtime_paths_uses_data_root_models_for_packaged_runtime(
@@ -127,6 +152,9 @@ def test_resolve_app_runtime_paths_uses_data_root_models_for_packaged_runtime(
     assert paths.notes_models[DEFAULT_SESSION_NOTES_MODEL] == data_root.resolve() / "models/notes/qwen3.5-4b-q4_k_m.gguf"
     assert paths.transcription_models[DEFAULT_LIVE_TRANSCRIPTION_MODEL] == (
         data_root.resolve() / "models/asr/nvidia/parakeet-tdt-0.6b-v3"
+    )
+    assert paths.transcription_models[runtime_env.PACKAGED_GRANITE_TRANSCRIPTION_MODEL] == (
+        data_root.resolve() / "models/asr/ibm-granite/granite-4.0-1b-speech"
     )
 
 

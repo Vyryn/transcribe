@@ -54,6 +54,7 @@ var
   ModelsPage: TWizardPage;
   VoiceParakeetCheckBox: TNewCheckBox;
   VoiceCanaryCheckBox: TNewCheckBox;
+  VoiceGraniteCheckBox: TNewCheckBox;
   Notes4BCheckBox: TNewCheckBox;
   Notes2BCheckBox: TNewCheckBox;
   ModelInstallProgressPage: TOutputProgressWizardPage;
@@ -88,6 +89,8 @@ begin
   if VoiceParakeetCheckBox.Checked then
     Result := Result + 1;
   if VoiceCanaryCheckBox.Checked then
+    Result := Result + 1;
+  if VoiceGraniteCheckBox.Checked then
     Result := Result + 1;
   if Notes4BCheckBox.Checked then
     Result := Result + 1;
@@ -205,6 +208,21 @@ begin
       end;
     end;
 
+    if VoiceGraniteCheckBox.Checked then
+    begin
+      CurrentIndex := CurrentIndex + 1;
+      if not InstallSelectedModel(
+        'ibm-granite/granite-4.0-1b-speech',
+        'Voice: IBM Granite 4.0 1B Speech',
+        CurrentIndex,
+        TotalCount
+      ) then
+      begin
+        Result := False;
+        Exit;
+      end;
+    end;
+
     if Notes4BCheckBox.Checked then
     begin
       CurrentIndex := CurrentIndex + 1;
@@ -269,11 +287,19 @@ begin
     False
   );
 
+  VoiceGraniteCheckBox := TNewCheckBox.Create(ModelsPage);
+  ConfigureModelCheckBox(
+    VoiceGraniteCheckBox,
+    'Voice: IBM Granite 4.0 1B Speech',
+    NextModelCheckBoxTop(VoiceCanaryCheckBox),
+    False
+  );
+
   Notes4BCheckBox := TNewCheckBox.Create(ModelsPage);
   ConfigureModelCheckBox(
     Notes4BCheckBox,
     'Notes: Qwen 3.5 4B GGUF (default)',
-    NextModelCheckBoxTop(VoiceCanaryCheckBox),
+    NextModelCheckBoxTop(VoiceGraniteCheckBox),
     True
   );
 
