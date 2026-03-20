@@ -315,7 +315,7 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
         resolved_devices: dict[str, list[_WindowsCaptureDevice]] = {}
         with _initialize_com_thread():
             if "mic" in self._active_stream_names:
-                resolved_devices["mic"] = self.resolve_devices(
+                resolved_devices["mic"] = self._resolve_windows_devices(
                     soundcard,
                     configured=config.mic_device,
                     require_monitor=False,
@@ -323,7 +323,7 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
                     allow_missing=config.allow_missing_sources,
                 )
             if "speakers" in self._active_stream_names:
-                resolved_devices["speakers"] = self.resolve_devices(
+                resolved_devices["speakers"] = self._resolve_windows_devices(
                     soundcard,
                     configured=config.speaker_device,
                     require_monitor=True,
@@ -345,7 +345,7 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
                 stream_key = f"{stream_name}:{device.index}"
                 self._queues[stream_key] = queue.Queue(maxsize=self._queue_max_frames)
                 try:
-                    stream, device_sample_rate_hz, frame_samples, device_channels = self._open_stream_with_fallback(
+                    stream, device_sample_rate_hz, frame_samples, device_channels = self._open_windows_stream_with_fallback(
                         stream_key=stream_key,
                         stream_group=stream_name,
                         device=device,
@@ -392,7 +392,7 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
 
         self._resolved_devices = {name: tuple(opened_devices[name]) for name in self._active_stream_names}
 
-    def resolve_devices(
+    def _resolve_windows_devices(
         self,
         soundcard: Any,
         configured: str | int | None,
@@ -406,7 +406,14 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
         candidates = [device for device in catalog if device.is_loopback is require_monitor]
 
         if configured is not None:
-            return [self._resolve_configured_device(soundcard, catalog=catalog, configured=configured, require_monitor=require_monitor)]
+            return [
+                self._resolve_configured_device(
+                    soundcard,
+                    catalog=catalog,
+                    configured=configured,
+                    require_monitor=require_monitor,
+                )
+            ]
 
         if candidates:
             if include_all:
@@ -426,7 +433,7 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
             )
         raise RuntimeError("No microphone input device found. Provide --mic-device explicitly.")
 
-    def _open_stream_with_fallback(
+    def _open_windows_stream_with_fallback(
         self,
         *,
         stream_key: str,
@@ -437,8 +444,8 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
     ) -> tuple[_SoundCardRecorderStream, int, int, int]:
         """Open one SoundCard stream, retrying fallback rates when necessary."""
         last_error: Exception | None = None
-        for candidate_channels in self._candidate_channel_counts(device=device, requested_channels=requested_channels):
-            for candidate_rate_hz in self._candidate_sample_rates(requested_sample_rate_hz=requested_sample_rate_hz):
+        for candidate_channels in self._windows_candidate_channel_counts(device=device, requested_channels=requested_channels):
+            for candidate_rate_hz in self._windows_candidate_sample_rates(requested_sample_rate_hz=requested_sample_rate_hz):
                 frame_samples = int((candidate_rate_hz * self.config.frame_ms) / 1000) if self.config is not None else 0
                 if frame_samples <= 0:
                     continue
@@ -470,8 +477,7 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
             "Try specifying a different --mic-device (or --speaker-device for both-mode capture)."
         )
 
-    @staticmethod
-    def _candidate_sample_rates(*, requested_sample_rate_hz: int) -> list[int]:
+    def _windows_candidate_sample_rates(self, *, requested_sample_rate_hz: int) -> list[int]:
         """Return candidate Windows shared-mode capture rates in preference order."""
         candidates = [int(requested_sample_rate_hz), 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 8_000]
         deduped: list[int] = []
@@ -483,8 +489,12 @@ class WindowsAudioCaptureBackend(LinuxAudioCaptureBackend):
             deduped.append(rate)
         return deduped
 
-    @staticmethod
-    def _candidate_channel_counts(*, device: _WindowsCaptureDevice, requested_channels: int) -> list[int]:
+    def _windows_candidate_channel_counts(
+        self,
+        *,
+        device: _WindowsCaptureDevice,
+        requested_channels: int,
+    ) -> list[int]:
         """Return candidate channel counts, preferring the device's native layout."""
         max_channels = max(1, int(device.max_input_channels))
         clamped_requested = max(1, min(int(requested_channels), max_channels))

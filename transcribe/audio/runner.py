@@ -129,9 +129,14 @@ def run_capture_session(
             "elapsed_monotonic_ns": time.monotonic_ns() - started_monotonic_ns,
             "frames_written_mic": frame_index,
             "frames_written_speakers": frame_index,
-            "interrupted": interrupted,
         }
     )
+    manifest_capture_stats: dict[str, int | float | str | bool] = {
+        key: value
+        for key, value in capture_stats.items()
+        if isinstance(value, (int, float, str, bool))
+    }
+    manifest_capture_stats["interrupted"] = interrupted
 
     manifest = SessionManifest(
         session_id=config.session_id,
@@ -145,7 +150,7 @@ def run_capture_session(
             "speakers_wav": str(speakers_path),
             "session_manifest": str(manifest_path),
         },
-        capture_stats=capture_stats,
+        capture_stats=manifest_capture_stats,
     )
 
     write_session_manifest(manifest, manifest_path)

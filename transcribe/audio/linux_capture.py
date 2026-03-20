@@ -558,10 +558,10 @@ class LinuxAudioCaptureBackend:
         sd: Any,
         *,
         require_monitor: bool,
-    ) -> list[int]:
+    ) -> list[str | int]:
         """Return ranked candidate device indices for mic or speaker/loopback capture."""
-        scored_candidates: list[tuple[float, int]] = []
-        generic_fallbacks: list[int] = []
+        scored_candidates: list[tuple[float, str | int]] = []
+        generic_fallbacks: list[str | int] = []
         for index, raw_device in enumerate(sd.query_devices()):
             if not isinstance(raw_device, Mapping):
                 continue
@@ -589,7 +589,7 @@ class LinuxAudioCaptureBackend:
 
         # Fallback: for mic mode, use all non-speaker-like devices.
         if not require_monitor:
-            fallback_mic: list[int] = []
+            fallback_mic: list[str | int] = []
             for index, raw_device in enumerate(sd.query_devices()):
                 if not isinstance(raw_device, Mapping):
                     continue

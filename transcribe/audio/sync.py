@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from transcribe.audio.interfaces import RawFrame
+from transcribe.audio.interfaces import RawFrame, StreamName
 from transcribe.models import CapturedFrame
 from transcribe.utils.stats import percentile
 
@@ -17,15 +18,11 @@ class SyncAccumulator:
     total_drift_ns: int = 0
     max_drift_ns: int = 0
     total_callback_to_write_ns: int = 0
-    callback_to_write_latency_samples_ms: list[float] = None
-
-    def __post_init__(self) -> None:
-        if self.callback_to_write_latency_samples_ms is None:
-            self.callback_to_write_latency_samples_ms = []
+    callback_to_write_latency_samples_ms: list[float] = field(default_factory=list)
 
 
 def build_captured_pair(
-    raw_frames: dict[str, RawFrame],
+    raw_frames: Mapping[StreamName, RawFrame],
     frame_index: int,
 ) -> tuple[CapturedFrame, CapturedFrame, int]:
     """Convert raw stream frames into typed captured frames.
