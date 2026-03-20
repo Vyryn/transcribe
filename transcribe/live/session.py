@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 import wave
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -496,8 +496,7 @@ def _select_best_source_chunk(
     for source_name, source_pcm16 in chunk_pcm16_by_source.items():
         source_scores[source_name] = _pcm16_clarity_score(bytes(source_pcm16), sample_rate_hz=sample_rate_hz)
 
-    best_source = max(source_scores, key=source_scores.get)
-    best_score = source_scores[best_source]
+    best_source, best_score = max(source_scores.items(), key=lambda item: item[1])
 
     selected_source = best_source
     hysteresis_margin = 0.15
@@ -668,12 +667,12 @@ def run_live_transcription_session(
         event: str,
         *,
         include_progress: bool,
-        write_handle: object | None = None,
+        write_handle: io.TextIOBase | None = None,
     ) -> None:
         nonlocal last_timeout_reported_monotonic, last_timeout_reported_streak
         now_monotonic = time.monotonic()
         diagnostics = _capture_diagnostics_snapshot(backend)
-        payload = {
+        payload: dict[str, object] = {
             "event": event,
             "captured_at_utc": datetime.now(timezone.utc).isoformat(),
             "read_timeout_streak": read_timeout_streak,
@@ -792,8 +791,8 @@ def run_live_transcription_session(
                 buffered_audio_sec=startup_buffered_audio_sec,
             )
 
-    def _write_event(event: dict[str, object], handle: object) -> None:
-        handle.write(json.dumps(event, ensure_ascii=True) + "\n")
+    def _write_event(event: Mapping[str, object], handle: io.TextIOBase) -> None:
+        handle.write(json.dumps(dict(event), ensure_ascii=True) + "\n")
         handle.flush()
 
     if not interrupted:
@@ -1216,10 +1215,8 @@ def run_live_transcription_session(
         "final_segments": final_segments,
     }
     transcript_json_path.write_text(json.dumps(transcript_payload, indent=2, ensure_ascii=True), encoding="utf-8")
-    transcript_txt_path.write_text(
-        "\n".join(segment["text"] for segment in final_segments if isinstance(segment.get("text"), str)) + "\n",
-        encoding="utf-8",
-    )
+    final_text_lines = [segment_text for segment in final_segments if isinstance((segment_text := segment.get("text")), str)]
+    transcript_txt_path.write_text("\n".join(final_text_lines) + "\n", encoding="utf-8")
 
     return LiveSessionResult(
         session_dir=session_dir,
