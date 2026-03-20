@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-import gc
 import hashlib
 import io
 import json
 import logging
 import os
 import tempfile
-import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+import transcribe.transcription_runtime as _runtime_asr
 from transcribe.bench.report import build_benchmark_report, write_benchmark_report
 from transcribe.models import CaptureConfig
 from transcribe.runtime_env import network_access_allowed
@@ -389,13 +388,14 @@ def _extract_audio_input(row: Mapping[str, object]) -> object:
     if isinstance(audio, str) and audio:
         return audio
     if isinstance(audio, Mapping):
-        payload = audio.get("bytes")
+        audio_mapping = dict(audio)
+        payload = audio_mapping.get("bytes")
         if isinstance(payload, (bytes, bytearray)):
             return io.BytesIO(bytes(payload))
-        array = audio.get("array")
+        array = audio_mapping.get("array")
         if array is not None:
             return array
-        path = audio.get("path")
+        path = audio_mapping.get("path")
         if isinstance(path, str) and path:
             return path
     raise ValueError("Dataset row does not include a usable audio payload")
@@ -744,12 +744,13 @@ def _extract_audio_path(row: Mapping[str, object]) -> str:
     if isinstance(audio, str) and audio:
         return audio
     if isinstance(audio, Mapping):
-        path = audio.get("path")
+        audio_mapping = dict(audio)
+        path = audio_mapping.get("path")
         if isinstance(path, str) and path:
             path_obj = Path(path)
             if path_obj.exists():
                 return path
-        payload = audio.get("bytes")
+        payload = audio_mapping.get("bytes")
         if isinstance(payload, (bytes, bytearray)):
             payload_bytes = bytes(payload)
             cache_key = hashlib.sha1(payload_bytes).hexdigest()
@@ -781,10 +782,11 @@ def _extract_qwen_audio_input(row: Mapping[str, object]) -> object:
     if isinstance(audio, str) and audio:
         return audio
     if isinstance(audio, Mapping):
-        path = audio.get("path")
+        audio_mapping = dict(audio)
+        path = audio_mapping.get("path")
         if isinstance(path, str) and path and Path(path).exists():
             return path
-        payload = audio.get("bytes")
+        payload = audio_mapping.get("bytes")
         if isinstance(payload, (bytes, bytearray)):
             payload_bytes = bytes(payload)
             cache_key = hashlib.sha1(payload_bytes).hexdigest()
@@ -807,9 +809,9 @@ def _extract_qwen_audio_input(row: Mapping[str, object]) -> object:
             return materialized_path
         if isinstance(path, str) and path:
             return path
-        array = audio.get("array")
+        array = audio_mapping.get("array")
         if array is not None:
-            sampling_rate = int(_to_float(audio.get("sampling_rate"), default=16_000))
+            sampling_rate = int(_to_float(audio_mapping.get("sampling_rate"), default=16_000))
             sampling_rate = sampling_rate if sampling_rate > 0 else 16_000
             return (array, sampling_rate)
     return _extract_audio_input(row)
@@ -859,8 +861,9 @@ def _extract_granite_audio_waveform(row: Mapping[str, object]) -> Any:
     if isinstance(audio, str) and audio:
         waveform, sampling_rate = torchaudio.load(audio)
     elif isinstance(audio, Mapping):
-        payload = audio.get("bytes")
-        path = audio.get("path")
+        audio_mapping = dict(audio)
+        payload = audio_mapping.get("bytes")
+        path = audio_mapping.get("path")
         if isinstance(payload, (bytes, bytearray)):
             audio_path = _materialize_audio_bytes_path(
                 bytes(payload),
@@ -872,10 +875,10 @@ def _extract_granite_audio_waveform(row: Mapping[str, object]) -> Any:
         elif isinstance(path, str) and path:
             waveform, sampling_rate = torchaudio.load(path)
         else:
-            array = audio.get("array")
+            array = audio_mapping.get("array")
             if array is not None:
                 waveform = torch.as_tensor(array)
-                sampling_rate = int(_to_float(audio.get("sampling_rate"), default=_GRANITE_ASR_SAMPLE_RATE))
+                sampling_rate = int(_to_float(audio_mapping.get("sampling_rate"), default=_GRANITE_ASR_SAMPLE_RATE))
                 sampling_rate = sampling_rate if sampling_rate > 0 else _GRANITE_ASR_SAMPLE_RATE
     if waveform is None:
         raise ValueError("Dataset row does not include Granite-compatible audio content")
@@ -923,7 +926,8 @@ def _transcription_item_to_text(item: object) -> str:
     if isinstance(text_attr, str):
         return text_attr.strip()
     if isinstance(item, Mapping):
-        text = item.get("text")
+        item_mapping = dict(item)
+        text = item_mapping.get("text")
         if isinstance(text, str):
             return text.strip()
     if isinstance(item, str):
@@ -936,109 +940,6 @@ def _transcription_output_to_text(output: object) -> str:
     if isinstance(output, (list, tuple)):
         return " ".join(piece for piece in (_transcription_item_to_text(item) for item in output) if piece).strip()
     return _transcription_item_to_text(output)
-
-
-def transcribe_row_with_faster_whisper(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
-    """Transcribe one diarized row and return text plus inference latency."""
-    model = _get_faster_whisper_model(transcription_model, local_files_only=True)
-    audio_input = _extract_audio_input(row)
-
-    started_at = time.perf_counter()
-    segments, _ = model.transcribe(
-        audio_input,
-        language="en",
-        beam_size=1,
-        condition_on_previous_text=False,
-        vad_filter=True,
-    )
-    predicted_text = " ".join(segment.text.strip() for segment in segments if segment.text).strip()
-    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-    return predicted_text, elapsed_ms
-
-
-def transcribe_row_with_nemo_asr(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
-    """Transcribe one diarized row with NeMo ASR and return text plus latency."""
-    model = _get_nemo_asr_model(transcription_model, local_files_only=True)
-    audio_path = _extract_audio_path(row)
-
-    started_at = time.perf_counter()
-    if hasattr(model, "transcribe"):
-        output = model.transcribe([audio_path])
-        predicted_text = _transcription_output_to_text(output)
-    elif hasattr(model, "generate"):
-        audio_locator_tag = getattr(model, "audio_locator_tag", "<|audioplaceholder|>")
-        prompt = f"Transcribe the following: {audio_locator_tag}"
-        output_ids = model.generate(
-            prompts=[[{"role": "user", "content": prompt, "audio": [audio_path]}]],
-            max_new_tokens=256,
-            do_sample=False,
-        )
-        tokenizer = getattr(model, "tokenizer", None)
-        if tokenizer is not None and hasattr(tokenizer, "ids_to_text"):
-            predicted_text = str(tokenizer.ids_to_text(output_ids[0].cpu())).strip()
-        else:
-            raise RuntimeError("Loaded NeMo model does not expose tokenizer.ids_to_text for transcription decoding.")
-    else:
-        raise RuntimeError(
-            f"Loaded NeMo model for {transcription_model!r} has no supported inference API (expected transcribe or generate)."
-        )
-    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-    return predicted_text, elapsed_ms
-
-
-def transcribe_row_with_qwen_asr(row: Mapping[str, object], transcription_model: str) -> tuple[str, float]:
-    """Transcribe one diarized row with qwen-asr and return text plus latency."""
-    model = _get_qwen_asr_model(transcription_model, local_files_only=True)
-    audio_input = _extract_qwen_audio_input(row)
-
-    started_at = time.perf_counter()
-    output = model.transcribe(audio=audio_input)
-    predicted_text = _transcription_output_to_text(output)
-    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-    return predicted_text, elapsed_ms
-
-
-def _default_hf_segment_transcriber(transcription_model: str) -> HfSegmentTranscriber:
-    """Resolve the default segment transcriber for a model identifier."""
-    backend, _ = _resolve_transcription_backend(transcription_model)
-    if backend == "nemo_asr":
-        return transcribe_row_with_nemo_asr
-    if backend == "qwen_asr":
-        return transcribe_row_with_qwen_asr
-    return transcribe_row_with_faster_whisper
-
-
-def preload_transcription_model(
-    transcription_model: str,
-    *,
-    max_model_ram_gb: float = DEFAULT_MAX_MODEL_RAM_GB,
-) -> None:
-    """Load the requested transcription backend into cache without running inference."""
-    _enforce_model_ram_limit(transcription_model, max_model_ram_gb)
-    backend, resolved_model_id = _resolve_transcription_backend(transcription_model)
-
-    if backend == "nemo_asr":
-        _get_nemo_asr_model(resolved_model_id, local_files_only=True)
-        return
-    if backend == "qwen_asr":
-        _get_qwen_asr_model(resolved_model_id, local_files_only=True)
-        return
-    _get_faster_whisper_model(resolved_model_id, local_files_only=True)
-
-
-def release_transcription_runtime_resources(transcription_model: str | None = None) -> int:
-    """Release cached ASR model instances so later stages can reclaim accelerator memory."""
-    caches = _selected_transcription_model_caches(transcription_model)
-    models_to_release = _collect_unique_cached_models(caches)
-
-    for cache in caches:
-        cache.clear()
-    for model in models_to_release:
-        _offload_model_to_cpu(model)
-
-    gc.collect()
-    _clear_accelerator_caches()
-    return len(models_to_release)
 
 
 def _selected_transcription_model_caches(transcription_model: str | None) -> list[dict[str, Any]]:
@@ -1596,7 +1497,7 @@ def run_hf_diarized_transcription_benchmark(
 
     row_count = len(run_results)
     total_inference_sec = total_inference_ms / 1000.0
-    summary = {
+    summary: dict[str, object] = {
         "run_count": row_count,
         "dataset_id": dataset_id,
         "dataset_config": dataset_config or "",
@@ -1628,8 +1529,6 @@ def run_hf_diarized_transcription_benchmark(
     )
     json_path, markdown_path = write_benchmark_report(report, output_dir=output_dir)
     return BenchmarkResult(report=report, json_path=json_path, markdown_path=markdown_path)
-
-import transcribe.transcription_runtime as _runtime_asr
 
 _FASTER_WHISPER_MODEL_CACHE = _runtime_asr._FASTER_WHISPER_MODEL_CACHE
 _GRANITE_ASR_MODEL_CACHE = _runtime_asr._GRANITE_ASR_MODEL_CACHE
@@ -1678,7 +1577,7 @@ def _runtime_transcription_overrides() -> dict[str, object]:
 
 
 @contextmanager
-def _synced_runtime_transcription_state() -> Iterable[None]:
+def _synced_runtime_transcription_state() -> Iterator[None]:
     """Temporarily wire benchmark overrides into the shared transcription runtime."""
     overrides = _runtime_transcription_overrides()
     originals = {name: getattr(_runtime_asr, name) for name in overrides}

@@ -67,6 +67,22 @@ _REEXPORTED_DEFAULTS = (
 )
 
 
+def _coerce_int(value: object, *, default: int = 0) -> int:
+    """Return one int-like value or a fallback."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return default
+    return default
+
+
 def _release_transcription_resources_in_background(
     transcription_model: str,
     *,
@@ -235,11 +251,12 @@ def list_devices(*, common: UiCommonOptions) -> DeviceListResult:
     for raw_device in raw_devices:
         if not isinstance(raw_device, dict):
             continue
-        index = int(raw_device.get("index", -1))
-        name = str(raw_device.get("name", "unknown device"))
-        hostapi_name = str(raw_device.get("hostapi_name", "")).strip()
-        max_inputs = int(raw_device.get("max_input_channels", 0))
-        default_sr_value = raw_device.get("default_samplerate")
+        device_info = dict(raw_device)
+        index = _coerce_int(device_info.get("index", -1), default=-1)
+        name = str(device_info.get("name", "unknown device"))
+        hostapi_name = str(device_info.get("hostapi_name", "")).strip()
+        max_inputs = _coerce_int(device_info.get("max_input_channels", 0))
+        default_sr_value = device_info.get("default_samplerate")
         default_samplerate = None
         if isinstance(default_sr_value, (int, float)) and float(default_sr_value) > 0:
             default_samplerate = float(default_sr_value)
