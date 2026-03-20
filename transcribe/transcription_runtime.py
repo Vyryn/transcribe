@@ -383,13 +383,14 @@ def _extract_audio_input(row: Mapping[str, object]) -> object:
     if isinstance(audio, str) and audio:
         return audio
     if isinstance(audio, Mapping):
-        payload = audio.get("bytes")
+        audio_mapping = dict(audio)
+        payload = audio_mapping.get("bytes")
         if isinstance(payload, (bytes, bytearray)):
             return io.BytesIO(bytes(payload))
-        array = audio.get("array")
+        array = audio_mapping.get("array")
         if array is not None:
             return array
-        path = audio.get("path")
+        path = audio_mapping.get("path")
         if isinstance(path, str) and path:
             return path
     raise ValueError("Dataset row does not include a usable audio payload")
@@ -930,8 +931,9 @@ def _extract_granite_audio_waveform(row: Mapping[str, object]) -> Any:
     if isinstance(audio, str) and audio:
         waveform, sampling_rate = torchaudio.load(audio)
     elif isinstance(audio, Mapping):
-        payload = audio.get("bytes")
-        path = audio.get("path")
+        audio_mapping = dict(audio)
+        payload = audio_mapping.get("bytes")
+        path = audio_mapping.get("path")
         if isinstance(payload, (bytes, bytearray)):
             audio_path = _materialize_audio_bytes_path(
                 bytes(payload),
@@ -943,10 +945,10 @@ def _extract_granite_audio_waveform(row: Mapping[str, object]) -> Any:
         elif isinstance(path, str) and path:
             waveform, sampling_rate = torchaudio.load(path)
         else:
-            array = audio.get("array")
+            array = audio_mapping.get("array")
             if array is not None:
                 waveform = torch.as_tensor(array)
-                sampling_rate = int(_to_float(audio.get("sampling_rate"), default=_GRANITE_ASR_SAMPLE_RATE))
+                sampling_rate = int(_to_float(audio_mapping.get("sampling_rate"), default=_GRANITE_ASR_SAMPLE_RATE))
                 sampling_rate = sampling_rate if sampling_rate > 0 else _GRANITE_ASR_SAMPLE_RATE
     if waveform is None:
         raise ValueError("Dataset row does not include Granite-compatible audio content")
@@ -973,12 +975,13 @@ def _extract_audio_path(row: Mapping[str, object]) -> str:
     if isinstance(audio, str) and audio:
         return audio
     if isinstance(audio, Mapping):
-        path = audio.get("path")
+        audio_mapping = dict(audio)
+        path = audio_mapping.get("path")
         if isinstance(path, str) and path:
             path_obj = Path(path)
             if path_obj.exists():
                 return path
-        payload = audio.get("bytes")
+        payload = audio_mapping.get("bytes")
         if isinstance(payload, (bytes, bytearray)):
             payload_bytes = bytes(payload)
             cache_key = hashlib.sha1(payload_bytes).hexdigest()
@@ -1010,10 +1013,11 @@ def _extract_qwen_audio_input(row: Mapping[str, object]) -> object:
     if isinstance(audio, str) and audio:
         return audio
     if isinstance(audio, Mapping):
-        path = audio.get("path")
+        audio_mapping = dict(audio)
+        path = audio_mapping.get("path")
         if isinstance(path, str) and path and Path(path).exists():
             return path
-        payload = audio.get("bytes")
+        payload = audio_mapping.get("bytes")
         if isinstance(payload, (bytes, bytearray)):
             payload_bytes = bytes(payload)
             cache_key = hashlib.sha1(payload_bytes).hexdigest()
@@ -1036,9 +1040,9 @@ def _extract_qwen_audio_input(row: Mapping[str, object]) -> object:
             return materialized_path
         if isinstance(path, str) and path:
             return path
-        array = audio.get("array")
+        array = audio_mapping.get("array")
         if array is not None:
-            sampling_rate = int(_to_float(audio.get("sampling_rate"), default=16_000))
+            sampling_rate = int(_to_float(audio_mapping.get("sampling_rate"), default=16_000))
             sampling_rate = sampling_rate if sampling_rate > 0 else 16_000
             return (array, sampling_rate)
     return _extract_audio_input(row)
@@ -1050,7 +1054,8 @@ def _transcription_item_to_text(item: object) -> str:
     if isinstance(text_attr, str):
         return text_attr.strip()
     if isinstance(item, Mapping):
-        text = item.get("text")
+        item_mapping = dict(item)
+        text = item_mapping.get("text")
         if isinstance(text, str):
             return text.strip()
     if isinstance(item, str):

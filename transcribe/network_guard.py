@@ -5,7 +5,7 @@ import ipaddress
 import socket
 import threading
 from contextlib import closing
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 
 class OutboundNetworkBlocked(PermissionError):
@@ -19,12 +19,14 @@ _ORIGINAL_CONNECT: _InstalledConnect | None = None
 _ORIGINAL_CONNECT_EX: _InstalledConnectEx | None = None
 _ORIGINAL_CREATE_CONNECTION: Callable[..., socket.socket] | None = None
 _INSTALLED = False
+_SOCKET_DEFAULT_TIMEOUT = getattr(socket, "_GLOBAL_DEFAULT_TIMEOUT", object())
 
 
 def _is_unix_socket_family(family: int) -> bool:
     """Return True when a socket family represents a Unix domain socket."""
     af_unix = getattr(socket, "AF_UNIX", None)
     return af_unix is not None and family == af_unix
+
 
 def is_loopback(host: str) -> bool:
     """Check whether a host string resolves to a loopback address.
@@ -97,7 +99,7 @@ def guarded_connect_ex(self: socket.socket, address: Any) -> Any:
 
 def guarded_create_connection(
     address: tuple[str, int],
-    timeout: float | object = socket._GLOBAL_DEFAULT_TIMEOUT,
+    timeout: float | object = _SOCKET_DEFAULT_TIMEOUT,
     source_address: tuple[str, int] | None = None,
 ) -> socket.socket:
     """Guard ``socket.create_connection`` to enforce outbound policy."""
@@ -118,9 +120,9 @@ def install_outbound_network_guard() -> None:
     _ORIGINAL_CONNECT_EX = socket.socket.connect_ex
     _ORIGINAL_CREATE_CONNECTION = socket.create_connection
 
-    socket.socket.connect = guarded_connect
-    socket.socket.connect_ex = guarded_connect_ex
-    socket.create_connection = guarded_create_connection
+    socket.socket.connect = cast(Any, guarded_connect)
+    socket.socket.connect_ex = cast(Any, guarded_connect_ex)
+    socket.create_connection = cast(Any, guarded_create_connection)
     _INSTALLED = True
 
 

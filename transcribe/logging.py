@@ -5,7 +5,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 SENSITIVE_FIELD_NAMES = {
     "audio",
@@ -56,7 +56,7 @@ def resolve_console_stream(*, error: bool, fallback_sink: bool = False) -> io.Te
     fallback = sys.__stderr__ if error else sys.__stdout__
     for candidate in (primary, fallback):
         if _stream_supports_text_writes(candidate):
-            return candidate
+            return cast(io.TextIOBase, candidate)
     if fallback_sink:
         return _NullTextStream()
     return None

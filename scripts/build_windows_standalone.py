@@ -423,8 +423,9 @@ def project_runtime_distribution_names(pyproject: Mapping[str, object]) -> tuple
     project = pyproject.get("project")
     if not isinstance(project, Mapping):
         raise ValueError("pyproject.toml is missing a [project] table.")
-    raw_dependencies = project.get("dependencies", [])
-    optional_dependencies = project.get("optional-dependencies", {})
+    project_table = dict(project)
+    raw_dependencies = project_table.get("dependencies", [])
+    optional_dependencies = project_table.get("optional-dependencies", {})
     if not isinstance(raw_dependencies, list):
         raise ValueError("[project].dependencies must be a list.")
     if not isinstance(optional_dependencies, Mapping):
@@ -459,7 +460,8 @@ def project_optional_dependency_groups(pyproject: Mapping[str, object]) -> tuple
     project = pyproject.get("project")
     if not isinstance(project, Mapping):
         raise ValueError("pyproject.toml is missing a [project] table.")
-    optional_dependencies = project.get("optional-dependencies", {})
+    project_table = dict(project)
+    optional_dependencies = project_table.get("optional-dependencies", {})
     if not isinstance(optional_dependencies, Mapping):
         raise ValueError("[project.optional-dependencies] must be a table.")
     return tuple(sorted(str(extra) for extra in optional_dependencies))
@@ -782,8 +784,9 @@ def select_github_asset(
     for raw_asset in raw_assets:
         if not isinstance(raw_asset, Mapping):
             continue
-        name = raw_asset.get("name")
-        download_url = raw_asset.get("browser_download_url")
+        asset_table = dict(raw_asset)
+        name = asset_table.get("name")
+        download_url = asset_table.get("browser_download_url")
         if isinstance(name, str) and isinstance(download_url, str):
             assets.append(GitHubReleaseAsset(name=name, download_url=download_url))
 

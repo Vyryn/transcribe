@@ -76,7 +76,7 @@ class SessionManifest:
     contains_phi: bool = True
     data_classification: DataClassification = DataClassification.PHI
     artifacts: dict[str, str] = field(default_factory=dict)
-    capture_stats: dict[str, int | float | str] = field(default_factory=dict)
+    capture_stats: dict[str, int | float | str | bool] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:

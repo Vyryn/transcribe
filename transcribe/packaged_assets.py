@@ -217,9 +217,10 @@ def write_packaged_asset_manifest(manifest: PackagedAssetsManifest, destination:
 def _parse_required_file(raw: object) -> PackagedAssetFile:
     if not isinstance(raw, dict):
         raise ValueError(f"required file entry must be a JSON object, got {type(raw).__name__}")
-    path = raw.get("path")
-    sha256 = raw.get("sha256")
-    size_bytes = raw.get("size_bytes")
+    raw_file = dict(raw)
+    path = raw_file.get("path")
+    sha256 = raw_file.get("sha256")
+    size_bytes = raw_file.get("size_bytes")
     if not isinstance(path, str) or not path.strip():
         raise ValueError("required file entry must include non-empty string field 'path'")
     if not isinstance(sha256, str) or len(sha256) != 64:
@@ -236,18 +237,19 @@ def _parse_required_file(raw: object) -> PackagedAssetFile:
 def _parse_asset(raw: object) -> PackagedModelAsset:
     if not isinstance(raw, dict):
         raise ValueError(f"asset entry must be a JSON object, got {type(raw).__name__}")
+    raw_asset = dict(raw)
 
-    model_id = raw.get("model_id")
-    kind = raw.get("kind")
-    relative_path = raw.get("relative_path")
-    source_type = raw.get("source_type")
-    repo_id = raw.get("repo_id")
-    revision = raw.get("revision")
-    filename = raw.get("filename")
-    required_files_raw = raw.get("required_files", [])
-    sha256 = raw.get("sha256")
-    size_bytes = raw.get("size_bytes")
-    default_install = raw.get("default_install")
+    model_id = raw_asset.get("model_id")
+    kind = raw_asset.get("kind")
+    relative_path = raw_asset.get("relative_path")
+    source_type = raw_asset.get("source_type")
+    repo_id = raw_asset.get("repo_id")
+    revision = raw_asset.get("revision")
+    filename = raw_asset.get("filename")
+    required_files_raw = raw_asset.get("required_files", [])
+    sha256 = raw_asset.get("sha256")
+    size_bytes = raw_asset.get("size_bytes")
+    default_install = raw_asset.get("default_install")
 
     if not isinstance(model_id, str) or not model_id.strip():
         raise ValueError("asset entry must include non-empty string field 'model_id'")
@@ -304,8 +306,7 @@ def load_packaged_asset_manifest(path: Path) -> PackagedAssetsManifest:
     assets_raw = raw.get("assets")
     if schema_version != PACKAGED_ASSET_SCHEMA_VERSION:
         raise ValueError(
-            f"unsupported packaged asset manifest schema {schema_version!r}; "
-            f"expected {PACKAGED_ASSET_SCHEMA_VERSION!r}"
+            f"unsupported packaged asset manifest schema {schema_version!r}; expected {PACKAGED_ASSET_SCHEMA_VERSION!r}"
         )
     if not isinstance(assets_raw, list):
         raise ValueError("packaged asset manifest must include a list field 'assets'")
@@ -597,9 +598,7 @@ def install_packaged_model_assets(
             os.replace(temp_root, target_path)
 
         if not verify_installed_asset(asset, models_root=resolved_models_root):
-            raise RuntimeError(
-                f"Installed packaged asset {asset.model_id!r} failed verification at {target_path}."
-            )
+            raise RuntimeError(f"Installed packaged asset {asset.model_id!r} failed verification at {target_path}.")
         state[asset.model_id] = _installed_asset_metadata(asset, target_path=target_path)
         if progress_callback is not None:
             progress_callback("installed", asset, target_path)
@@ -607,5 +606,3 @@ def install_packaged_model_assets(
 
     write_installed_asset_state(installed_state_path, state)
     return tuple(results)
-
-

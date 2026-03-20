@@ -300,8 +300,9 @@ class OllamaRuntimeSession:
         message = response.get("message")
         if not isinstance(message, dict):
             raise NotesRuntimeError("Ollama runtime returned no message payload.")
-        content = message.get("content")
-        thinking = message.get("thinking")
+        message_payload = dict(message)
+        content = message_payload.get("content")
+        thinking = message_payload.get("thinking")
         if isinstance(thinking, str) and thinking.strip() and content == "":
             raise NotesRuntimeError(
                 "Ollama runtime returned reasoning content without a final answer. "
@@ -344,7 +345,7 @@ class LlamaCppRuntimeSession:
             if self.launch_config is not None
             else _MIN_NOTES_CONTEXT_TOKENS,
         )
-        payload = {
+        payload: dict[str, object] = {
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
             "max_tokens": resolved_options.max_tokens,
@@ -366,11 +367,13 @@ class LlamaCppRuntimeSession:
         choice = choices[0]
         if not isinstance(choice, dict):
             raise NotesRuntimeError("Bundled notes runtime returned an invalid completion payload.")
-        message = choice.get("message")
+        choice_payload = dict(choice)
+        message = choice_payload.get("message")
         if not isinstance(message, dict):
             raise NotesRuntimeError("Bundled notes runtime returned no message content.")
-        content = message.get("content")
-        reasoning_content = message.get("reasoning_content")
+        message_payload = dict(message)
+        content = message_payload.get("content")
+        reasoning_content = message_payload.get("reasoning_content")
         if isinstance(reasoning_content, str) and reasoning_content.strip() and content == "":
             raise NotesRuntimeError(
                 "Bundled notes runtime returned reasoning content without a final answer. "
@@ -388,7 +391,6 @@ def _llama_server_chat_completion_request(
 ) -> dict[str, object]:
     """Call llama.cpp chat completions, retrying while the model is still loading."""
     deadline = time.monotonic() + min(_MODEL_LOADING_RETRY_TIMEOUT_SEC, _PROMPT_TIMEOUT_SEC)
-    last_loading_error: NotesRuntimeError | None = None
     while True:
         try:
             return _llama_server_request(
@@ -400,7 +402,6 @@ def _llama_server_chat_completion_request(
         except NotesRuntimeError as exc:
             if not _is_model_loading_error(str(exc)):
                 raise
-            last_loading_error = exc
             if time.monotonic() >= deadline:
                 raise NotesRuntimeError(
                     "Bundled llama.cpp runtime did not finish loading the model before timeout."
@@ -489,10 +490,16 @@ def build_notes_execution_plan(
         tuple(build_cleanup_chunks(transcript_units, max_words=cleanup_chunk_words)) if cleanup_required else ()
     )
 
+    largest_cleanup_chunk: str = initial_clean_transcript
+    if cleanup_chunks:
+        largest_cleanup_chunk = cleanup_chunks[0]
+        for cleanup_chunk in cleanup_chunks[1:]:
+            if len(cleanup_chunk) > len(largest_cleanup_chunk):
+                largest_cleanup_chunk = cleanup_chunk
     cleanup_request = PromptRequestOptions(
         max_tokens=_cleanup_output_max_tokens(model),
         context_tokens=_recommended_context_tokens(
-            build_clean_transcript_prompt(max(cleanup_chunks, key=len, default=initial_clean_transcript)),
+            build_clean_transcript_prompt(largest_cleanup_chunk),
             minimum=_MIN_CLEANUP_CONTEXT_TOKENS,
             output_max_tokens=_cleanup_output_max_tokens(model),
         ),
@@ -580,32 +587,37 @@ def _run_runtime_prompt(
     request_options: PromptRequestOptions | None = None,
 ) -> str:
     """Call one runtime prompt method while tolerating older non-streaming runtimes."""
-    kwargs: dict[str, object] = {
-        "model": model,
-        "prompt": prompt,
-    }
-    if request_options is not None:
-        kwargs["request_options"] = request_options
-    if on_text_delta is not None:
-        kwargs["on_text_delta"] = on_text_delta
-
-    stripped_kwargs: set[str] = set()
+    stripped_request_options = False
+    stripped_on_text_delta = False
     while True:
         try:
-            result = runtime.run_prompt(**kwargs)
+            if on_text_delta is not None and request_options is not None:
+                result = runtime.run_prompt(
+                    model=model,
+                    prompt=prompt,
+                    on_text_delta=on_text_delta,
+                    request_options=request_options,
+                )
+            elif on_text_delta is not None:
+                result = runtime.run_prompt(model=model, prompt=prompt, on_text_delta=on_text_delta)
+            elif request_options is not None:
+                result = runtime.run_prompt(model=model, prompt=prompt, request_options=request_options)
+            else:
+                result = runtime.run_prompt(model=model, prompt=prompt)
             break
         except TypeError as exc:
-            removed_any = False
             detail = str(exc)
-            for optional_name in ("request_options", "on_text_delta"):
-                if optional_name in kwargs and optional_name in detail and optional_name not in stripped_kwargs:
-                    kwargs.pop(optional_name, None)
-                    stripped_kwargs.add(optional_name)
-                    removed_any = True
-            if not removed_any:
-                raise
+            if request_options is not None and not stripped_request_options and "request_options" in detail:
+                request_options = None
+                stripped_request_options = True
+                continue
+            if on_text_delta is not None and not stripped_on_text_delta and "on_text_delta" in detail:
+                on_text_delta = None
+                stripped_on_text_delta = True
+                continue
+            raise
 
-    if on_text_delta is not None and "on_text_delta" not in kwargs and result:
+    if on_text_delta is not None and stripped_on_text_delta and result:
         on_text_delta(result)
     return result
 
@@ -1153,7 +1165,7 @@ def _load_structured_session_units(transcript_path: Path) -> list[str]:
     current_label: str | None = None
     current_parts: list[str] = []
     for source, text in segments:
-        label = source_labels.get(source, "Speaker")
+        label = source_labels[source] if source is not None and source in source_labels else "Speaker"
         if label != current_label and current_parts:
             turns.append(f"{current_label}: {' '.join(current_parts)}")
             current_parts = []
@@ -1400,7 +1412,9 @@ def _temporary_ollama_runtime(*, cpu_only: bool, allow_reasoning: bool) -> Itera
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        **_subprocess_text_mode_kwargs(),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         creationflags=_subprocess_creationflags_no_window(),
     )
     try:
@@ -1577,7 +1591,9 @@ def _start_llama_cpp_runtime(
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        **_subprocess_text_mode_kwargs(),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         creationflags=_subprocess_creationflags_no_window(),
     )
     try:
@@ -1947,14 +1963,17 @@ def _extract_llama_stream_delta(payload: dict[str, object]) -> str:
     choice = choices[0]
     if not isinstance(choice, dict):
         return ""
-    delta = choice.get("delta")
+    choice_payload = dict(choice)
+    delta = choice_payload.get("delta")
     if isinstance(delta, dict):
-        content = delta.get("content")
+        delta_payload = dict(delta)
+        content = delta_payload.get("content")
         if isinstance(content, str):
             return content
-    message = choice.get("message")
+    message = choice_payload.get("message")
     if isinstance(message, dict):
-        content = message.get("content")
+        message_payload = dict(message)
+        content = message_payload.get("content")
         if isinstance(content, str):
             return content
     return ""
@@ -1968,14 +1987,17 @@ def _extract_llama_stream_reasoning_delta(payload: dict[str, object]) -> str:
     choice = choices[0]
     if not isinstance(choice, dict):
         return ""
-    delta = choice.get("delta")
+    choice_payload = dict(choice)
+    delta = choice_payload.get("delta")
     if isinstance(delta, dict):
-        reasoning_content = delta.get("reasoning_content")
+        delta_payload = dict(delta)
+        reasoning_content = delta_payload.get("reasoning_content")
         if isinstance(reasoning_content, str):
             return reasoning_content
-    message = choice.get("message")
+    message = choice_payload.get("message")
     if isinstance(message, dict):
-        reasoning_content = message.get("reasoning_content")
+        message_payload = dict(message)
+        reasoning_content = message_payload.get("reasoning_content")
         if isinstance(reasoning_content, str):
             return reasoning_content
     return ""
@@ -1995,7 +2017,9 @@ def _run_ollama_command(
             env=env,
             input=input_text,
             capture_output=True,
-            **_subprocess_text_mode_kwargs(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_sec,
             check=False,
         )

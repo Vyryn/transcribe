@@ -8,10 +8,6 @@ from pathlib import Path
 
 from transcribe.packaged_asset_defaults import build_default_packaged_assets_manifest
 from transcribe.packaged_assets import INSTALLED_ASSET_STATE_FILENAME
-from transcribe.runtime_defaults import (
-    PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
-    PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
-)
 
 APP_ROOT_ENV = "TRANSCRIBE_APP_ROOT"
 DATA_ROOT_ENV = "TRANSCRIBE_DATA_DIR"
