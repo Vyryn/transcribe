@@ -121,7 +121,7 @@ begin
 
   if not Exec(
     ExpandConstant('{app}\Transcribe.exe'),
-    'models install --model ' + ModelId,
+    'models install --quiet --model ' + ModelId,
     ExpandConstant('{app}'),
     SW_HIDE,
     ewWaitUntilTerminated,

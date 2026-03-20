@@ -74,6 +74,14 @@ def test_build_packaged_assets_manifest_defaults() -> None:
     )
 
 
+def test_project_runtime_distribution_names_include_hf_xet() -> None:
+    module = _load_build_module()
+
+    distribution_names = module.project_runtime_distribution_names(module.load_pyproject())
+
+    assert "hf-xet" in distribution_names
+
+
 def test_safe_filename_component_normalizes_build_metadata() -> None:
     module = _load_build_module()
 
@@ -202,15 +210,12 @@ def test_stage_built_app_copies_onedir_bundle_contents(tmp_path: Path) -> None:
     bundle_internal_dir.mkdir(parents=True)
     expected_executable.write_text("exe", encoding="utf-8")
     expected_runtime_file.write_text("dll", encoding="utf-8")
-    (stage_dir / "packaged-assets.json").parent.mkdir(parents=True)
-    (stage_dir / "packaged-assets.json").write_text("manifest", encoding="utf-8")
 
     staged_executable = module.stage_built_app(bundle_dir, stage_dir)
 
     assert staged_executable == (stage_dir / f"{module.APP_NAME}.exe").resolve()
     assert (stage_dir / f"{module.APP_NAME}.exe").read_text(encoding="utf-8") == "exe"
     assert (stage_dir / "_internal" / "python313.dll").read_text(encoding="utf-8") == "dll"
-    assert (stage_dir / "packaged-assets.json").read_text(encoding="utf-8") == "manifest"
 
 
 def test_installer_template_hides_shell_wrapper_and_shows_model_progress() -> None:
@@ -225,6 +230,7 @@ def test_installer_template_hides_shell_wrapper_and_shows_model_progress() -> No
     assert "ExpandConstant('{app}\\Transcribe.exe')" in template_text
     assert "Voice: IBM Granite 4.0 1B Speech" in template_text
     assert "ibm-granite/granite-4.0-1b-speech" in template_text
+    assert "models install --quiet --model " in template_text
     assert "CheckBox.Height := ScaleY(28);" in template_text
     assert "PreviousCheckBox.Top + PreviousCheckBox.Height + ScaleY(8)" in template_text
     assert 'Source: "{#SourceDir}\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs' in template_text
