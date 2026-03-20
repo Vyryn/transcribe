@@ -42,6 +42,7 @@ dev = [
   "ruff>=0.13.0",
   "mypy>=1.18.0",
   "ty>=0.0.24",
+  "basedpyright>=1.38.3",
 ]
 
 [build-system]
@@ -50,3 +51,6 @@ build-backend = "hatchling.build"
 
 [tool.black]
 line-length = 120
+
+[tool.ty.src]
+exclude = ["build/", "releases/", "tests/"]
