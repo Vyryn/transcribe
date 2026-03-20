@@ -3,6 +3,9 @@ When you encounter a new problem that required significant searching to resolve 
 This project uses uv; `uv run transcribe`
 Use python 3.13 best practices and numpy style docstrings. 
 Before adding a new dependency, explain the need and ask the developer.
+Linters: `uv run ruff check .` and `uv run ty check`
+Tests: `uv run pytest .`
+After making significant changes, verify relevant unit tests and linters pass.
 
 Benchmark harness wrappers can temporarily mirror helper functions into `transcribe.transcription_runtime` so benchmark-specific monkeypatches affect delegated calls. Always restore the runtime module's original helper functions after the delegated call finishes, or later tests can accidentally reuse stale benchmark fixtures.
 
