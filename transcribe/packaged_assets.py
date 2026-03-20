@@ -465,6 +465,8 @@ def _hf_download_file(*, repo_id: str, revision: str, filename: str, cache_dir: 
             "HF_HUB_OFFLINE": "0",
             "TRANSFORMERS_OFFLINE": "0",
             "HF_DATASETS_OFFLINE": "0",
+            # Packaged Windows launches can be windowed with no stdout/stderr.
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
             "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
         }
     ):

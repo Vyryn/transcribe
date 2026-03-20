@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import time
@@ -1699,7 +1698,7 @@ def page_order(*, packaged_runtime: bool | None = None) -> tuple[str, ...]:
 def main() -> int:
     """Launch the desktop UI."""
     root = tk.Tk()
-    TranscribeUiApp(root)
+    TranscribeUiApp(root, packaged_runtime=False)
     root.mainloop()
     return 0
 

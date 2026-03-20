@@ -10,25 +10,26 @@ from transcribe.config import load_app_config
 from transcribe.logging import configure_logging, security_log
 from transcribe.models import AudioSourceMode, CaptureConfig
 from transcribe.network_guard import install_outbound_network_guard, outbound_network_guard_installed
+from transcribe.packaged_asset_defaults import build_default_packaged_assets_manifest
 from transcribe.runtime_env import (
-    PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
-    PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
     RuntimeMode,
     resolve_app_runtime_paths,
     set_network_access_allowed,
     validate_transcription_model_for_runtime,
 )
-from transcribe.runtime_defaults import ALTERNATE_SESSION_NOTES_MODEL
+from transcribe.runtime_defaults import (
+    ALTERNATE_SESSION_NOTES_MODEL,
+    DEFAULT_LIVE_TRANSCRIPTION_MODEL,
+    DEFAULT_SESSION_NOTES_MODEL,
+)
 from transcribe.ui.types import (
     DEFAULT_BENCH_CONFIG,
     DEFAULT_BENCH_DATASET,
     DEFAULT_BENCH_LIMIT,
     DEFAULT_BENCH_MODEL,
     DEFAULT_BENCH_SPLIT,
-    DEFAULT_LIVE_TRANSCRIPTION_MODEL,
     DEFAULT_LOG_LEVEL,
     DEFAULT_NOTES_RUNTIME,
-    DEFAULT_SESSION_NOTES_MODEL,
     BenchmarkInitRequest,
     BenchmarkInitResultSummary,
     BenchmarkRunRequest,
@@ -53,13 +54,16 @@ from transcribe.ui.types import (
 LOGGER = logging.getLogger("transcribe.ui")
 ProgressCallback = Callable[[str, dict[str, object]], None]
 _REEXPORTED_DEFAULTS = (
+    ALTERNATE_SESSION_NOTES_MODEL,
     DEFAULT_BENCH_CONFIG,
     DEFAULT_BENCH_DATASET,
     DEFAULT_BENCH_LIMIT,
     DEFAULT_BENCH_MODEL,
     DEFAULT_BENCH_SPLIT,
+    DEFAULT_LIVE_TRANSCRIPTION_MODEL,
     DEFAULT_LOG_LEVEL,
     DEFAULT_NOTES_RUNTIME,
+    DEFAULT_SESSION_NOTES_MODEL,
 )
 
 
@@ -109,14 +113,13 @@ def _release_transcription_resources_in_background(
 def transcription_model_options() -> tuple[str, ...]:
     """Return curated transcription model choices for UI dropdowns."""
     runtime_paths = resolve_app_runtime_paths()
+    packaged_model_ids = tuple(runtime_paths.transcription_models) or _default_model_ids(kind="transcription")
     if runtime_paths.mode == RuntimeMode.PACKAGED:
-        return tuple(runtime_paths.transcription_models)
+        return packaged_model_ids
     return tuple(
         dict.fromkeys(
             (
-                DEFAULT_LIVE_TRANSCRIPTION_MODEL,
-                PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
-                PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
+                *packaged_model_ids,
                 "faster-whisper-medium",
                 "whisper-small",
                 "whisper-large-v3",
@@ -129,9 +132,16 @@ def transcription_model_options() -> tuple[str, ...]:
 def notes_model_options() -> tuple[str, ...]:
     """Return curated notes model choices for UI dropdowns."""
     runtime_paths = resolve_app_runtime_paths()
+    packaged_model_ids = tuple(runtime_paths.notes_models) or _default_model_ids(kind="notes")
     if runtime_paths.mode == RuntimeMode.PACKAGED:
-        return tuple(runtime_paths.notes_models)
-    return tuple(dict.fromkeys((DEFAULT_SESSION_NOTES_MODEL, ALTERNATE_SESSION_NOTES_MODEL)))
+        return packaged_model_ids
+    return tuple(dict.fromkeys(packaged_model_ids))
+
+
+def _default_model_ids(*, kind: str) -> tuple[str, ...]:
+    """Return shared model ids from the built-in manifest for one asset kind."""
+    manifest = build_default_packaged_assets_manifest()
+    return tuple(asset.model_id for asset in manifest.assets if asset.kind == kind)
 
 
 def default_data_subdir(name: str) -> Path:
@@ -405,17 +415,10 @@ def run_notes(
 
 def list_models() -> ModelsListResult:
     """List packaged model assets and install status when a manifest is available."""
-    from transcribe.packaged_assets import load_packaged_asset_manifest, verify_installed_asset
+    from transcribe.packaged_assets import verify_installed_asset
 
     runtime_paths = resolve_app_runtime_paths()
-    manifest_path = runtime_paths.packaged_assets_manifest_path
-    if not manifest_path.exists():
-        return ModelsListResult(manifest_path=None, items=(), error=f"Packaged asset manifest not found: {manifest_path}")
-
-    try:
-        manifest = load_packaged_asset_manifest(manifest_path)
-    except (OSError, ValueError) as exc:
-        return ModelsListResult(manifest_path=manifest_path, items=(), error=str(exc))
+    manifest = build_default_packaged_assets_manifest()
 
     items = tuple(
         ModelStatus(
@@ -426,7 +429,7 @@ def list_models() -> ModelsListResult:
         )
         for asset in manifest.assets
     )
-    return ModelsListResult(manifest_path=manifest_path, items=items)
+    return ModelsListResult(manifest_path=None, items=items)
 
 
 def install_models(
@@ -435,14 +438,11 @@ def install_models(
     progress_callback: ProgressCallback | None = None,
 ) -> ModelsInstallResultSummary:
     """Install packaged model assets selected from the manifest."""
-    from transcribe.packaged_assets import install_packaged_model_assets, load_packaged_asset_manifest
+    from transcribe.packaged_assets import install_packaged_model_assets
 
     ensure_network_downloads_available("Packaged model install", common=request.common)
     runtime_paths = resolve_app_runtime_paths()
-    manifest_path = runtime_paths.packaged_assets_manifest_path
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Packaged asset manifest not found: {manifest_path}")
-    manifest = load_packaged_asset_manifest(manifest_path)
+    manifest = build_default_packaged_assets_manifest()
 
     def _report(event: str, asset, target_path: Path) -> None:
         if progress_callback is None:

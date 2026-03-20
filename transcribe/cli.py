@@ -8,9 +8,10 @@ from pathlib import Path
 
 from transcribe.compliance import enforce_no_url_literals, run_network_compliance_check
 from transcribe.config import load_app_config
-from transcribe.logging import configure_logging, security_log
+from transcribe.logging import configure_logging, security_log, write_console_line
 from transcribe.models import AudioSourceMode, CaptureConfig
 from transcribe.network_guard import install_outbound_network_guard
+from transcribe.packaged_asset_defaults import build_default_packaged_assets_manifest
 from transcribe.runtime_defaults import (
     ALTERNATE_SESSION_NOTES_MODEL,
     DEFAULT_LIVE_TRANSCRIPTION_MODEL,
@@ -771,48 +772,38 @@ def run_models(args: argparse.Namespace) -> int:
     """Execute packaged model-management commands."""
     from transcribe.packaged_assets import (
         install_packaged_model_assets,
-        load_packaged_asset_manifest,
         verify_installed_asset,
     )
 
     runtime_paths = resolve_app_runtime_paths()
-    manifest_path = runtime_paths.packaged_assets_manifest_path
-    if not manifest_path.exists():
-        print(f"Models command failed: packaged asset manifest not found: {manifest_path}")
-        return 2
-
-    try:
-        manifest = load_packaged_asset_manifest(manifest_path)
-    except (OSError, ValueError) as exc:
-        print(f"Models command failed: {exc}")
-        return 2
+    manifest = build_default_packaged_assets_manifest()
 
     if args.models_command == "list":
         for asset in manifest.assets:
             install_class = "default" if asset.default_install else "optional"
             status = "installed" if verify_installed_asset(asset, models_root=runtime_paths.models_root) else "not installed"
-            print(f"{asset.model_id}\t{asset.kind}\t{install_class}\t{status}")
+            write_console_line(f"{asset.model_id}\t{asset.kind}\t{install_class}\t{status}")
         return 0
 
     if args.models_command != "install":
-        print(f"Models command failed: unsupported subcommand {args.models_command!r}.")
+        write_console_line(f"Models command failed: unsupported subcommand {args.models_command!r}.", error=True)
         return 2
 
     if not getattr(args, "default", False) and not getattr(args, "model_ids", []):
-        print("Models install failed: pass --default or --model <id>.")
+        write_console_line("Models install failed: pass --default or --model <id>.", error=True)
         return 2
 
     def _report(event: str, asset, target_path: Path) -> None:
         if getattr(args, "quiet", False):
             return
         if event == "installing":
-            print(f"Installing {asset.model_id} -> {target_path}")
+            write_console_line(f"Installing {asset.model_id} -> {target_path}")
             return
         if event == "installed":
-            print(f"Installed {asset.model_id}")
+            write_console_line(f"Installed {asset.model_id}")
             return
         if event == "skipped":
-            print(f"Already installed {asset.model_id}")
+            write_console_line(f"Already installed {asset.model_id}")
 
     try:
         results = install_packaged_model_assets(
@@ -824,11 +815,11 @@ def run_models(args: argparse.Namespace) -> int:
             progress_callback=_report,
         )
     except Exception as exc:
-        print(f"Models install failed: {exc}")
+        write_console_line(f"Models install failed: {exc}", error=True)
         return 2
 
     if not getattr(args, "quiet", False):
-        print(f"Models ready: {len(results)}")
+        write_console_line(f"Models ready: {len(results)}")
     return 0
 
 def run_check_no_network(args: argparse.Namespace) -> int:

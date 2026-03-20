@@ -6,25 +6,16 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from transcribe.packaged_assets import (
-    INSTALLED_ASSET_STATE_FILENAME,
-    PACKAGED_ASSET_MANIFEST_FILENAME,
-    load_packaged_asset_manifest,
-)
+from transcribe.packaged_asset_defaults import build_default_packaged_assets_manifest
+from transcribe.packaged_assets import INSTALLED_ASSET_STATE_FILENAME
 from transcribe.runtime_defaults import (
-    ALTERNATE_SESSION_NOTES_MODEL,
-    DEFAULT_LIVE_TRANSCRIPTION_MODEL,
-    DEFAULT_SESSION_NOTES_MODEL,
+    PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
+    PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
 )
 
-PACKAGED_RUNTIME_ENV = "TRANSCRIBE_PACKAGED"
 APP_ROOT_ENV = "TRANSCRIBE_APP_ROOT"
 DATA_ROOT_ENV = "TRANSCRIBE_DATA_DIR"
 ALLOW_NETWORK_ENV = "TRANSCRIBE_ALLOW_NETWORK"
-
-PACKAGED_ACCURACY_TRANSCRIPTION_MODEL = "nvidia/canary-qwen-2.5b"
-PACKAGED_GRANITE_TRANSCRIPTION_MODEL = "ibm-granite/granite-4.0-1b-speech"
-
 
 class RuntimeMode(StrEnum):
     """Execution-mode categories used to resolve bundled assets."""
@@ -59,7 +50,6 @@ class AppRuntimePaths:
     runtime_root: Path
     models_root: Path
     prompt_root: Path
-    packaged_assets_manifest_path: Path
     installed_assets_state_path: Path
     notes_runtime_binary: Path
     notes_prompt_path: Path
@@ -74,12 +64,7 @@ def is_frozen_app() -> bool:
 
 def detect_runtime_mode() -> RuntimeMode:
     """Return the effective runtime mode for the current process."""
-    raw = os.environ.get(PACKAGED_RUNTIME_ENV, "").strip().lower()
-    if raw in {"1", "true", "yes", "on", "packaged"}:
-        return RuntimeMode.PACKAGED
-    if is_frozen_app():
-        return RuntimeMode.PACKAGED
-    return RuntimeMode.DEVELOPMENT
+    return RuntimeMode.PACKAGED if is_frozen_app() else RuntimeMode.DEVELOPMENT
 
 
 def network_access_allowed() -> bool:
@@ -147,38 +132,16 @@ def _resolve_notes_prompt_path(*, install_root: Path) -> Path:
 
 def bundled_notes_model_specs() -> tuple[BundledModelSpec, ...]:
     """Return the packaged note-model mapping relative to the models root."""
-    return (
-        BundledModelSpec(
-            DEFAULT_SESSION_NOTES_MODEL,
-            Path("notes/qwen3.5-4b-q4_k_m.gguf"),
-        ),
-        BundledModelSpec(
-            ALTERNATE_SESSION_NOTES_MODEL,
-            Path("notes/qwen3.5-2b-q4_k_m.gguf"),
-        ),
-    )
+    return _default_manifest_model_specs(kind="notes")
 
 
 def bundled_transcription_model_specs() -> tuple[BundledModelSpec, ...]:
     """Return the packaged ASR model mapping relative to the models root."""
-    return (
-        BundledModelSpec(
-            DEFAULT_LIVE_TRANSCRIPTION_MODEL,
-            Path("asr/nvidia/parakeet-tdt-0.6b-v3"),
-        ),
-        BundledModelSpec(
-            PACKAGED_ACCURACY_TRANSCRIPTION_MODEL,
-            Path("asr/nvidia/canary-qwen-2.5b"),
-        ),
-        BundledModelSpec(
-            PACKAGED_GRANITE_TRANSCRIPTION_MODEL,
-            Path("asr/ibm-granite/granite-4.0-1b-speech"),
-        ),
-    )
+    return _default_manifest_model_specs(kind="transcription")
 
 
-def _manifest_model_specs(manifest_path: Path, *, kind: str) -> tuple[BundledModelSpec, ...]:
-    manifest = load_packaged_asset_manifest(manifest_path)
+def _default_manifest_model_specs(*, kind: str) -> tuple[BundledModelSpec, ...]:
+    manifest = build_default_packaged_assets_manifest()
     specs: list[BundledModelSpec] = []
     for asset in manifest.assets:
         if asset.kind != kind:
@@ -187,23 +150,8 @@ def _manifest_model_specs(manifest_path: Path, *, kind: str) -> tuple[BundledMod
     return tuple(specs)
 
 
-def _resolve_model_specs(
-    *,
-    mode: RuntimeMode,
-    manifest_path: Path,
-) -> tuple[tuple[BundledModelSpec, ...], tuple[BundledModelSpec, ...]]:
-    notes_specs = bundled_notes_model_specs()
-    transcription_specs = bundled_transcription_model_specs()
-    if mode != RuntimeMode.PACKAGED or not manifest_path.exists():
-        return notes_specs, transcription_specs
-
-    manifest_notes = _manifest_model_specs(manifest_path, kind="notes")
-    manifest_transcription = _manifest_model_specs(manifest_path, kind="transcription")
-    if manifest_notes:
-        notes_specs = manifest_notes
-    if manifest_transcription:
-        transcription_specs = manifest_transcription
-    return notes_specs, transcription_specs
+def _resolve_model_specs() -> tuple[tuple[BundledModelSpec, ...], tuple[BundledModelSpec, ...]]:
+    return bundled_notes_model_specs(), bundled_transcription_model_specs()
 
 
 def resolve_app_runtime_paths() -> AppRuntimePaths:
@@ -214,9 +162,8 @@ def resolve_app_runtime_paths() -> AppRuntimePaths:
     runtime_root = install_root / "runtime"
     models_root = (data_root / "models") if mode == RuntimeMode.PACKAGED else (install_root / "models")
     prompt_root = install_root / "prompts"
-    manifest_path = install_root / PACKAGED_ASSET_MANIFEST_FILENAME
     installed_assets_state_path = data_root / INSTALLED_ASSET_STATE_FILENAME
-    notes_specs, transcription_specs = _resolve_model_specs(mode=mode, manifest_path=manifest_path)
+    notes_specs, transcription_specs = _resolve_model_specs()
 
     binary_map = {
         spec.logical_name: install_root / spec.relative_path
@@ -238,7 +185,6 @@ def resolve_app_runtime_paths() -> AppRuntimePaths:
         runtime_root=runtime_root,
         models_root=models_root,
         prompt_root=prompt_root,
-        packaged_assets_manifest_path=manifest_path,
         installed_assets_state_path=installed_assets_state_path,
         notes_runtime_binary=binary_map["llama_server"],
         notes_prompt_path=_resolve_notes_prompt_path(install_root=install_root),
