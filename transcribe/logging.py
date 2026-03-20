@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
+import sys
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +17,66 @@ SENSITIVE_FIELD_NAMES = {
     "text",
     "transcript",
 }
+
+
+class _NullTextStream(io.TextIOBase):
+    """Writable text sink used when packaged launches have no console stream."""
+
+    def writable(self) -> bool:
+        """Return whether the sink accepts text writes."""
+        return True
+
+    def write(self, text: str) -> int:
+        """Accept text written by logging handlers and discard it."""
+        return len(text)
+
+
+def _stream_supports_text_writes(stream: object) -> bool:
+    """Return whether one candidate stream can accept text output."""
+    return stream is not None and not bool(getattr(stream, "closed", False)) and callable(getattr(stream, "write", None))
+
+
+def resolve_console_stream(*, error: bool, fallback_sink: bool = False) -> io.TextIOBase | None:
+    """Resolve a usable stdout/stderr-like text stream.
+
+    Parameters
+    ----------
+    error : bool
+        Whether to prefer stderr instead of stdout.
+    fallback_sink : bool, optional
+        When ``True``, return a writable null sink if no console stream exists.
+
+    Returns
+    -------
+    io.TextIOBase | None
+        The resolved writable text stream, or ``None`` when no stream exists and
+        ``fallback_sink`` is disabled.
+    """
+    primary = sys.stderr if error else sys.stdout
+    fallback = sys.__stderr__ if error else sys.__stdout__
+    for candidate in (primary, fallback):
+        if _stream_supports_text_writes(candidate):
+            return candidate
+    if fallback_sink:
+        return _NullTextStream()
+    return None
+
+
+def write_console_line(message: object, *, error: bool = False) -> None:
+    """Write one line to an available console stream when present.
+
+    Parameters
+    ----------
+    message : object
+        Message to render.
+    error : bool, optional
+        Whether to prefer stderr over stdout.
+    """
+    stream = resolve_console_stream(error=error, fallback_sink=False)
+    if stream is None:
+        return
+    stream.write(f"{message}\n")
+    stream.flush()
 
 
 class JsonFormatter(logging.Formatter):
@@ -94,7 +156,7 @@ def configure_logging(level: str = "INFO", *, redact_logs: bool = True) -> None:
     """
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
-    handler = logging.StreamHandler()
+    handler = logging.StreamHandler(resolve_console_stream(error=True, fallback_sink=True))
     handler.setFormatter(JsonFormatter(redact=redact_logs))
     root_logger.addHandler(handler)
     root_logger.setLevel(level.upper())

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -345,3 +348,31 @@ def test_install_packaged_model_assets_supports_remote_only_manifest_metadata(
     assert verify_installed_asset(manifest.assets[0], models_root=tmp_path / "installed-models") is True
     assert verify_installed_asset(manifest.assets[1], models_root=tmp_path / "installed-models") is True
 
+
+def test_hf_download_file_disables_progress_bars_for_packaged_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, str | None] = {}
+    downloaded_path = tmp_path / "hf-cache" / "downloaded.bin"
+
+    def fake_hf_hub_download(*, repo_id: str, filename: str, revision: str, local_files_only: bool, cache_dir: str) -> str:
+        _ = (repo_id, filename, revision, local_files_only, cache_dir)
+        observed["HF_HUB_DISABLE_PROGRESS_BARS"] = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+        downloaded_path.parent.mkdir(parents=True, exist_ok=True)
+        downloaded_path.write_bytes(b"downloaded")
+        return str(downloaded_path)
+
+    fake_module = types.ModuleType("huggingface_hub")
+    fake_module.hf_hub_download = fake_hf_hub_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
+
+    resolved = packaged_assets._hf_download_file(
+        repo_id="repo/model",
+        revision="rev-1",
+        filename="model.bin",
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert observed["HF_HUB_DISABLE_PROGRESS_BARS"] == "1"
+    assert resolved == downloaded_path.resolve()

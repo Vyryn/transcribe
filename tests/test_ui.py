@@ -409,6 +409,28 @@ def test_ui_page_order_hides_bench_in_packaged_mode() -> None:
     assert "bench" not in app_module.page_order(packaged_runtime=True)
 
 
+def test_ui_main_explicitly_uses_development_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    app_module = importlib.import_module("transcribe.ui.app")
+    observed: dict[str, object] = {}
+
+    class FakeRoot:
+        def mainloop(self) -> None:
+            observed["mainloop"] = True
+
+    fake_root = FakeRoot()
+
+    monkeypatch.setattr(app_module.tk, "Tk", lambda: fake_root)
+    monkeypatch.setattr(
+        app_module,
+        "TranscribeUiApp",
+        lambda root, packaged_runtime=None: observed.setdefault("call", (root, packaged_runtime)),
+    )
+
+    assert app_module.main() == 0
+    assert observed["call"] == (fake_root, False)
+    assert observed["mainloop"] is True
+
+
 def test_ui_preferences_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     preferences_module = importlib.import_module("transcribe.ui.preferences")
     prefs_path = tmp_path / "ui-preferences.json"
@@ -541,6 +563,43 @@ def test_ui_models_result_handler_failure_does_not_freeze_polling(
 
         assert captured_errors
         assert "models-install failed while processing its result update" in captured_errors[0][1]
+        assert app.busy_var.get() == "Idle"
+        assert app._active_binding is None
+        assert scheduled and scheduled[-1][0] == app_module.POLL_INTERVAL_MS
+    finally:
+        _close_ui_app(app, root)
+
+
+def test_ui_models_error_does_not_freeze_polling(
+    monkeypatch: pytest.MonkeyPatch, tk_host_root: tuple[object, object]
+) -> None:
+    app_module, host_root = tk_host_root
+    controller_module = importlib.import_module("transcribe.ui.controller")
+    captured_errors: list[tuple[str, str]] = []
+    scheduled: list[tuple[int, object]] = []
+    monkeypatch.setattr(app_module, "load_ui_preferences", lambda: app_module.UiPreferences())
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda title, body: captured_errors.append((title, body)))
+    app = None
+    root = _create_ui_test_window(app_module, host_root)
+    try:
+        app = app_module.TranscribeUiApp(root, packaged_runtime=False)
+        monkeypatch.setattr(root, "after", lambda delay, callback: scheduled.append((delay, callback)))
+        app._active_binding = app_module.TaskBinding(task_name="models-install")
+        app._set_busy(True, "models-install", cancelable=False)
+        app.controller._messages.put(
+            controller_module.ControllerMessage(
+                kind="error",
+                task_name="models-install",
+                payload=AttributeError("'NoneType' object has no attribute 'write'"),
+            )
+        )
+        app.controller._messages.put(
+            controller_module.ControllerMessage(kind="finished", task_name="models-install")
+        )
+
+        app._poll_messages()
+
+        assert captured_errors == [("Task failed", "'NoneType' object has no attribute 'write'")]
         assert app.busy_var.get() == "Idle"
         assert app._active_binding is None
         assert scheduled and scheduled[-1][0] == app_module.POLL_INTERVAL_MS
