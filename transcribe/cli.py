@@ -22,6 +22,36 @@ from transcribe.runtime_env import network_access_allowed, resolve_app_runtime_p
 LOGGER = logging.getLogger("transcribe")
 
 
+def _coerce_float(value: object, *, default: float = 0.0) -> float:
+    """Return one float-like field value or a fallback."""
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return default
+    return default
+
+
+def _coerce_int(value: object, *, default: int = 0) -> int:
+    """Return one int-like field value or a fallback."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return default
+    return default
+
+
 def _default_data_subdir(name: str) -> Path:
     """Resolve a default writable data subdirectory for CLI output flags."""
     runtime_paths = resolve_app_runtime_paths()
@@ -113,9 +143,10 @@ def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str,
     def _format_sources(raw_devices: object) -> str:
         if not isinstance(raw_devices, dict):
             return "none"
+        device_map = dict(raw_devices)
         parts: list[str] = []
         for source_name in ("mic", "speakers"):
-            devices = raw_devices.get(source_name)
+            devices = device_map.get(source_name)
             if not isinstance(devices, list) or not devices:
                 continue
             label = source_name if len(devices) == 1 else f"{source_name} x{len(devices)}"
@@ -129,16 +160,16 @@ def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str,
                 print("Recording now. Buffering audio until the model is ready.")
             return
         if event == "model_ready":
-            buffered_audio_sec = float(fields.get("buffered_audio_sec", 0.0))
+            buffered_audio_sec = _coerce_float(fields.get("buffered_audio_sec", 0.0))
             if buffered_audio_sec >= 0.5:
                 print(f"Model ready. Catching up on {_format_buffered_audio_sec(buffered_audio_sec)} of buffered audio.")
             else:
                 print("Model ready.")
             return
         if event == "capture_ready":
-            requested_rate_hz = int(fields.get("requested_sample_rate_hz", 0))
-            capture_rate_hz = int(fields.get("capture_sample_rate_hz", 0))
-            asr_rate_hz = int(fields.get("transcription_sample_rate_hz", 0))
+            requested_rate_hz = _coerce_int(fields.get("requested_sample_rate_hz", 0))
+            capture_rate_hz = _coerce_int(fields.get("capture_sample_rate_hz", 0))
+            asr_rate_hz = _coerce_int(fields.get("transcription_sample_rate_hz", 0))
             print(f"Capture ready: {_format_sources(fields.get('resolved_capture_devices'))}")
             if capture_rate_hz == requested_rate_hz:
                 print(f"Sample rate: {capture_rate_hz} Hz capture, {asr_rate_hz} Hz ASR")
@@ -154,9 +185,9 @@ def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str,
                     print(f"Device channels: {device_channels}")
             return
         if event == "transcribing_started":
-            buffered_audio_sec = float(fields.get("buffered_audio_sec", 0.0))
+            buffered_audio_sec = _coerce_float(fields.get("buffered_audio_sec", 0.0))
             is_catching_up = buffered_audio_sec >= 0.5
-            if float(fields.get("duration_sec", 0.0)) > 0:
+            if _coerce_float(fields.get("duration_sec", 0.0)) > 0:
                 if is_catching_up:
                     print("Listening and catching up.")
                 else:
@@ -181,8 +212,8 @@ def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str,
                 print(text)
             return
         if event == "capture_timeout":
-            streak = int(fields.get("read_timeout_streak", 0))
-            stall_duration_sec = float(fields.get("stall_duration_sec", 0.0))
+            streak = _coerce_int(fields.get("read_timeout_streak", 0))
+            stall_duration_sec = _coerce_float(fields.get("stall_duration_sec", 0.0))
             print(
                 "Capture stalled: "
                 f"{streak} consecutive read timeouts over {_format_buffered_audio_sec(stall_duration_sec)}."
@@ -193,7 +224,7 @@ def _build_session_progress_reporter(*, debug: bool) -> Callable[[str, dict[str,
                     print(f"Capture diagnostics: {backend}")
             return
         if event == "capture_resumed":
-            stall_duration_sec = float(fields.get("stall_duration_sec", 0.0))
+            stall_duration_sec = _coerce_float(fields.get("stall_duration_sec", 0.0))
             print(f"Capture resumed after {_format_buffered_audio_sec(stall_duration_sec)}.")
 
     return _report
@@ -205,15 +236,15 @@ def _build_notes_progress_reporter() -> Callable[[str, dict[str, object]], None]
     def _report(event: str, fields: dict[str, object]) -> None:
         if event == "notes_started":
             model = str(fields.get("model", ""))
-            chunk_count = int(fields.get("cleanup_chunk_count", 0))
+            chunk_count = _coerce_int(fields.get("cleanup_chunk_count", 0))
             if chunk_count > 1:
                 print(f"Post-session notes: cleaning transcript with {model} ({chunk_count} passes)...")
             else:
                 print(f"Post-session notes: cleaning transcript with {model}...")
             return
         if event == "clean_transcript_chunk_started":
-            chunk_count = int(fields.get("chunk_count", 0))
-            chunk_index = int(fields.get("chunk_index", 0))
+            chunk_count = _coerce_int(fields.get("chunk_count", 0))
+            chunk_index = _coerce_int(fields.get("chunk_index", 0))
             if chunk_count > 1:
                 print(f"Cleanup pass {chunk_index}/{chunk_count}...")
             return

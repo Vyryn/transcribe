@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -8,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Callable
+from typing import Callable, cast
 
 from transcribe.models import AudioSourceMode
 from transcribe.runtime_env import (
@@ -26,6 +27,7 @@ from transcribe.ui.types import (
     BenchmarkInitResultSummary,
     BenchmarkRunRequest,
     BenchmarkRunResultSummary,
+    BenchmarkScenario,
     CaptureRequest,
     CaptureResultSummary,
     ComplianceResultSummary,
@@ -45,6 +47,36 @@ from transcribe.ui.types import (
 MAX_LOG_LINES = 2_000
 POLL_INTERVAL_MS = 75
 LOG_LEVEL_OPTIONS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def _coerce_int(value: object, *, default: int = 0) -> int:
+    """Return one int-like UI payload value or a fallback."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return default
+    return default
+
+
+def _coerce_float(value: object, *, default: float = 0.0) -> float:
+    """Return one float-like UI payload value or a fallback."""
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return default
+    return default
 
 
 def _parse_optional_positive_int(raw_value: str, *, field_name: str) -> int | None:
@@ -524,14 +556,14 @@ class SessionPage(BasePage):
                 self._append_transcript_line(text)
                 self.partial_text_var.set("")
         elif name == "capture_timeout":
-            streak = int(fields.get("read_timeout_streak", 0))
-            stall_duration_sec = float(fields.get("stall_duration_sec", 0.0))
+            streak = _coerce_int(fields.get("read_timeout_streak", 0))
+            stall_duration_sec = _coerce_float(fields.get("stall_duration_sec", 0.0))
             self.status_var.set("Waiting for audio")
             self._append_transcript_line(
                 f"[capture] stalled after {streak} timeout{'s' if streak != 1 else ''} ({stall_duration_sec:.1f}s)"
             )
         elif name == "capture_resumed":
-            stall_duration_sec = float(fields.get("stall_duration_sec", 0.0))
+            stall_duration_sec = _coerce_float(fields.get("stall_duration_sec", 0.0))
             self.status_var.set("Capture resumed")
             self._append_transcript_line(f"[capture] resumed after {stall_duration_sec:.1f}s")
         elif name == "notes_preparing":
@@ -1198,9 +1230,13 @@ class BenchPage(BasePage):
         )
 
     def start_run(self) -> None:
+        scenario_name = self.run_scenario_var.get()
+        if scenario_name not in {"capture_sync", "hf_diarized_transcription"}:
+            raise ValueError(f"Unsupported benchmark scenario: {scenario_name!r}")
+        scenario = cast(BenchmarkScenario, scenario_name)
         request = BenchmarkRunRequest(
             common=self.app.common_options(),
-            scenario=self.run_scenario_var.get(),
+            scenario=scenario,
             runs=int(self.run_runs_var.get() or 5),
             duration_sec=float(self.run_duration_var.get() or 10.0),
             output_dir=Path(self.run_output_var.get().strip()),
@@ -1575,7 +1611,7 @@ class TranscribeUiApp:
             return
         try:
             if os.name == "nt":
-                os.startfile(str(resolved))  # type: ignore[attr-defined]
+                os.startfile(str(resolved))
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", str(resolved)])
             else:

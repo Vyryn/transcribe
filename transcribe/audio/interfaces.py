@@ -21,6 +21,9 @@ class RawFrame:
 class AudioBackend(Protocol):
     """Protocol for audio capture backend implementations."""
 
+    sample_rate_hz: int
+    dropped_callback_frames: int
+
     def list_devices(self) -> list[dict[str, object]]: ...
 
     def open(self, config: CaptureConfig) -> None: ...
