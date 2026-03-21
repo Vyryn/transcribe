@@ -376,3 +376,46 @@ def test_hf_download_file_disables_progress_bars_for_packaged_downloads(
 
     assert observed["HF_HUB_DISABLE_PROGRESS_BARS"] == "1"
     assert resolved == downloaded_path.resolve()
+
+
+def test_hf_download_file_patches_missing_console_streams(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, object] = {}
+    downloaded_path = tmp_path / "hf-cache" / "downloaded.bin"
+
+    def fake_hf_hub_download(*, repo_id: str, filename: str, revision: str, local_files_only: bool, cache_dir: str) -> str:
+        _ = (repo_id, filename, revision, local_files_only, cache_dir)
+        observed["stdout_has_write"] = callable(getattr(sys.stdout, "write", None))
+        observed["stderr_has_write"] = callable(getattr(sys.stderr, "write", None))
+        assert sys.stdout is not None
+        assert sys.stderr is not None
+        print("download progress")
+        sys.stderr.write("download warning\n")
+        downloaded_path.parent.mkdir(parents=True, exist_ok=True)
+        downloaded_path.write_bytes(b"downloaded")
+        return str(downloaded_path)
+
+    fake_module = types.ModuleType("huggingface_hub")
+    fake_module.hf_hub_download = fake_hf_hub_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_module)
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "__stdout__", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setattr(sys, "__stderr__", None)
+
+    resolved = packaged_assets._hf_download_file(
+        repo_id="repo/model",
+        revision="rev-1",
+        filename="model.bin",
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert observed == {
+        "stdout_has_write": True,
+        "stderr_has_write": True,
+    }
+    assert resolved == downloaded_path.resolve()
+    assert sys.stdout is None
+    assert sys.stderr is None
