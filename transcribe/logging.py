@@ -4,7 +4,9 @@ import io
 import json
 import logging
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from collections.abc import Iterator
 from typing import Any, cast
 
 SENSITIVE_FIELD_NAMES = {
@@ -60,6 +62,28 @@ def resolve_console_stream(*, error: bool, fallback_sink: bool = False) -> io.Te
     if fallback_sink:
         return _NullTextStream()
     return None
+
+
+@contextmanager
+def patched_missing_console_streams() -> Iterator[io.TextIOBase]:
+    """Temporarily replace missing stdio streams with a writable null sink.
+
+    This protects packaged/windowed launches where third-party libraries still
+    assume ``sys.stdout``/``sys.stderr`` exist and can accept text writes.
+    """
+    sink = _NullTextStream()
+    patched_attributes: dict[str, object | None] = {}
+    for attribute in ("stdout", "__stdout__", "stderr", "__stderr__"):
+        stream = getattr(sys, attribute, None)
+        if _stream_supports_text_writes(stream):
+            continue
+        patched_attributes[attribute] = stream
+        setattr(sys, attribute, sink)
+    try:
+        yield sink
+    finally:
+        for attribute, original in patched_attributes.items():
+            setattr(sys, attribute, original)
 
 
 def write_console_line(message: object, *, error: bool = False) -> None:

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from transcribe.logging import patched_missing_console_streams
+
 PACKAGED_ASSET_MANIFEST_FILENAME = "packaged-assets.json"
 INSTALLED_ASSET_STATE_FILENAME = "installed-assets.json"
 PACKAGED_ASSET_SCHEMA_VERSION = "transcribe-packaged-assets-v1"
@@ -471,13 +473,14 @@ def _hf_download_file(*, repo_id: str, revision: str, filename: str, cache_dir: 
             "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
         }
     ):
-        downloaded = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            revision=revision,
-            local_files_only=False,
-            cache_dir=str(hub_cache),
-        )
+        with patched_missing_console_streams():
+            downloaded = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                revision=revision,
+                local_files_only=False,
+                cache_dir=str(hub_cache),
+            )
     path = Path(downloaded).resolve()
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"Downloaded Hugging Face asset is missing: {path}")
