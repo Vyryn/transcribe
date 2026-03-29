@@ -1233,19 +1233,22 @@ def _resolve_llama_cpp_executable(runtime_paths) -> Path | None:
 
     executable_name = primary_candidate.name
     install_root = runtime_paths.install_root
-    candidates.extend(
-        (
-            install_root / "_internal" / "runtime" / "llm" / executable_name,
-            install_root.parent / "runtime" / "llm" / executable_name,
+    ancestor_roots = (install_root, *install_root.parents)
+    for root in ancestor_roots:
+        candidates.extend(
+            (
+                root / "_internal" / "runtime" / "llm" / executable_name,
+                root / "runtime" / "llm" / executable_name,
+                root / "stage" / "runtime" / "llm" / executable_name,
+            )
         )
-    )
-
-    staged_runtime_candidates = sorted(
-        (install_root / "build" / "windows_standalone").glob(f"*/stage/runtime/llm/{executable_name}"),
-        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
-        reverse=True,
-    )
-    candidates.extend(staged_runtime_candidates)
+    for root in ancestor_roots:
+        staged_runtime_candidates = sorted(
+            root.glob(f"build/windows_standalone/*/stage/runtime/llm/{executable_name}"),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+            reverse=True,
+        )
+        candidates.extend(staged_runtime_candidates)
 
     seen_paths: set[Path] = set()
     for candidate in candidates:

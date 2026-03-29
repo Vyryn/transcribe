@@ -741,6 +741,23 @@ def test_resolve_llama_cpp_executable_falls_back_to_staged_runtime(tmp_path: Pat
     assert _resolve_llama_cpp_executable(runtime_paths) == staged_binary.resolve()
 
 
+def test_resolve_llama_cpp_executable_falls_back_from_dist_bundle_to_nearby_stage(tmp_path: Path) -> None:
+    from transcribe.notes import _resolve_llama_cpp_executable
+
+    install_root = tmp_path / "repo" / "build" / "windows_standalone" / "0.2.2" / "pyinstaller" / "dist" / "Transcribe"
+    staged_runtime_dir = tmp_path / "repo" / "build" / "windows_standalone" / "0.2.2" / "stage" / "runtime" / "llm"
+    staged_runtime_dir.mkdir(parents=True)
+    staged_binary = staged_runtime_dir / "llama-server.exe"
+    staged_binary.write_text("", encoding="utf-8")
+
+    runtime_paths = SimpleNamespace(
+        install_root=install_root,
+        notes_runtime_binary=install_root / "runtime" / "llm" / "llama-server.exe",
+    )
+
+    assert _resolve_llama_cpp_executable(runtime_paths) == staged_binary.resolve()
+
+
 def test_run_ollama_command_uses_replace_for_text_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
     import transcribe.notes as notes_module
 
@@ -1358,5 +1375,4 @@ def test_default_runtime_factory_falls_back_to_llama_cpp_when_ollama_model_is_mi
         pass
 
     assert observed == [("ollama", False), ("llama_cpp", False)]
-
 

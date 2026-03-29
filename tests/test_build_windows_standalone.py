@@ -218,6 +218,74 @@ def test_stage_built_app_copies_onedir_bundle_contents(tmp_path: Path) -> None:
     assert (stage_dir / "_internal" / "python313.dll").read_text(encoding="utf-8") == "dll"
 
 
+def test_assemble_staged_app_overlays_llama_runtime_after_bundle_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_build_module()
+    bundle_dir = tmp_path / "dist" / module.APP_NAME
+    bundle_runtime_dir = bundle_dir / "runtime" / "llm"
+    bundle_runtime_dir.mkdir(parents=True)
+    (bundle_dir / f"{module.APP_NAME}.exe").write_text("exe", encoding="utf-8")
+    (bundle_runtime_dir / "llama-server.exe").write_text("stale", encoding="utf-8")
+
+    prompt_path = tmp_path / "clinical_note_synthesis_llm_prompt.md"
+    prompt_path.write_text("prompt", encoding="utf-8")
+    icon_path = tmp_path / "transcribe.ico"
+    icon_path.write_text("icon", encoding="utf-8")
+
+    layout = module.BuildLayout(
+        root=tmp_path / "build",
+        downloads_dir=tmp_path / "build" / "downloads",
+        pyinstaller_work_dir=tmp_path / "build" / "work",
+        pyinstaller_dist_dir=tmp_path / "build" / "dist",
+        stage_dir=tmp_path / "stage",
+        stage_prompts_dir=tmp_path / "stage" / "prompts",
+        stage_runtime_dir=tmp_path / "stage" / "runtime" / "llm",
+        installer_dir=tmp_path / "build" / "installer",
+        spec_path=tmp_path / "build" / "transcribe.spec",
+    )
+
+    def fake_stage_llama_runtime(*, llama_runtime_dir, llama_cpp_release, downloads_dir, destination_dir) -> None:
+        del llama_runtime_dir, llama_cpp_release, downloads_dir
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        (destination_dir / "llama-server.exe").write_text("fresh", encoding="utf-8")
+
+    monkeypatch.setattr(module, "PROMPT_SOURCE_PATH", prompt_path)
+    monkeypatch.setattr(module, "stage_llama_runtime", fake_stage_llama_runtime)
+
+    staged_executable = module.assemble_staged_app(
+        bundle_dir=bundle_dir,
+        layout=layout,
+        args=module.argparse.Namespace(llama_runtime_dir=None, llama_cpp_release="latest"),
+        icon_path=icon_path,
+    )
+
+    assert staged_executable == (layout.stage_dir / f"{module.APP_NAME}.exe").resolve()
+    assert (layout.stage_runtime_dir / "llama-server.exe").read_text(encoding="utf-8") == "fresh"
+    assert (layout.stage_dir / f"{module.APP_NAME}.exe").read_text(encoding="utf-8") == "exe"
+    assert (layout.stage_prompts_dir / "clinical_note_synthesis_llm_prompt.md").read_text(encoding="utf-8") == "prompt"
+    assert (layout.stage_dir / "transcribe.ico").read_text(encoding="utf-8") == "icon"
+
+
+def test_verify_staged_llama_runtime_requires_binary(tmp_path: Path) -> None:
+    module = _load_build_module()
+    layout = module.BuildLayout(
+        root=tmp_path / "build",
+        downloads_dir=tmp_path / "build" / "downloads",
+        pyinstaller_work_dir=tmp_path / "build" / "work",
+        pyinstaller_dist_dir=tmp_path / "build" / "dist",
+        stage_dir=tmp_path / "stage",
+        stage_prompts_dir=tmp_path / "stage" / "prompts",
+        stage_runtime_dir=tmp_path / "stage" / "runtime" / "llm",
+        installer_dir=tmp_path / "build" / "installer",
+        spec_path=tmp_path / "build" / "transcribe.spec",
+    )
+
+    with pytest.raises(RuntimeError, match="missing the bundled llama.cpp runtime"):
+        module.verify_staged_llama_runtime(layout)
+
+
 def test_installer_template_hides_shell_wrapper_and_shows_model_progress() -> None:
     template_path = Path(__file__).resolve().parent.parent / "packaging" / "windows" / "transcribe_installer.iss"
     template_text = template_path.read_text(encoding="utf-8")

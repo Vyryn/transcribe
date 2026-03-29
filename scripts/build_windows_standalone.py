@@ -1128,7 +1128,7 @@ def build_pyinstaller_bundle(
 
 
 def stage_runtime_assets(*, layout: BuildLayout, args: argparse.Namespace, icon_path: Path) -> None:
-    """Stage prompt, icon, runtime files, and install-time manifest.
+    """Overlay prompt, icon, and llama.cpp runtime files onto one staged app.
 
     Parameters
     ----------
@@ -1139,7 +1139,6 @@ def stage_runtime_assets(*, layout: BuildLayout, args: argparse.Namespace, icon_
     icon_path : Path
         Application icon file to stage alongside the bundle.
     """
-    clear_directory_contents(layout.stage_dir)
     ensure_directory(layout.stage_dir)
     ensure_directory(layout.stage_prompts_dir)
     ensure_directory(layout.stage_runtime_dir)
@@ -1151,6 +1150,25 @@ def stage_runtime_assets(*, layout: BuildLayout, args: argparse.Namespace, icon_
         downloads_dir=ensure_directory(layout.downloads_dir),
         destination_dir=layout.stage_runtime_dir,
     )
+
+
+def verify_staged_llama_runtime(layout: BuildLayout) -> Path:
+    """Require one staged llama.cpp server binary before packaging continues.
+
+    Parameters
+    ----------
+    layout : BuildLayout
+        Concrete build directories for this packaging run.
+
+    Returns
+    -------
+    Path
+        Resolved staged ``llama-server.exe`` path.
+    """
+    runtime_binary = layout.stage_runtime_dir / "llama-server.exe"
+    if not runtime_binary.exists():
+        raise RuntimeError(f"Staged app is missing the bundled llama.cpp runtime: {runtime_binary}")
+    return runtime_binary.resolve()
 
 
 def stage_built_app(bundle_dir: Path, stage_dir: Path) -> Path:
@@ -1173,6 +1191,39 @@ def stage_built_app(bundle_dir: Path, stage_dir: Path) -> Path:
     if not staged_executable.exists():
         raise RuntimeError(f"Staged app bundle is missing the expected executable: {staged_executable}")
     return staged_executable.resolve()
+
+
+def assemble_staged_app(
+    *,
+    bundle_dir: Path,
+    layout: BuildLayout,
+    args: argparse.Namespace,
+    icon_path: Path,
+) -> Path:
+    """Assemble the final staged app directory used by the Windows installer.
+
+    Parameters
+    ----------
+    bundle_dir : Path
+        PyInstaller-built application bundle directory.
+    layout : BuildLayout
+        Concrete build directories for this packaging run.
+    args : argparse.Namespace
+        Parsed build options.
+    icon_path : Path
+        Application icon file to stage alongside the bundle.
+
+    Returns
+    -------
+    Path
+        Final staged application executable path.
+    """
+    clear_directory_contents(layout.stage_dir)
+    ensure_directory(layout.stage_dir)
+    staged_executable = stage_built_app(bundle_dir, layout.stage_dir)
+    stage_runtime_assets(layout=layout, args=args, icon_path=icon_path)
+    verify_staged_llama_runtime(layout)
+    return staged_executable
 
 
 def known_inno_setup_paths() -> tuple[Path, ...]:
@@ -1387,14 +1438,18 @@ def main(argv: list[str] | None = None) -> int:
 
     python_executable = resolve_build_python()
     ensure_pyinstaller_available(python_executable)
-    stage_runtime_assets(layout=layout, args=args, icon_path=ICON_PATH)
     bundle_dir = build_pyinstaller_bundle(
         python_executable=python_executable,
         layout=layout,
         distribution_names=distribution_names,
         icon_path=ICON_PATH,
     )
-    staged_executable = stage_built_app(bundle_dir, layout.stage_dir)
+    staged_executable = assemble_staged_app(
+        bundle_dir=bundle_dir,
+        layout=layout,
+        args=args,
+        icon_path=ICON_PATH,
+    )
     print(f"Staged app: {staged_executable}")
 
     if args.skip_installer:
